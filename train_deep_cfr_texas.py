@@ -145,6 +145,7 @@ def train_deep_cfr(
     )
     
     print(f"  正在加载游戏...")
+    print(f"  游戏字符串: {game_string}")
     sys.stdout.flush()
     
     try:

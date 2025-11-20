@@ -88,31 +88,221 @@ def get_opponent_action(state, opponent_strategy="random"):
         return np.random.choice(legal_actions)
 
 
-def play_game(game, policy_network, device, opponent_strategy="random", verbose=False):
-    """玩一局游戏"""
+def action_to_string(action):
+    """将动作编号转换为字符串"""
+    action_map = {
+        0: "Fold",
+        1: "Call/Check",
+        2: "Bet/Raise",
+        3: "All-in",
+        4: "Half-pot"
+    }
+    return action_map.get(action, f"Action_{action}")
+
+
+def format_game_state(state, show_all_hands=False):
+    """格式化显示游戏状态信息"""
+    try:
+        state_struct = state.to_struct()
+        
+        # 获取基本信息
+        num_players = state.num_players()
+        current_player = state.current_player() if not state.is_terminal() else -1
+        
+        # 获取手牌和公共牌
+        player_hands = getattr(state_struct, 'player_hands', [])
+        board_cards = getattr(state_struct, 'board_cards', '')
+        pot_size = getattr(state_struct, 'pot_size', 0)
+        player_contributions = getattr(state_struct, 'player_contributions', [])
+        betting_history = getattr(state_struct, 'betting_history', '')
+        
+        lines = []
+        lines.append("  " + "=" * 60)
+        
+        # 显示公共牌
+        if board_cards:
+            lines.append(f"  公共牌: {board_cards}")
+        else:
+            lines.append(f"  公共牌: (未发牌)")
+        
+        # 显示底池
+        lines.append(f"  底池: {pot_size}")
+        
+        # 显示每个玩家的信息
+        for p in range(num_players):
+            hand_str = player_hands[p] if p < len(player_hands) else "??"
+            contribution = player_contributions[p] if p < len(player_contributions) else 0
+            
+            if show_all_hands or state.is_terminal():
+                # 显示所有玩家的手牌（游戏结束时）
+                lines.append(f"  玩家 {p}: 手牌={hand_str}, 投入={contribution}")
+            else:
+                # 游戏进行中，只显示当前玩家或已弃牌玩家的手牌
+                if p == current_player:
+                    lines.append(f"  玩家 {p} [当前行动]: 手牌={hand_str}, 投入={contribution}")
+                else:
+                    lines.append(f"  玩家 {p}: 投入={contribution}")
+        
+        # 显示下注历史
+        if betting_history:
+            lines.append(f"  下注历史: {betting_history}")
+        
+        lines.append("  " + "=" * 60)
+        
+        return "\n".join(lines)
+    except Exception as e:
+        # 如果获取状态信息失败，返回简化信息
+        return f"  状态信息获取失败: {e}"
+
+
+def play_game(game, policy_network, device, opponent_strategy="random", verbose=False, show_full_game=False):
+    """玩一局游戏
+    
+    Args:
+        game: 游戏对象
+        policy_network: 策略网络
+        device: 设备
+        opponent_strategy: 对手策略
+        verbose: 是否显示基本信息
+        show_full_game: 是否显示完整的对局流程（包括手牌、公共牌等）
+    """
     state = game.new_initial_state()
+    action_history = []
+    last_board_cards_count = 0
+    last_round_displayed = -1
+    
+    if show_full_game:
+        print("\n" + "=" * 70)
+        print("开始新对局")
+        print("=" * 70)
+        # 显示初始状态（Preflop）
+        print("\n--- Preflop ---")
+        print(format_game_state(state, show_all_hands=False))
     
     while not state.is_terminal():
         if state.is_chance_node():
+            # 机会节点（发牌）
             outcomes = state.chance_outcomes()
             action = np.random.choice([a for a, _ in outcomes], 
                                      p=[p for _, p in outcomes])
             state = state.child(action)
         else:
+            # 玩家行动节点：检测是否进入新的一轮
+            if show_full_game:
+                try:
+                    state_struct = state.to_struct()
+                    board_cards_str = getattr(state_struct, 'board_cards', '')
+                    current_board_cards_count = len(board_cards_str) // 2  # 每张牌2个字符
+                    
+                    # 根据已发公共牌数判断当前轮次
+                    # numBoardCards=0 3 1 1 表示：
+                    # Round 0 (Preflop): 0张
+                    # Round 1 (Flop): 3张（累计）
+                    # Round 2 (Turn): 4张（累计，3+1）
+                    # Round 3 (River): 5张（累计，3+1+1）
+                    if current_board_cards_count != last_board_cards_count:
+                        # 公共牌数量变化，可能是新轮次开始
+                        if current_board_cards_count == 0:
+                            round_name = "Preflop"
+                            round_num = 0
+                        elif current_board_cards_count <= 3:
+                            round_name = "Flop"
+                            round_num = 1
+                        elif current_board_cards_count == 4:
+                            round_name = "Turn"
+                            round_num = 2
+                        elif current_board_cards_count == 5:
+                            round_name = "River"
+                            round_num = 3
+                        else:
+                            round_name = f"Round {current_board_cards_count}"
+                            round_num = current_board_cards_count
+                        
+                        # 只在轮次变化时显示（避免重复显示）
+                        if round_num != last_round_displayed:
+                            print(f"\n--- {round_name} ---")
+                            print(format_game_state(state, show_all_hands=False))
+                            last_round_displayed = round_num
+                        
+                        last_board_cards_count = current_board_cards_count
+                except:
+                    pass
+            
             player = state.current_player()
+            legal_actions = state.legal_actions()
+            
             if player == 0:  # 使用模型策略
-                action, _ = get_action_from_network(state, policy_network, device)
+                action, action_probs = get_action_from_network(state, policy_network, device)
             else:  # 对手策略
                 action = get_opponent_action(state, opponent_strategy)
+                action_probs = None
+            
+            action_str = action_to_string(action)
+            
+            if show_full_game:
+                print(f"\n  玩家 {player} 行动: {action_str} (动作编号: {action})")
+                if action_probs and player == 0:
+                    # 显示模型的动作概率分布
+                    prob_str = ", ".join([f"{action_to_string(a)}: {p:.3f}" 
+                                         for a, p in sorted(action_probs.items(), 
+                                                           key=lambda x: x[1], reverse=True)[:3]])
+                    print(f"    动作概率分布 (前3): {prob_str}")
+            
+            action_history.append((player, action, action_str))
             state = state.child(action)
     
+    # 游戏结束，显示最终结果
     returns = state.returns()
+    
+    if show_full_game:
+        print("\n" + "=" * 70)
+        print("对局结束 - 最终状态")
+        print("=" * 70)
+        print(format_game_state(state, show_all_hands=True))
+        
+        # 显示最终手牌和牌型（如果可用）
+        try:
+            state_struct = state.to_struct()
+            best_hand_rank_types = getattr(state_struct, 'best_hand_rank_types', [])
+            best_five_card_hands = getattr(state_struct, 'best_five_card_hands', [])
+            
+            print("\n最终牌型:")
+            for p in range(game.num_players()):
+                rank_type = best_hand_rank_types[p] if p < len(best_hand_rank_types) else "Unknown"
+                best_hand = best_five_card_hands[p] if p < len(best_five_card_hands) else "Unknown"
+                print(f"  玩家 {p}: {rank_type} ({best_hand})")
+        except:
+            pass
+        
+        print("\n最终收益:")
+        for p in range(game.num_players()):
+            print(f"  玩家 {p}: {returns[p]:.2f}")
+        
+        print("\n动作历史:")
+        for i, (player, action, action_str) in enumerate(action_history, 1):
+            print(f"  {i}. 玩家 {player}: {action_str}")
+        
+        print("=" * 70)
+    elif verbose:
+        print(f"  对局结束，收益: {returns}")
+    
     return returns
 
 
 def evaluate_against_opponent(game, policy_network, device, opponent_strategy="random", 
-                             num_games=100, verbose=True):
-    """评估模型对特定对手的表现"""
+                             num_games=100, verbose=True, show_full_game=False, show_first_n_games=0):
+    """评估模型对特定对手的表现
+    
+    Args:
+        game: 游戏对象
+        policy_network: 策略网络
+        device: 设备
+        opponent_strategy: 对手策略
+        num_games: 对局数量
+        verbose: 是否显示基本信息
+        show_full_game: 是否显示完整的对局流程
+        show_first_n_games: 显示前N局完整流程（0表示不显示，-1表示显示所有）
+    """
     if verbose:
         print(f"\n评估对局 ({opponent_strategy} 对手, {num_games} 局)...")
     
@@ -127,7 +317,11 @@ def evaluate_against_opponent(game, policy_network, device, opponent_strategy="r
         if verbose and (i + 1) % 20 == 0:
             print(f"  进行第 {i + 1}/{num_games} 局...")
         
-        returns = play_game(game, policy_network, device, opponent_strategy, verbose=False)
+        # 决定是否显示完整对局流程
+        should_show = show_full_game or (show_first_n_games > 0 and i < show_first_n_games)
+        
+        returns = play_game(game, policy_network, device, opponent_strategy, 
+                          verbose=False, show_full_game=should_show)
         results['returns'].append(returns[0])  # 玩家0的收益
         
         if returns[0] > returns[1]:
@@ -231,6 +425,10 @@ def main():
                        help="玩家数量（必须与训练时一致）")
     parser.add_argument("--output", type=str, default=None,
                        help="输出JSON文件路径（可选）")
+    parser.add_argument("--show_full_game", action="store_true",
+                       help="显示完整的对局流程（包括手牌、公共牌、动作等）")
+    parser.add_argument("--show_first_n_games", type=int, default=0,
+                       help="显示前N局完整流程（默认0，不显示）")
     
     args = parser.parse_args()
     
@@ -306,7 +504,9 @@ def main():
             game, policy_network, device, 
             opponent_strategy=opponent,
             num_games=args.num_games,
-            verbose=True
+            verbose=True,
+            show_full_game=args.show_full_game,
+            show_first_n_games=args.show_first_n_games
         )
         all_results[opponent] = results
     

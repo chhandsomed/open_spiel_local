@@ -6,6 +6,83 @@
 **总耗时**: 41.05 分钟 (2,462.79 秒)  
 **模型保存位置**: `models/deepcfr_texas_6player_large/`
 
+### 训练时的评估机制
+
+训练过程中，每 `eval_interval` 次迭代（默认20次）会进行一次**轻量级评估**，不会中断训练流程。评估包括两部分：
+
+#### 1. 策略质量评估（`evaluate_policy_quality`）
+
+通过采样游戏状态来评估策略质量：
+
+- **策略熵**：衡量策略的随机性
+  - 采样 50 个游戏状态（限制深度为10，避免过深）
+  - 对每个状态计算策略熵：`H = -Σ p(a) * log(p(a))`
+  - 统计平均熵、标准差、最小/最大熵
+  
+- **缓冲区大小**：衡量探索进度
+  - 策略缓冲区大小：已探索的状态-策略对数量
+  - 优势缓冲区大小：每个玩家的优势样本数量
+  - 总优势样本数：所有玩家的优势样本总和
+
+#### 2. 测试对局评估（可选，通过 `--eval_with_games` 启用）
+
+如果启用 `--eval_with_games`，会进行实际对局测试：
+
+- **对局数量**：默认 50 局（可在代码中调整）
+- **对手策略**：随机策略（`random`）
+- **评估指标**：
+  - 玩家0的平均收益
+  - 玩家0的胜率
+  - 标准差（衡量稳定性）
+
+#### 评估代码位置
+
+```264:315:train_deep_cfr_texas.py
+                # 进行评估（轻量级，不计算 NashConv）
+                if skip_nashconv:
+                    try:
+                        from training_evaluator import quick_evaluate, print_evaluation_summary
+                        print(f"\n  评估训练效果（迭代 {iteration + 1}）...", end="", flush=True)
+                        eval_result = quick_evaluate(
+                            game,
+                            deep_cfr_solver,
+                            include_test_games=eval_with_games,
+                            num_test_games=50,
+                            verbose=False
+                        )
+                        print(" 完成")
+                        
+                        # 打印简要评估信息
+                        metrics = eval_result['metrics']
+                        print(f"  策略熵: {metrics.get('avg_entropy', 0):.4f} | "
+                              f"策略缓冲区: {metrics.get('strategy_buffer_size', 0):,} | "
+                              f"优势样本: {metrics.get('total_advantage_samples', 0):,}")
+                        
+                        if eval_result.get('test_results'):
+                            test = eval_result['test_results']
+                            print(f"  测试对局: 玩家0平均收益={test.get('player0_avg_return', 0):.4f}, "
+                                  f"胜率={test.get('player0_win_rate', 0)*100:.1f}%")
+```
+
+#### 评估输出示例
+
+训练时的评估输出如下：
+
+```
+  迭代 20/500... 完成 | 玩家0损失: 43.94M | GPU内存: 2.15GB
+
+  评估训练效果（迭代 20）... 完成
+  策略熵: 0.0000 | 策略缓冲区: 85,722 | 优势样本: 10,917
+  测试对局: 玩家0平均收益=67.39, 胜率=16.0%
+```
+
+**注意**：
+- ⚠️ 训练时的评估是**轻量级**的，不会计算耗时的 NashConv
+- ⚠️ 测试对局数量较少（50局），统计意义有限，主要用于观察趋势
+- ⚠️ 策略熵计算可能不准确（采样状态有限）
+- ✅ 评估不会显著影响训练速度
+- ✅ 评估结果会保存到训练历史 JSON 文件中
+
 ### 训练配置
 
 | 参数 | 值 |
@@ -223,7 +300,43 @@ python evaluate_model.py \
     --output evaluation_6player_large.json
 ```
 
-### 5. 对比不同训练阶段
+### 5. 查看完整对局流程（验证时）
+
+在验证模型效果时，可以查看完整的对局流程，包括每个玩家的手牌、公共牌、动作序列等详细信息：
+
+```bash
+# 显示前3局完整对局流程
+python evaluate_model.py \
+    --model_prefix models/deepcfr_texas_6player_large/deepcfr_texas_6player_large \
+    --num_games 100 \
+    --opponents random \
+    --policy_layers 256 256 128 \
+    --num_players 6 \
+    --show_first_n_games 3
+```
+
+**显示内容包括**：
+- ✅ **每轮状态**：Preflop、Flop、Turn、River 各阶段的状态
+- ✅ **公共牌**：当前公共牌信息
+- ✅ **玩家手牌**：每个玩家的手牌（游戏结束时显示所有玩家）
+- ✅ **底池大小**：当前底池金额
+- ✅ **玩家投入**：每个玩家已投入的金额
+- ✅ **动作序列**：每个玩家的动作（Fold、Call/Check、Bet/Raise、All-in等）
+- ✅ **动作概率**：模型的动作概率分布（前3个最可能的动作）
+- ✅ **最终牌型**：游戏结束时每个玩家的最佳5张牌和牌型
+- ✅ **最终收益**：每个玩家的最终收益
+- ✅ **完整动作历史**：整局游戏的所有动作序列
+
+**使用场景**：
+- 🔍 **调试策略**：查看模型在特定情况下的决策
+- 📊 **分析表现**：理解模型为什么在某些对局中表现好/差
+- 🎓 **学习参考**：观察训练后的策略行为模式
+
+**参数说明**：
+- `--show_full_game`: 显示所有对局的完整流程（可能输出很多）
+- `--show_first_n_games N`: 只显示前N局完整流程（推荐使用，如 `--show_first_n_games 3`）
+
+### 6. 对比不同训练阶段
 
 ```bash
 # 对比不同迭代的模型（如果有保存中间检查点）

@@ -218,7 +218,8 @@ class DeepCFRSolver(policy.Policy):
                memory_capacity: int = int(1e6),
                policy_network_train_steps: int = 1,
                advantage_network_train_steps: int = 1,
-               reinitialize_advantage_networks: bool = True):
+               reinitialize_advantage_networks: bool = True,
+               device=None):
     """Initialize the Deep CFR algorithm.
 
     Args:
@@ -239,6 +240,8 @@ class DeepCFRSolver(policy.Policy):
         (per iteration).
       reinitialize_advantage_networks: Whether to re-initialize the advantage
         network before training on each iteration.
+      device: (torch.device or None) Device to use for computation. If None,
+        automatically selects CUDA if available, else CPU.
     """
     all_players = list(range(game.num_players()))
     super(DeepCFRSolver, self).__init__(game, all_players)
@@ -259,11 +262,19 @@ class DeepCFRSolver(policy.Policy):
     self._num_actions = game.num_distinct_actions()
     self._iteration = 1
 
+    # Set device
+    if device is None:
+      self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+      self._device = device
+
     # Define strategy network, loss & memory.
     self._strategy_memories = ReservoirBuffer(memory_capacity)
     self._policy_network = MLP(self._embedding_size,
                                list(policy_network_layers),
                                self._num_actions)
+    # Move policy network to device
+    self._policy_network = self._policy_network.to(self._device)
     # Illegal actions are handled in the traversal code where expected payoff
     # and sampled regret is computed from the advantage networks.
     self._policy_sm = nn.Softmax(dim=-1)
@@ -279,6 +290,9 @@ class DeepCFRSolver(policy.Policy):
         MLP(self._embedding_size, list(advantage_network_layers),
             self._num_actions) for _ in range(self._num_players)
     ]
+    # Move advantage networks to device
+    for i in range(self._num_players):
+      self._advantage_networks[i] = self._advantage_networks[i].to(self._device)
     self._loss_advantages = nn.MSELoss(reduction="mean")
     self._optimizer_advantages = []
     for p in range(self._num_players):
@@ -301,6 +315,8 @@ class DeepCFRSolver(policy.Policy):
 
   def reinitialize_advantage_network(self, player):
     self._advantage_networks[player].reset()
+    # Ensure network stays on device after reset
+    self._advantage_networks[player] = self._advantage_networks[player].to(self._device)
     self._optimizer_advantages[player] = torch.optim.Adam(
         self._advantage_networks[player].parameters(), lr=self._learning_rate)
 
@@ -404,8 +420,8 @@ class DeepCFRSolver(policy.Policy):
     info_state = state.information_state_tensor(player)
     legal_actions = state.legal_actions(player)
     with torch.no_grad():
-      state_tensor = torch.FloatTensor(np.expand_dims(info_state, axis=0))
-      raw_advantages = self._advantage_networks[player](state_tensor)[0].numpy()
+      state_tensor = torch.FloatTensor(np.expand_dims(info_state, axis=0)).to(self._device)
+      raw_advantages = self._advantage_networks[player](state_tensor)[0].cpu().numpy()
     advantages = [max(0., advantage) for advantage in raw_advantages]
     cumulative_regret = np.sum([advantages[action] for action in legal_actions])
     matched_regrets = np.array([0.] * self._num_actions)
@@ -433,8 +449,8 @@ class DeepCFRSolver(policy.Policy):
     if len(info_state_vector.shape) == 1:
       info_state_vector = np.expand_dims(info_state_vector, axis=0)
     with torch.no_grad():
-      logits = self._policy_network(torch.FloatTensor(info_state_vector))
-      probs = self._policy_sm(logits).numpy()
+      logits = self._policy_network(torch.FloatTensor(info_state_vector).to(self._device))
+      probs = self._policy_sm(logits).cpu().numpy()
     return {action: probs[0][action] for action in legal_actions}
 
   def _learn_advantage_network(self, player):
@@ -470,16 +486,16 @@ class DeepCFRSolver(policy.Policy):
       if not info_states:
         return None
       self._optimizer_advantages[player].zero_grad()
-      advantages = torch.FloatTensor(np.array(advantages))
-      iters = torch.FloatTensor(np.sqrt(np.array(iterations)))
+      advantages = torch.FloatTensor(np.array(advantages)).to(self._device)
+      iters = torch.FloatTensor(np.sqrt(np.array(iterations))).to(self._device)
       outputs = self._advantage_networks[player](
-          torch.FloatTensor(np.array(info_states)))
+          torch.FloatTensor(np.array(info_states)).to(self._device))
       loss_advantages = self._loss_advantages(iters * outputs,
                                               iters * advantages)
       loss_advantages.backward()
       self._optimizer_advantages[player].step()
 
-    return loss_advantages.detach().numpy()
+    return loss_advantages.detach().cpu().numpy()
 
   def _learn_strategy_network(self):
     """Compute the loss over the strategy network.
@@ -504,12 +520,12 @@ class DeepCFRSolver(policy.Policy):
         iterations.append([s.iteration])
 
       self._optimizer_policy.zero_grad()
-      iters = torch.FloatTensor(np.sqrt(np.array(iterations)))
-      ac_probs = torch.FloatTensor(np.array(np.squeeze(action_probs)))
-      logits = self._policy_network(torch.FloatTensor(np.array(info_states)))
+      iters = torch.FloatTensor(np.sqrt(np.array(iterations))).to(self._device)
+      ac_probs = torch.FloatTensor(np.array(np.squeeze(action_probs))).to(self._device)
+      logits = self._policy_network(torch.FloatTensor(np.array(info_states)).to(self._device))
       outputs = self._policy_sm(logits)
       loss_strategy = self._loss_policy(iters * outputs, iters * ac_probs)
       loss_strategy.backward()
       self._optimizer_policy.step()
 
-    return loss_strategy.detach().numpy()
+    return loss_strategy.detach().cpu().numpy()

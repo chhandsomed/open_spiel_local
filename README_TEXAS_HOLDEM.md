@@ -478,12 +478,9 @@ python load_and_test_strategy.py
 ## 相关文档
 
 详细文档请参考：
-- `TRAIN_6PLAYER_EXAMPLE.md` - **6人场训练完整指南**（推荐查看）
-- `TRAINING_EVALUATION_GUIDE.md` - 训练评估详细指南（评估指标、使用方法、指标解读）
-- `NUM_TRAVERSALS_EXPLANATION.md` - num_traversals 参数详解
-- `SKIP_NASHCONV_EXPLANATION.md` - NashConv 详细说明（为什么可以跳过、影响分析）
-- `INFERENCE_GUIDE.md` - 推理详细指南（推理脚本使用、测试结果解读）
-- `NASHCONV_RESOURCE_FIX.md` - NashConv 资源问题修复（资源限制、故障排除）
+- **[USAGE_GUIDE.md](USAGE_GUIDE.md)** - 特征转换使用指南（简单版本 vs 复杂版本）
+- **[LOSS_AND_EVALUATION.md](LOSS_AND_EVALUATION.md)** - 损失计算与评估方法详解（策略熵、缓冲区大小、测试对局）
+- **[INTERACTIVE_PLAY_GUIDE.md](INTERACTIVE_PLAY_GUIDE.md)** - 交互式游戏使用指南
 
 ## 技术支持
 

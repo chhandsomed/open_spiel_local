@@ -31,6 +31,7 @@ def evaluate_policy_quality(
     game,
     deep_cfr_solver,
     num_sample_states=100,
+    max_depth=None,
     verbose=True
 ):
     """评估策略质量（轻量级方法）
@@ -39,6 +40,7 @@ def evaluate_policy_quality(
         game: OpenSpiel 游戏对象
         deep_cfr_solver: DeepCFRSolver 实例
         num_sample_states: 采样状态数量
+        max_depth: 最大采样深度（None 时自动设置）
         verbose: 是否显示详细信息
     
     Returns:
@@ -46,39 +48,94 @@ def evaluate_policy_quality(
     """
     metrics = {}
     
+    # 自动设置 max_depth（基于游戏特性）
+    if max_depth is None:
+        try:
+            # 尝试获取游戏的最大长度
+            max_game_length = game.max_game_length()
+            # 设置为最大长度的 75%，确保能覆盖大部分状态
+            # 但不超过 30，防止评估时间过长
+            max_depth = min(int(max_game_length * 0.75), 30)
+        except:
+            # 如果无法获取，使用默认值
+            # 德州扑克：4轮 × 平均每轮3-4步 ≈ 15
+            max_depth = 15
+    
     # 1. 策略熵统计
     entropies = []
     states_sampled = 0
     
     try:
         # 采样一些状态，计算策略熵
-        for _ in range(num_sample_states):
-            state = game.new_initial_state()
-            depth = 0
-            max_depth = 10  # 限制深度，避免太深
-            
-            while not state.is_terminal() and depth < max_depth:
-                if state.is_chance_node():
-                    outcomes = state.chance_outcomes()
-                    action = np.random.choice([a for a, _ in outcomes], 
-                                             p=[p for _, p in outcomes])
-                    state = state.child(action)
-                else:
-                    player = state.current_player()
-                    probs = deep_cfr_solver.action_probabilities(state, player)
-                    entropy = compute_policy_entropy(probs)
-                    entropies.append(entropy)
-                    states_sampled += 1
+        for sample_idx in range(num_sample_states):
+            try:
+                state = game.new_initial_state()
+                depth = 0
+                
+                while not state.is_terminal() and depth < max_depth:
+                    if state.is_chance_node():
+                        outcomes = state.chance_outcomes()
+                        if not outcomes:
+                            break
+                        action = np.random.choice([a for a, _ in outcomes], 
+                                                 p=[p for _, p in outcomes])
+                        state = state.child(action)
+                    else:
+                        player = state.current_player()
+                        legal_actions = state.legal_actions()
+                        
+                        if len(legal_actions) == 0:
+                            break
+                        
+                        # 获取策略概率
+                        try:
+                            probs = deep_cfr_solver.action_probabilities(state, player)
+                            
+                            # 确保所有合法动作都有概率
+                            action_probs = {a: probs.get(a, 0.0) for a in legal_actions}
+                            
+                            # 归一化（防止概率和不为1）
+                            total = sum(action_probs.values())
+                            if total > 0:
+                                action_probs = {a: p/total for a, p in action_probs.items()}
+                            else:
+                                # 如果所有概率为0，使用均匀分布
+                                action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
+                            
+                            # 计算熵
+                            entropy = compute_policy_entropy(action_probs)
+                            if entropy > 0:  # 只记录有效的熵值
+                                entropies.append(entropy)
+                                states_sampled += 1
+                            
+                            # 根据策略采样动作继续
+                            actions = list(action_probs.keys())
+                            probabilities = list(action_probs.values())
+                            action = np.random.choice(actions, p=probabilities)
+                            state = state.child(action)
+                        except Exception as e:
+                            # 如果获取策略失败，跳过这个状态
+                            if verbose:
+                                print(f"    采样 {sample_idx}: 获取策略失败: {e}")
+                            break
                     
-                    # 根据策略采样动作
-                    actions = list(probs.keys())
-                    probabilities = list(probs.values())
-                    action = np.random.choice(actions, p=probabilities)
-                    state = state.child(action)
-                depth += 1
+                    depth += 1
+                    
+                    # 如果已经采样到足够的状态，提前退出
+                    if states_sampled >= num_sample_states:
+                        break
+                        
+            except Exception as e:
+                # 单个采样失败不影响整体
+                if verbose:
+                    print(f"    采样 {sample_idx} 失败: {e}")
+                continue
+                
     except Exception as e:
         if verbose:
             print(f"  ⚠️ 策略熵计算出错: {e}")
+            import traceback
+            traceback.print_exc()
     
     if entropies:
         metrics['avg_entropy'] = np.mean(entropies)
@@ -267,6 +324,7 @@ def quick_evaluate(
     deep_cfr_solver,
     include_test_games=False,
     num_test_games=50,
+    max_depth=None,
     verbose=True
 ):
     """快速评估（轻量级）
@@ -276,6 +334,7 @@ def quick_evaluate(
         deep_cfr_solver: DeepCFRSolver 实例
         include_test_games: 是否包含测试对局
         num_test_games: 测试对局数量
+        max_depth: 最大采样深度（None 时自动设置）
         verbose: 是否显示详细信息
     
     Returns:
@@ -283,7 +342,8 @@ def quick_evaluate(
     """
     # 策略质量评估
     metrics = evaluate_policy_quality(game, deep_cfr_solver, 
-                                      num_sample_states=50, 
+                                      num_sample_states=50,
+                                      max_depth=max_depth,
                                       verbose=verbose)
     
     # 测试对局（可选）

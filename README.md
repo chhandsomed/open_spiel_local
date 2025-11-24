@@ -1,57 +1,45 @@
 # OpenSpiel 德州扑克训练项目
 
-## 📖 主要文档
+## 📖 快速开始
 
-**👉 [README_TEXAS_HOLDEM.md](README_TEXAS_HOLDEM.md) - 完整使用指南（推荐从这里开始）**
-
-这是项目的完整使用指南，包含：
-- 快速开始
-- DeepCFR 和 MCCFR 训练方法
-- 推理使用方法
-- 注意事项和常见问题
-
-## 🚀 快速开始
-
-### DeepCFR 训练
+### 环境设置
 ```bash
-python train_deep_cfr_texas.py --num_iterations 100 --skip_nashconv
+conda activate open_spiel
 ```
 
-### DeepCFR 推理
+### DeepCFR 训练（推荐）
 ```bash
-python inference_simple.py --num_games 10
+# 6人场训练（默认使用简单特征版本）
+python train_deep_cfr_texas.py \
+    --num_players 6 \
+    --num_iterations 100 \
+    --skip_nashconv \
+    --eval_interval 10
 ```
 
-### MCCFR 训练
+### 交互式游戏
 ```bash
-python train_texas_holdem_mccfr.py --num_players 2 --iterations 1000
+python play_interactive.py --model_dir models/deepcfr_texas_*
 ```
 
-## 📁 核心文件
+## 📚 完整文档
 
-### DeepCFR
-- `train_deep_cfr_texas.py` - 训练脚本
-- `inference_simple.py` - 推理脚本（推荐）
-- `training_evaluator.py` - 训练评估模块
-- `nash_conv_gpu.py` - NashConv GPU 加速
+- **[README_TEXAS_HOLDEM.md](README_TEXAS_HOLDEM.md)** - 完整使用指南（训练、推理、参数说明）
+- **[USAGE_GUIDE.md](USAGE_GUIDE.md)** - 特征转换使用指南（简单版本 vs 复杂版本）
+- **[LOSS_AND_EVALUATION.md](LOSS_AND_EVALUATION.md)** - 损失计算与评估方法详解
+- **[INTERACTIVE_PLAY_GUIDE.md](INTERACTIVE_PLAY_GUIDE.md)** - 交互式游戏使用指南
 
-### MCCFR
-- `train_texas_holdem_mccfr.py` - 训练脚本
-- `load_and_test_strategy.py` - 策略加载和测试
+## 🎯 核心功能
 
-## 📚 详细文档
-
-- [README_TEXAS_HOLDEM.md](README_TEXAS_HOLDEM.md) - **主文档（完整指南）**
-- [TRAINING_EVALUATION_GUIDE.md](TRAINING_EVALUATION_GUIDE.md) - 训练评估详细指南
-- [SKIP_NASHCONV_EXPLANATION.md](SKIP_NASHCONV_EXPLANATION.md) - NashConv 说明
-- [INFERENCE_GUIDE.md](INFERENCE_GUIDE.md) - 推理详细指南
-- [NASHCONV_RESOURCE_FIX.md](NASHCONV_RESOURCE_FIX.md) - NashConv 资源修复
-- [TEXAS_HOLDEM_GUIDE.md](TEXAS_HOLDEM_GUIDE.md) - 德州扑克技术指南
+1. **DeepCFR 训练** - 支持2-6人场，GPU加速，自动特征提取
+2. **特征转换** - 起手牌强度、位置优势等7维手动特征
+3. **训练评估** - 策略熵、缓冲区大小、测试对局等轻量级指标
+4. **交互式游戏** - 与训练好的模型对局
 
 ## ⚠️ 重要提示
 
-1. **训练时使用 `--skip_nashconv`**：避免资源问题
-2. **游戏配置必须一致**：训练和推理时配置要相同
-3. **网络结构必须一致**：推理时参数要与训练时相同
+- 训练时使用 `--skip_nashconv` 避免资源问题
+- 游戏配置必须与训练时一致
+- 网络结构参数必须与训练时一致
 
 详细说明请参考 [README_TEXAS_HOLDEM.md](README_TEXAS_HOLDEM.md)

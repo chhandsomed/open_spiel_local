@@ -16,6 +16,8 @@ import pyspiel
 from open_spiel.python.games import pokerkit_wrapper  # noqa: F401
 from open_spiel.python.pytorch import deep_cfr
 from open_spiel.python import policy
+from deep_cfr_with_feature_transform import DeepCFRWithFeatureTransform
+from deep_cfr_simple_feature import DeepCFRSimpleFeature
 
 
 def json_serialize(obj):
@@ -77,6 +79,10 @@ def train_deep_cfr(
     eval_with_games=False,
     save_history=True,
     save_dir="models",
+    use_feature_transform=True,  # 新增：是否使用特征转换层
+    use_simple_feature=True,  # 新增：是否使用简单版本（直接拼接7维特征，推荐True）
+    transformed_size=150,  # 新增：转换后的特征大小（仅用于复杂版本）
+    use_hybrid_transform=True,  # 新增：是否使用混合特征转换（仅用于复杂版本）
 ):
     """使用 DeepCFR 训练德州扑克策略
     
@@ -179,19 +185,65 @@ def train_deep_cfr(
     sys.stdout.flush()
     
     try:
-        deep_cfr_solver = deep_cfr.DeepCFRSolver(
-            game,
-            policy_network_layers=policy_layers,
-            advantage_network_layers=advantage_layers,
-            num_iterations=num_iterations,
-            num_traversals=num_traversals,
-            learning_rate=learning_rate,
-            batch_size_advantage=None,
-            batch_size_strategy=None,
-            memory_capacity=memory_capacity,
-            device=device,
-        )
-        print("  ✓ DeepCFR 求解器创建成功")
+        if use_feature_transform:
+            if use_simple_feature:
+                # 使用简单版本：直接拼接7维手动特征
+                deep_cfr_solver = DeepCFRSimpleFeature(
+                    game,
+                    policy_network_layers=policy_layers,
+                    advantage_network_layers=advantage_layers,
+                    num_iterations=num_iterations,
+                    num_traversals=num_traversals,
+                    learning_rate=learning_rate,
+                    batch_size_advantage=None,
+                    batch_size_strategy=None,
+                    memory_capacity=memory_capacity,
+                    device=device,
+                )
+                print("  ✓ DeepCFR Simple Feature 求解器创建成功（简单版本）")
+                print(f"  ✓ 原始信息状态大小: {deep_cfr_solver._embedding_size}")
+                print(f"  ✓ 手动特征维度: 7 (直接拼接)")
+                print(f"  ✓ MLP输入维度: {deep_cfr_solver._embedding_size + 7}")
+                print(f"  ✓ 说明: 信息状态({deep_cfr_solver._embedding_size}维) + 手动特征(7维) -> MLP")
+            else:
+                # 使用复杂版本：特征转换层
+                deep_cfr_solver = DeepCFRWithFeatureTransform(
+                    game,
+                    policy_network_layers=policy_layers,
+                    advantage_network_layers=advantage_layers,
+                    transformed_size=transformed_size,
+                    use_hybrid_transform=use_hybrid_transform,
+                    num_iterations=num_iterations,
+                    num_traversals=num_traversals,
+                    learning_rate=learning_rate,
+                    batch_size_advantage=None,
+                    batch_size_strategy=None,
+                    memory_capacity=memory_capacity,
+                    device=device,
+                )
+                print("  ✓ DeepCFR with Feature Transform 求解器创建成功（复杂版本）")
+                print(f"  ✓ 原始信息状态大小: {deep_cfr_solver._embedding_size} (自动检测，保留)")
+                print(f"  ✓ 手动特征维度: 7 (新增)")
+                print(f"  ✓ 可学习特征维度: 64 (新增)")
+                combined_size = deep_cfr_solver._embedding_size + 7 + 64
+                print(f"  ✓ 合并后维度: {combined_size} (原始{deep_cfr_solver._embedding_size} + 手动7 + 可学习64)")
+                print(f"  ✓ 最终输出维度: {transformed_size}")
+                print(f"  ✓ 使用混合特征转换: {use_hybrid_transform}")
+        else:
+            # 使用标准 DeepCFR
+            deep_cfr_solver = deep_cfr.DeepCFRSolver(
+                game,
+                policy_network_layers=policy_layers,
+                advantage_network_layers=advantage_layers,
+                num_iterations=num_iterations,
+                num_traversals=num_traversals,
+                learning_rate=learning_rate,
+                batch_size_advantage=None,
+                batch_size_strategy=None,
+                memory_capacity=memory_capacity,
+                device=device,
+            )
+            print("  ✓ DeepCFR 求解器创建成功（标准版本）")
         if device.type == "cuda":
             print(f"  ✓ 模型已移到 GPU: {device}")
         sys.stdout.flush()
@@ -219,6 +271,10 @@ def train_deep_cfr(
             'learning_rate': learning_rate,
             'memory_capacity': memory_capacity,
             'device': str(device),
+            'use_feature_transform': use_feature_transform,
+            'use_simple_feature': use_simple_feature if use_feature_transform else None,
+            'transformed_size': transformed_size if (use_feature_transform and not use_simple_feature) else None,
+            'use_hybrid_transform': use_hybrid_transform if (use_feature_transform and not use_simple_feature) else None,
         },
         'iterations': [],
         'start_time': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -263,56 +319,57 @@ def train_deep_cfr(
                 print()
                 
                 # 进行评估（轻量级，不计算 NashConv）
-                if skip_nashconv:
-                    try:
-                        from training_evaluator import quick_evaluate, print_evaluation_summary
-                        print(f"\n  评估训练效果（迭代 {iteration + 1}）...", end="", flush=True)
-                        eval_result = quick_evaluate(
-                            game,
-                            deep_cfr_solver,
-                            include_test_games=eval_with_games,
-                            num_test_games=50,
-                            verbose=False
-                        )
-                        print(" 完成")
-                        
-                        # 打印简要评估信息
-                        metrics = eval_result['metrics']
-                        print(f"  策略熵: {metrics.get('avg_entropy', 0):.4f} | "
-                              f"策略缓冲区: {metrics.get('strategy_buffer_size', 0):,} | "
-                              f"优势样本: {metrics.get('total_advantage_samples', 0):,}")
-                        
+                # 注意：评估应该总是运行（如果可用），NashConv是可选的
+                try:
+                    from training_evaluator import quick_evaluate, print_evaluation_summary
+                    print(f"\n  评估训练效果（迭代 {iteration + 1}）...", end="", flush=True)
+                    eval_result = quick_evaluate(
+                        game,
+                        deep_cfr_solver,
+                        include_test_games=eval_with_games,
+                        num_test_games=50,
+                        max_depth=None,  # 自动设置（基于游戏特性）
+                        verbose=False
+                    )
+                    print(" 完成")
+                    
+                    # 打印简要评估信息
+                    metrics = eval_result['metrics']
+                    print(f"  策略熵: {metrics.get('avg_entropy', 0):.4f} | "
+                          f"策略缓冲区: {metrics.get('strategy_buffer_size', 0):,} | "
+                          f"优势样本: {metrics.get('total_advantage_samples', 0):,}")
+                    
+                    if eval_result.get('test_results'):
+                        test = eval_result['test_results']
+                        print(f"  测试对局: 玩家0平均收益={test.get('player0_avg_return', 0):.4f}, "
+                              f"胜率={test.get('player0_win_rate', 0)*100:.1f}%")
+                    
+                    # 记录评估结果到历史
+                    if save_history:
+                        iteration_record = {
+                            'iteration': iteration + 1,
+                            'time_elapsed': float(time.time() - start_time),
+                            'advantage_losses': {str(p): float(losses[-1]) if losses and losses[-1] is not None else None 
+                                                 for p, losses in advantage_losses.items()},
+                            'metrics': {
+                                'avg_entropy': float(metrics.get('avg_entropy', 0)),
+                                'strategy_buffer_size': int(metrics.get('strategy_buffer_size', 0)),
+                                'total_advantage_samples': int(metrics.get('total_advantage_samples', 0)),
+                            }
+                        }
                         if eval_result.get('test_results'):
                             test = eval_result['test_results']
-                            print(f"  测试对局: 玩家0平均收益={test.get('player0_avg_return', 0):.4f}, "
-                                  f"胜率={test.get('player0_win_rate', 0)*100:.1f}%")
-                        
-                        # 记录评估结果到历史
-                        if save_history:
-                            iteration_record = {
-                                'iteration': iteration + 1,
-                                'time_elapsed': float(time.time() - start_time),
-                                'advantage_losses': {str(p): float(losses[-1]) if losses and losses[-1] is not None else None 
-                                                     for p, losses in advantage_losses.items()},
-                                'metrics': {
-                                    'avg_entropy': float(metrics.get('avg_entropy', 0)),
-                                    'strategy_buffer_size': int(metrics.get('strategy_buffer_size', 0)),
-                                    'total_advantage_samples': int(metrics.get('total_advantage_samples', 0)),
-                                }
+                            iteration_record['test_results'] = {
+                                'player0_avg_return': float(test.get('player0_avg_return', 0)),
+                                'player0_win_rate': float(test.get('player0_win_rate', 0)),
                             }
-                            if eval_result.get('test_results'):
-                                test = eval_result['test_results']
-                                iteration_record['test_results'] = {
-                                    'player0_avg_return': float(test.get('player0_avg_return', 0)),
-                                    'player0_win_rate': float(test.get('player0_win_rate', 0)),
-                                }
-                            training_history['iterations'].append(iteration_record)
-                    except ImportError:
-                        # 如果评估模块不存在，跳过
-                        pass
-                    except Exception as e:
-                        # 评估失败不影响训练
-                        print(f"  ⚠️ 评估失败: {e}")
+                        training_history['iterations'].append(iteration_record)
+                except ImportError:
+                    # 如果评估模块不存在，跳过
+                    pass
+                except Exception as e:
+                    # 评估失败不影响训练
+                    print(f"  ⚠️ 评估失败: {e}")
         
         # 训练策略网络
         print("  训练策略网络...", end="", flush=True)
@@ -455,6 +512,10 @@ def train_deep_cfr(
                 'learning_rate': learning_rate,
                 'memory_capacity': memory_capacity,
                 'device': str(device),
+                'use_feature_transform': use_feature_transform,
+                'use_simple_feature': use_simple_feature if use_feature_transform else None,
+                'transformed_size': transformed_size if (use_feature_transform and not use_simple_feature) else None,
+                'use_hybrid_transform': use_hybrid_transform if (use_feature_transform and not use_simple_feature) else None,
                 'training_time': time.strftime('%Y-%m-%d %H:%M:%S'),
             }
             with open(config_path, 'w') as f:
@@ -489,6 +550,13 @@ if __name__ == "__main__":
     parser.add_argument("--eval_interval", type=int, default=10, help="每 N 次迭代进行一次评估")
     parser.add_argument("--eval_with_games", action="store_true", help="评估时包含测试对局")
     parser.add_argument("--save_history", action="store_true", default=True, help="保存训练历史到JSON文件")
+    parser.add_argument("--use_feature_transform", action="store_true", default=True, help="使用特征转换层（默认启用）")
+    parser.add_argument("--no_feature_transform", dest="use_feature_transform", action="store_false", help="不使用特征转换层")
+    parser.add_argument("--use_simple_feature", action="store_true", default=True, help="使用简单版本（直接拼接7维特征，默认启用，推荐）")
+    parser.add_argument("--no_simple_feature", dest="use_simple_feature", action="store_false", help="不使用简单版本（使用复杂特征转换层）")
+    parser.add_argument("--transformed_size", type=int, default=150, help="转换后的特征大小（仅用于复杂版本，默认150）")
+    parser.add_argument("--use_hybrid_transform", action="store_true", default=True, help="使用混合特征转换（仅用于复杂版本，默认启用）")
+    parser.add_argument("--no_hybrid_transform", dest="use_hybrid_transform", action="store_false", help="不使用混合特征转换（仅用于复杂版本）")
     
     args = parser.parse_args()
     
@@ -507,5 +575,9 @@ if __name__ == "__main__":
         eval_interval=args.eval_interval,
         eval_with_games=args.eval_with_games,
         save_history=args.save_history,
+        use_feature_transform=args.use_feature_transform,
+        use_simple_feature=args.use_simple_feature,
+        transformed_size=args.transformed_size,
+        use_hybrid_transform=args.use_hybrid_transform,
     )
 

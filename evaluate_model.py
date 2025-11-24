@@ -443,18 +443,16 @@ def main():
     # 创建游戏（必须与训练时完全一致）
     print(f"\n[1/3] 创建游戏 ({args.num_players}人场)...")
     num_players = args.num_players
-    blinds_str = " ".join(["100"] * num_players)
-    stacks_str = " ".join(["2000"] * num_players)
-    
-    # 配置 firstPlayer: Preflop 是大盲后第一个玩家，后续轮次是小盲
-    # 注意: universal_poker 使用 1-indexed，所以 player 0 = 1, player 2 = 3
+    # 配置 blinds 和 firstPlayer
     if num_players == 2:
-        # 2人场: Preflop 是 button (player 1), 后续是小盲 (player 0)
-        first_player_str = " ".join(["2"] + ["1"] * 3)  # round 0: player 1 (button), rounds 1-3: player 0 (SB)
+        blinds_str = "100 50"
+        first_player_str = "2 1 1 1"
     else:
-        # 多人场: Preflop 是 UTG (player 2), 后续是小盲 (player 0)
-        # 注意: 1-indexed，所以 player 2 = 3, player 0 = 1
-        first_player_str = " ".join(["3"] + ["1"] * 3)  # round 0: player 2 (UTG), rounds 1-3: player 0 (SB)
+        blinds_list = ["50", "100"] + ["0"] * (num_players - 2)
+        blinds_str = " ".join(blinds_list)
+        first_player_str = " ".join(["3"] + ["1"] * 3)
+        
+    stacks_str = " ".join(["2000"] * num_players)
     
     game_string = (
         f"universal_poker("

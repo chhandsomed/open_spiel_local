@@ -291,16 +291,25 @@ def calculate_position_advantage(player_idx, num_players=6):
     
     features = []
     
-    # 位置优势值（6人场：UTG=0, MP=1, CO=2, BTN=3, SB=4, BB=5）
-    # 位置优势：BTN > CO > MP > UTG，SB和BB在盲注轮有位置优势
-    position_values = {
-        0: 0.0,   # UTG - 最弱
-        1: 0.3,   # MP
-        2: 0.6,   # CO
-        3: 1.0,   # BTN - 最强
-        4: 0.7,   # SB
-        5: 0.8,   # BB
-    }
+    # 位置优势值（6人场：UTG=2, MP=3, CO=4, BTN=5, SB=0, BB=1）
+    # 基于 OpenSpiel universal_poker 的默认玩家顺序：P0=SB, P1=BB, P2=UTG...
+    if num_players == 6:
+        position_values = {
+            2: 0.0,   # UTG - 最弱
+            3: 0.3,   # MP
+            4: 0.6,   # CO
+            5: 1.0,   # BTN - 最强
+            0: 0.7,   # SB
+            1: 0.8,   # BB
+        }
+    elif num_players == 2:
+        # 2人场：P0=BB, P1=SB/BTN
+        position_values = {
+            0: 0.8,   # BB
+            1: 1.0,   # SB/BTN - 有位置优势
+        }
+    else:
+        position_values = {i: 0.5 for i in range(num_players)}
     
     # 计算位置优势值
     position_advantage = torch.zeros(batch_size, 1, device=player_idx.device)
@@ -310,13 +319,20 @@ def calculate_position_advantage(player_idx, num_players=6):
     features.append(position_advantage)
     
     # 位置编码（one-hot，但只取关键位置）
-    # 注意：is_early/is_late/is_blind 和 distance_to_btn 与 position_advantage 有重叠
-    # 但保留 is_early/is_late/is_blind 因为它们提供离散分类信息，可能对网络学习有帮助
-    # 移除 distance_to_btn，因为它与 position_advantage 高度相关，信息冗余
     player_idx_expanded = player_idx.unsqueeze(1)  # [batch_size, 1]
-    is_early = ((player_idx_expanded == 0) | (player_idx_expanded == 1)).float()  # UTG, MP
-    is_late = ((player_idx_expanded == 2) | (player_idx_expanded == 3)).float()    # CO, BTN
-    is_blind = ((player_idx_expanded == 4) | (player_idx_expanded == 5)).float()  # SB, BB
+    
+    if num_players == 6:
+        is_early = ((player_idx_expanded == 2) | (player_idx_expanded == 3)).float()  # UTG, MP
+        is_late = ((player_idx_expanded == 4) | (player_idx_expanded == 5)).float()    # CO, BTN
+        is_blind = ((player_idx_expanded == 0) | (player_idx_expanded == 1)).float()  # SB, BB
+    elif num_players == 2:
+        is_early = torch.zeros_like(player_idx_expanded)
+        is_late = (player_idx_expanded == 1).float()   # BTN
+        is_blind = torch.ones_like(player_idx_expanded) # Both are blinds
+    else:
+        is_early = torch.zeros_like(player_idx_expanded)
+        is_late = torch.zeros_like(player_idx_expanded)
+        is_blind = torch.zeros_like(player_idx_expanded)
     
     features.extend([is_early, is_late, is_blind])
     

@@ -205,13 +205,16 @@ def simulate_game_and_print_states(num_players=6, num_steps=10):
     print("=" * 70)
     
     # 创建游戏
-    blinds_str = " ".join(["100"] * num_players)
-    stacks_str = " ".join(["2000"] * num_players)
-    
+    # 配置 blinds 和 firstPlayer
     if num_players == 2:
-        first_player_str = " ".join(["2"] + ["1"] * 3)
+        blinds_str = "100 50"
+        first_player_str = "2 1 1 1"
     else:
+        blinds_list = ["50", "100"] + ["0"] * (num_players - 2)
+        blinds_str = " ".join(blinds_list)
         first_player_str = " ".join(["3"] + ["1"] * 3)
+        
+    stacks_str = " ".join(["2000"] * num_players)
     
     game_string = (
         f"universal_poker("

@@ -116,24 +116,31 @@ def train_deep_cfr(
     print("  注意: 使用 universal_poker (DeepCFR 需要 information_state_tensor)")
     sys.stdout.flush()
     
-    # 使用 universal_poker 的游戏字符串格式
-    # 德州扑克: 4 rounds (preflop, flop, turn, river)
-    # numBoardCards: 每个round的board card数量 (0 3 1 1)
-    # firstPlayer: 每个round第一个行动的玩家（1-indexed）
-    #   - Preflop: 大盲后面的玩家 (player 2, 即索引2+1=3)
-    #   - Flop/Turn/River: 小盲位置的玩家 (player 0, 即索引0+1=1)
-    blinds_str = " ".join(["100"] * num_players)  # 小盲大盲
-    stacks_str = " ".join(["2000"] * num_players)
-    
-    # 配置 firstPlayer: Preflop 是大盲后第一个玩家，后续轮次是小盲
-    # 注意: universal_poker 使用 1-indexed，所以 player 0 = 1, player 2 = 3
+    # 配置 blinds 和 firstPlayer
     if num_players == 2:
-        # 2人场: Preflop 是 button (player 1), 后续是小盲 (player 0)
-        first_player_str = " ".join(["2"] + ["1"] * 3)  # round 0: player 1 (button), rounds 1-3: player 0 (SB)
+        # 2人场 (Heads-Up): 
+        # P1 是 Button/SB (行动: Preflop先, Postflop后)
+        # P0 是 BB (行动: Preflop后, Postflop先)
+        # Blinds: P0=100(BB), P1=50(SB)
+        blinds_str = "100 50" 
+        first_player_str = "2 1 1 1"  # Preflop: P1(SB), Postflop: P0(BB)
     else:
-        # 多人场: Preflop 是 UTG (player 2), 后续是小盲 (player 0)
-        # 注意: 1-indexed，所以 player 2 = 3, player 0 = 1
-        first_player_str = " ".join(["3"] + ["1"] * 3)  # round 0: player 2 (UTG), rounds 1-3: player 0 (SB)
+        # 多人场 (e.g. 6-max):
+        # P0 是 SB
+        # P1 是 BB
+        # P2 是 UTG
+        # ...
+        # P(N-1) 是 Button
+        # Blinds: P0=50(SB), P1=100(BB), Others=0
+        blinds_list = ["50", "100"] + ["0"] * (num_players - 2)
+        blinds_str = " ".join(blinds_list)
+        # Preflop: UTG (P2, index 3) acts first
+        # Postflop: SB (P0, index 1) acts first
+        # 注意: universal_poker 使用 1-indexed，所以 player 2 = 3, player 0 = 1
+        first_player_str = " ".join(["3"] + ["1"] * 3)
+    
+    # stacks_str 保持一致
+    stacks_str = " ".join(["2000"] * num_players)
     
     game_string = (
         f"universal_poker("

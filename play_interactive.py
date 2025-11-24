@@ -41,6 +41,9 @@ def load_model(model_dir, num_players=None, device='cpu'):
         use_simple_feature = config.get('use_simple_feature', False)
         use_feature_transform = config.get('use_feature_transform', False)
         policy_layers = tuple(config.get('policy_layers', [64, 64]))
+        
+        # 获取保存前缀
+        save_prefix = config.get('save_prefix', 'deepcfr_texas')
     else:
         print(f"  ⚠️ 配置文件不存在，使用默认值")
         if num_players is None:
@@ -48,6 +51,7 @@ def load_model(model_dir, num_players=None, device='cpu'):
         use_simple_feature = False
         use_feature_transform = False
         policy_layers = (64, 64)
+        save_prefix = 'deepcfr_texas'
     
     # 创建游戏（必须与训练时一致）
     game_config = {
@@ -63,10 +67,30 @@ def load_model(model_dir, num_players=None, device='cpu'):
         'betting': 'nolimit',
         'maxRaises': '3',
     }
+    
+    # 修正盲注配置（如果 num_players 是 6）
+    if num_players == 6:
+        # P0=SB(50), P1=BB(100)
+        game_config['blind'] = "50 100 0 0 0 0"
+        # P2=UTG acts first preflop (index 3), P0=SB acts first postflop (index 1)
+        game_config['firstPlayer'] = "3 1 1 1"
+    elif num_players == 2:
+        game_config['blind'] = "100 50"
+        game_config['firstPlayer'] = "2 1 1 1"
+    
     game = pyspiel.load_game('universal_poker', game_config)
     
     # 加载模型
-    policy_path = os.path.join(model_dir, 'deepcfr_texas_policy_network.pt')
+    # 优先使用 config 中的 prefix，否则尝试默认名称
+    policy_filename = f"{save_prefix}_policy_network.pt"
+    policy_path = os.path.join(model_dir, policy_filename)
+    
+    # 如果找不到，尝试旧的默认名称作为回退
+    if not os.path.exists(policy_path):
+        fallback_path = os.path.join(model_dir, 'deepcfr_texas_policy_network.pt')
+        if os.path.exists(fallback_path):
+            print(f"  ⚠️ 未找到 {policy_filename}，尝试加载 {os.path.basename(fallback_path)}")
+            policy_path = fallback_path
     
     if not os.path.exists(policy_path):
         print(f"  ✗ 模型文件不存在: {policy_path}")

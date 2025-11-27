@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """简化的 DeepCFR 推理脚本
 
-直接加载模型权重，避免创建完整求解器（避免 PyTorch 导入问题）
+直接加载模型权重，支持多种模型架构（简单特征、复杂特征转换、标准MLP）
 """
 
 import os
@@ -9,34 +9,128 @@ os.environ.setdefault('TORCH_COMPILE_DISABLE', '1')
 
 import torch
 import numpy as np
+import json
+import sys
 import pyspiel
 from open_spiel.python.games import pokerkit_wrapper  # noqa: F401
 from open_spiel.python.pytorch.deep_cfr import MLP
 
+# 尝试导入自定义特征类
+try:
+    from deep_cfr_simple_feature import DeepCFRSimpleFeature
+    from deep_cfr_with_feature_transform import DeepCFRWithFeatureTransform
+    HAVE_CUSTOM_FEATURES = True
+except ImportError:
+    HAVE_CUSTOM_FEATURES = False
+    print("注意: 未找到自定义特征模块 (deep_cfr_simple_feature.py 等)，只能加载标准 MLP 模型")
 
-def load_policy_network(model_path, embedding_size, num_actions, layers=(64, 64), device='cpu'):
-    """直接加载策略网络"""
+
+def load_config(model_prefix):
+    """尝试加载配置文件"""
+    # 尝试找到配置文件
+    # case 1: model_prefix 是完整路径前缀，如 models/dir/prefix
+    dir_name = os.path.dirname(model_prefix)
+    config_path = os.path.join(dir_name, "config.json")
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"  ⚠️ 无法读取配置文件 {config_path}: {e}")
+    
+    return None
+
+
+def load_policy_network(model_path, game, config=None, device='cpu'):
+    """加载策略网络，根据配置自动选择模型结构"""
     print(f"  加载策略网络: {model_path}")
     
-    # 创建网络结构
-    network = MLP(embedding_size, list(layers), num_actions)
-    network = network.to(device)
+    if not os.path.exists(model_path):
+        print(f"  ✗ 文件不存在: {model_path}")
+        return None
+
+    # 默认参数
+    policy_layers = [64, 64]
+    use_simple_feature = False
+    use_feature_transform = False
+    transformed_size = 150
+    use_hybrid_transform = True
     
+    # 从配置读取
+    if config:
+        policy_layers = config.get('policy_layers', [64, 64])
+        use_simple_feature = config.get('use_simple_feature', False)
+        use_feature_transform = config.get('use_feature_transform', False)
+        transformed_size = config.get('transformed_size', 150)
+        use_hybrid_transform = config.get('use_hybrid_transform', True)
+        
+        # 兼容性检查
+        if use_simple_feature and not HAVE_CUSTOM_FEATURES:
+            print("  ✗ 模型使用了 Simple Feature，但未找到对应代码模块")
+            return None
+        if use_feature_transform and not use_simple_feature and not HAVE_CUSTOM_FEATURES:
+            print("  ✗ 模型使用了 Feature Transform，但未找到对应代码模块")
+            return None
+
+    # 1. 简单特征版本 (Simple Feature)
+    if use_simple_feature and HAVE_CUSTOM_FEATURES:
+        print("  模式: Simple Feature (直接拼接特征)")
+        try:
+            # 我们只需要创建一个临时的 solver 来获取网络结构
+            # 不需要实际运行 solver
+            solver = DeepCFRSimpleFeature(
+                game,
+                policy_network_layers=tuple(policy_layers),
+                advantage_network_layers=(32, 32), # 占位
+                device=device
+            )
+            network = solver._policy_network
+        except Exception as e:
+            print(f"  ✗ 创建 SimpleFeature 模型失败: {e}")
+            return None
+
+    # 2. 复杂特征转换版本 (Feature Transform)
+    elif use_feature_transform and HAVE_CUSTOM_FEATURES:
+        print("  模式: Feature Transform (复杂特征层)")
+        try:
+            solver = DeepCFRWithFeatureTransform(
+                game,
+                policy_network_layers=tuple(policy_layers),
+                advantage_network_layers=(32, 32),
+                transformed_size=transformed_size,
+                use_hybrid_transform=use_hybrid_transform,
+                device=device
+            )
+            network = solver._policy_network
+        except Exception as e:
+            print(f"  ✗ 创建 FeatureTransform 模型失败: {e}")
+            return None
+
+    # 3. 标准版本 (Standard MLP)
+    else:
+        print("  模式: Standard MLP")
+        state = game.new_initial_state()
+        embedding_size = len(state.information_state_tensor(0))
+        num_actions = game.num_distinct_actions()
+        network = MLP(embedding_size, list(policy_layers), num_actions)
+        network = network.to(device)
+
     # 加载权重
-    if os.path.exists(model_path):
+    try:
         state_dict = torch.load(model_path, map_location=device)
         network.load_state_dict(state_dict)
         network.eval()
         print(f"  ✓ 策略网络加载成功")
         return network
-    else:
-        print(f"  ✗ 文件不存在: {model_path}")
+    except RuntimeError as e:
+        print(f"  ✗ 权重加载失败: {e}")
+        print(f"  提示: 模型结构可能不匹配 (Layers: {policy_layers})")
         return None
 
 
 def get_action_from_network(state, policy_network, device):
-    """使用策略网络获取动作"""
-    # 获取信息状态张量
+    """使用策略网络获取动作 (兼容普通 MLP 和带特征提取的网络)"""
     info_state = state.information_state_tensor()
     legal_actions = state.legal_actions()
     
@@ -45,6 +139,8 @@ def get_action_from_network(state, policy_network, device):
     
     # 前向传播
     with torch.no_grad():
+        # 检查网络是否需要特殊输入处理 (例如 SimpleFeatureMLP)
+        # 通常这些网络重写了 forward 方法来处理 raw input
         logits = policy_network(info_tensor)
         probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
     
@@ -53,16 +149,14 @@ def get_action_from_network(state, policy_network, device):
     
     # 归一化
     total = sum(action_probs.values())
-    if total > 1e-10:  # 避免除零
+    if total > 1e-10:
         action_probs = {a: p/total for a, p in action_probs.items()}
     else:
-        # 如果所有概率都是0，使用均匀分布
         action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
     
     # 采样动作
     actions = list(action_probs.keys())
     probabilities = np.array([action_probs[a] for a in actions])
-    # 确保概率和为1（处理浮点误差）
     probabilities = probabilities / probabilities.sum()
     action = np.random.choice(actions, p=probabilities)
     
@@ -70,7 +164,7 @@ def get_action_from_network(state, policy_network, device):
 
 
 def play_game_simple(game, policy_network, device, verbose=True):
-    """使用模型玩一局游戏（简化版）"""
+    """使用模型玩一局游戏"""
     state = game.new_initial_state()
     
     if verbose:
@@ -78,13 +172,11 @@ def play_game_simple(game, policy_network, device, verbose=True):
     
     while not state.is_terminal():
         if state.is_chance_node():
-            # 机会节点：随机选择
             outcomes = state.chance_outcomes()
             action = np.random.choice([a for a, _ in outcomes], 
                                      p=[p for _, p in outcomes])
             state = state.child(action)
         else:
-            # 玩家节点：使用模型策略
             player = state.current_player()
             action, action_probs = get_action_from_network(state, policy_network, device)
             
@@ -101,7 +193,7 @@ def play_game_simple(game, policy_network, device, verbose=True):
 
 
 def test_model_simple(game, policy_network, device, num_games=10):
-    """测试模型（简化版）"""
+    """测试模型"""
     print(f"\n[2/2] 测试模型 ({num_games} 局游戏)...")
     
     results = {
@@ -122,7 +214,6 @@ def test_model_simple(game, policy_network, device, num_games=10):
             if returns[player] > 0:
                 results['wins'][player] += 1
     
-    # 打印结果
     print(f"\n  测试结果:")
     for player in range(game.num_players()):
         avg_return = results['total_returns'][player] / num_games
@@ -140,13 +231,13 @@ def main():
     
     parser = argparse.ArgumentParser(description="简化的 DeepCFR 推理")
     parser.add_argument("--model_prefix", type=str, default="deepcfr_texas",
-                       help="模型文件前缀")
+                       help="模型文件路径前缀 (例如: models/run1/deepcfr_texas)")
     parser.add_argument("--num_games", type=int, default=10,
                        help="测试游戏数量")
-    parser.add_argument("--policy_layers", type=int, nargs="+", default=[64, 64],
-                       help="策略网络层大小")
-    parser.add_argument("--num_players", type=int, default=2,
-                       help="玩家数量（必须与训练时一致）")
+    parser.add_argument("--num_players", type=int, default=None,
+                       help="玩家数量 (如果不指定，尝试从配置读取，默认6)")
+    parser.add_argument("--betting_abstraction", type=str, default=None,
+                       help="下注抽象 (如果不指定，尝试从配置读取，默认为 fcpa)")
     parser.add_argument("--use_gpu", action="store_true", default=True,
                        help="使用 GPU")
     
@@ -156,14 +247,38 @@ def main():
     print("DeepCFR 简化推理")
     print("=" * 70)
     
+    # 加载配置
+    config = load_config(args.model_prefix)
+    if config:
+        print("  ✓ 找到并加载配置文件 config.json")
+    else:
+        print("  ⚠️ 未找到配置文件，将使用默认参数或命令行参数")
+
+    # 确定 num_players
+    if args.num_players is not None:
+        num_players = args.num_players
+    elif config and 'num_players' in config:
+        num_players = config['num_players']
+    else:
+        num_players = 6  # 默认为6人场
+        print(f"  注意: 未指定玩家数量，默认为 {num_players}")
+
+    # 确定 betting_abstraction
+    betting_abstraction = "fcpa" # 默认值
+    if args.betting_abstraction is not None:
+        betting_abstraction = args.betting_abstraction
+    elif config and 'betting_abstraction' in config:
+        betting_abstraction = config['betting_abstraction']
+    
+    print(f"  下注抽象: {betting_abstraction}")
+
     # 检查设备
     device = torch.device("cuda" if torch.cuda.is_available() and args.use_gpu else "cpu")
     print(f"\n使用设备: {device}")
     
-    # 创建游戏（必须与训练时完全一致）
-    print(f"\n[0/2] 创建游戏 ({args.num_players}人场)...")
-    num_players = args.num_players
-    # 配置 blinds 和 firstPlayer
+    # 创建游戏
+    print(f"\n[0/2] 创建游戏 ({num_players}人场)...")
+    
     if num_players == 2:
         blinds_str = "100 50"
         first_player_str = "2 1 1 1"
@@ -188,25 +303,21 @@ def main():
         f"numRanks=13"
         f")"
     )
-    game = pyspiel.load_game(game_string)
-    print(f"  ✓ 游戏创建成功: {game.get_type().short_name}")
-    
-    # 获取游戏参数
-    state = game.new_initial_state()
-    embedding_size = len(state.information_state_tensor(0))
-    num_actions = game.num_distinct_actions()
-    
-    print(f"  信息状态大小: {embedding_size}")
-    print(f"  动作数量: {num_actions}")
+    try:
+        game = pyspiel.load_game(game_string)
+        print(f"  ✓ 游戏创建成功: {game.get_type().short_name}")
+    except Exception as e:
+        print(f"  ✗ 游戏创建失败: {e}")
+        return
     
     # 加载模型
     print(f"\n[1/2] 加载模型...")
     policy_path = f"{args.model_prefix}_policy_network.pt"
+    
     policy_network = load_policy_network(
         policy_path,
-        embedding_size,
-        num_actions,
-        layers=tuple(args.policy_layers),
+        game,
+        config=config,
         device=device
     )
     
@@ -224,4 +335,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

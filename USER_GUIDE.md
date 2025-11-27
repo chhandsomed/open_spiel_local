@@ -137,15 +137,9 @@ python play_interactive.py \
     --human_player 0
 ```
 
-### 游戏流程
-1.  **启动**: 脚本自动检测模型配置，加载环境。
-2.  **状态**: 显示当前轮次（Preflop/Flop/Turn/River）、公共牌、底池、你的手牌。
-3.  **行动**: 输入数字选择动作（弃牌/跟注/加注）。
-4.  **结束**: 结算收益，显示所有玩家手牌。
-
-### 故障排除
-*   **"RuntimeError: size mismatch"**: 检查模型是否使用了不同的 `bettingAbstraction` 或特征配置。确保 `config.json` 存在且正确。
-*   **"模型加载失败"**: 检查模型文件（.pt）是否存在于目录中。
+**功能**:
+*   自动检测 `config.json` 中的 `betting_abstraction`，加载正确的动作空间。
+*   支持 `fchpa` 模式下的 5 种动作：Fold, Check/Call, Pot, All-in, Half-pot。
 
 ---
 
@@ -192,42 +186,7 @@ python load_and_test_strategy.py
 *   **原因**: 6人局复杂度是指数级增长的。
 *   **解决**: 需要指数级增加的训练资源。2000 次迭代对于 6 人局可能只是起步，可能需要 5000+ 次迭代才能达到较强水平。
 
----
-
-## 8. 进阶主题：特征转换 (Feature Engineering)
-
-本项目默认使用**简单特征版本**（Simple Feature），即将 7 维手动特征（如手牌强度、位置优势）直接拼接到原始信息状态张量中。
-
-### 两种模式
-1.  **简单版本 (推荐)**: `info_state (281) + manual_features (7) -> MLP`。计算快，效果好。
-2.  **复杂版本**: `info_state + features -> Transform Layer -> MLP`。包含可学习特征，适合更深的研究。
-
-### 代码调用
-```python
-from deep_cfr_simple_feature import DeepCFRSimpleFeature
-# 自动启用特征拼接
-solver = DeepCFRSimpleFeature(game, policy_network_layers=(128, 128), ...)
-```
-
----
-
-## 9. 进阶主题：损失与评估 (Loss & Evaluation)
-
-### 损失计算
-DeepCFR 的损失函数包含 `sqrt(iteration)` 加权项。因此，**随着迭代次数增加，损失值自然会增长**。
-*   **不要**仅凭损失值绝对值判断训练是否恶化。
-*   应关注损失值的相对趋势。
-
-### 评估指标
-判断训练效果的最佳指标：
-1.  **策略熵 (Policy Entropy)**: 应逐渐降低，表示策略在收敛。
-2.  **缓冲区大小 (Buffer Size)**: 应持续增长，表示探索了更多状态。
-3.  **测试对局 (Test Games)**: 胜率应稳定在 50% 以上（对随机策略）或与其他模型对战胜率提升。
-4.  **NashConv**: 最准确但计算极其耗时，大规模训练时建议跳过 (`--skip_nashconv`)。
-
----
-
-## 10. 文件结构
+## 8. 文件结构
 
 ```
 .
@@ -240,22 +199,7 @@ DeepCFR 的损失函数包含 `sqrt(iteration)` 加权项。因此，**随着迭
 ├── models/                      # 模型保存目录
 │   └── deepcfr_texas_.../       # 每次训练的独立目录
 │       ├── config.json          # 训练配置
-│       ├── *_policy_network.pt  # 策略网络权重 (用于推理)
-│       ├── *_advantage_player_*.pt # 优势网络权重 (仅用于训练)
+│       ├── *_policy_network.pt  # 策略网络权重
 │       └── *_history.json       # 训练日志
 └── train_texas_holdem_mccfr.py  # MCCFR 训练脚本
-
-## 11. 附录：DeepCFR 网络结构说明
-
-DeepCFR 包含两种类型的神经网络，它们作用不同：
-
-### 1. 优势网络 (Advantage Network)
-- **数量**: 每个玩家 1 个 (6人局有 6 个)
-- **作用**: 预测每个动作的**后悔值 (Regret)**。它指导算法在训练过程中如何改进策略。
-- **使用场景**: **仅训练阶段**。推理时不需要。
-
-### 2. 策略网络 (Policy Network)
-- **数量**: 所有玩家共用 1 个
-- **作用**: 拟合所有迭代产生的**平均策略**。根据 DeepCFR 理论，平均策略会收敛到纳什均衡。
-- **使用场景**: **推理、对战阶段**。这是最终产出的模型文件。
 ```

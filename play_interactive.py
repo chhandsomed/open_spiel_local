@@ -44,6 +44,12 @@ def load_model(model_dir, num_players=None, device='cpu'):
         
         # 获取保存前缀
         save_prefix = config.get('save_prefix', 'deepcfr_texas')
+        
+        # 获取 betting_abstraction
+        betting_abstraction = config.get('betting_abstraction', 'fcpa')
+        
+        # 获取 game_string
+        game_string = config.get('game_string', None)
     else:
         print(f"  ⚠️ 配置文件不存在，使用默认值")
         if num_players is None:
@@ -52,33 +58,48 @@ def load_model(model_dir, num_players=None, device='cpu'):
         use_feature_transform = False
         policy_layers = (64, 64)
         save_prefix = 'deepcfr_texas'
+        betting_abstraction = 'fcpa'
+        game_string = None
     
     # 创建游戏（必须与训练时一致）
-    game_config = {
-        'numPlayers': num_players,
-        'numBoardCards': '0 3 1 1',
-        'numRanks': 13,
-        'numSuits': 4,
-        'firstPlayer': '2',
-        'stack': '2000 2000 2000 2000 2000 2000',
-        'blind': '100 100 100 100 100 100',
-        'numHoleCards': 2,
-        'numRounds': 4,
-        'betting': 'nolimit',
-        'maxRaises': '3',
-    }
+    game = None
     
-    # 修正盲注配置（如果 num_players 是 6）
-    if num_players == 6:
-        # P0=SB(50), P1=BB(100)
-        game_config['blind'] = "50 100 0 0 0 0"
-        # P2=UTG acts first preflop (index 3), P0=SB acts first postflop (index 1)
-        game_config['firstPlayer'] = "3 1 1 1"
-    elif num_players == 2:
-        game_config['blind'] = "100 50"
-        game_config['firstPlayer'] = "2 1 1 1"
+    # 优先使用 game_string
+    if game_string:
+        try:
+            print(f"  使用 game_string 创建游戏: {game_string}")
+            game = pyspiel.load_game(game_string)
+        except Exception as e:
+            print(f"  ⚠️ 使用 game_string 创建游戏失败: {e}，尝试手动配置")
+            game = None
     
-    game = pyspiel.load_game('universal_poker', game_config)
+    if game is None:
+        game_config = {
+            'numPlayers': num_players,
+            'numBoardCards': '0 3 1 1',
+            'numRanks': 13,
+            'numSuits': 4,
+            'firstPlayer': '2',
+            'stack': '2000 2000 2000 2000 2000 2000',
+            'blind': '100 100 100 100 100 100',
+            'numHoleCards': 2,
+            'numRounds': 4,
+            'betting': 'nolimit',
+            'maxRaises': '3',
+            'bettingAbstraction': betting_abstraction, # 使用读取到的配置
+        }
+        
+        # 修正盲注配置（如果 num_players 是 6）
+        if num_players == 6:
+            # P0=SB(50), P1=BB(100)
+            game_config['blind'] = "50 100 0 0 0 0"
+            # P2=UTG acts first preflop (index 3), P0=SB acts first postflop (index 1)
+            game_config['firstPlayer'] = "3 1 1 1"
+        elif num_players == 2:
+            game_config['blind'] = "100 50"
+            game_config['firstPlayer'] = "2 1 1 1"
+        
+        game = pyspiel.load_game('universal_poker', game_config)
     
     # 加载模型
     # 优先使用 config 中的 prefix，否则尝试默认名称
@@ -405,9 +426,9 @@ def action_to_string(action):
     action_map = {
         0: "弃牌 (Fold)",
         1: "跟注/过牌 (Call/Check)",
-        2: "加注 (Raise)",
+        2: "底池加注 (Pot Raise)",
         3: "全押 (All-in)",
-        4: "半池加注 (Half-pot)"
+        4: "半池加注 (Half-pot)"  # 注意：在某些配置下可能不可用
     }
     return action_map.get(action, f"动作 {action}")
 
@@ -636,13 +657,14 @@ def play_interactive_game(game, model, device, human_player=0, model_player=1):
         if p != human_player:
             print(f"  玩家 {p} 收益: {returns[p]:.2f}")
     
-    # 判断胜负（只比较人类玩家和模型玩家）
-    if returns[human_player] > returns[model_player]:
-        print(f"\n🎉 你赢了！ (你: {returns[human_player]:.2f} vs 玩家{model_player}: {returns[model_player]:.2f})")
-    elif returns[human_player] < returns[model_player]:
-        print(f"\n😢 你输了 (你: {returns[human_player]:.2f} vs 玩家{model_player}: {returns[model_player]:.2f})")
+    # 判断胜负 (显示人类玩家结果)
+    human_return = returns[human_player]
+    if human_return > 0:
+        print(f"\n🎉 你赢了！ (收益: +{human_return:.2f})")
+    elif human_return < 0:
+        print(f"\n😢 你输了 (收益: {human_return:.2f})")
     else:
-        print(f"\n🤝 平局 (你: {returns[human_player]:.2f} vs 玩家{model_player}: {returns[model_player]:.2f})")
+        print(f"\n🤝 平局 (收益: 0.00)")
     
     # 如果游戏在Preflop就结束，说明其他玩家都弃牌了
     if info['round'] == "Preflop" and len(action_history) > 0:

@@ -83,6 +83,7 @@ def train_deep_cfr(
     use_simple_feature=True,  # 新增：是否使用简单版本（直接拼接7维特征，推荐True）
     transformed_size=150,  # 新增：转换后的特征大小（仅用于复杂版本）
     use_hybrid_transform=True,  # 新增：是否使用混合特征转换（仅用于复杂版本）
+    betting_abstraction="fcpa", # 新增：下注抽象模式
 ):
     """使用 DeepCFR 训练德州扑克策略
     
@@ -95,6 +96,7 @@ def train_deep_cfr(
         learning_rate: 学习率
         memory_capacity: 内存容量
         save_prefix: 保存文件前缀
+        betting_abstraction: 下注抽象 (fcpa, fchpa, etc.)
     """
     print("=" * 70)
     print("DeepCFR 训练 - 德州扑克")
@@ -114,6 +116,7 @@ def train_deep_cfr(
     # pokerkit_wrapper 不支持 tensor，所以不能用于 DeepCFR
     print(f"\n[1/4] 创建游戏 ({num_players}人无限注德州)...")
     print("  注意: 使用 universal_poker (DeepCFR 需要 information_state_tensor)")
+    print(f"  下注抽象: {betting_abstraction}")
     sys.stdout.flush()
     
     # 配置 blinds 和 firstPlayer
@@ -153,7 +156,8 @@ def train_deep_cfr(
         f"numBoardCards=0 3 1 1,"
         f"firstPlayer={first_player_str},"
         f"numSuits=4,"
-        f"numRanks=13"
+        f"numRanks=13,"
+        f"bettingAbstraction={betting_abstraction}"  # 添加参数
         f")"
     )
     
@@ -164,6 +168,7 @@ def train_deep_cfr(
     try:
         game = pyspiel.load_game(game_string)
         print(f"  ✓ 游戏创建成功: {game.get_type().short_name}")
+        print(f"  ✓ 动作数量: {game.num_distinct_actions()}")
         sys.stdout.flush()
         
         # 验证 tensor 支持
@@ -282,6 +287,7 @@ def train_deep_cfr(
             'use_simple_feature': use_simple_feature if use_feature_transform else None,
             'transformed_size': transformed_size if (use_feature_transform and not use_simple_feature) else None,
             'use_hybrid_transform': use_hybrid_transform if (use_feature_transform and not use_simple_feature) else None,
+            'betting_abstraction': betting_abstraction,
         },
         'iterations': [],
         'start_time': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -523,6 +529,8 @@ def train_deep_cfr(
                 'use_simple_feature': use_simple_feature if use_feature_transform else None,
                 'transformed_size': transformed_size if (use_feature_transform and not use_simple_feature) else None,
                 'use_hybrid_transform': use_hybrid_transform if (use_feature_transform and not use_simple_feature) else None,
+                'betting_abstraction': betting_abstraction,
+                'game_string': game_string,
                 'training_time': time.strftime('%Y-%m-%d %H:%M:%S'),
             }
             with open(config_path, 'w') as f:
@@ -564,6 +572,7 @@ if __name__ == "__main__":
     parser.add_argument("--transformed_size", type=int, default=150, help="转换后的特征大小（仅用于复杂版本，默认150）")
     parser.add_argument("--use_hybrid_transform", action="store_true", default=True, help="使用混合特征转换（仅用于复杂版本，默认启用）")
     parser.add_argument("--no_hybrid_transform", dest="use_hybrid_transform", action="store_false", help="不使用混合特征转换（仅用于复杂版本）")
+    parser.add_argument("--betting_abstraction", type=str, default="fcpa", help="下注抽象: fcpa (默认), fchpa (含半池), fc, fullgame")
     
     args = parser.parse_args()
     
@@ -586,5 +595,5 @@ if __name__ == "__main__":
         use_simple_feature=args.use_simple_feature,
         transformed_size=args.transformed_size,
         use_hybrid_transform=args.use_hybrid_transform,
+        betting_abstraction=args.betting_abstraction,
     )
-

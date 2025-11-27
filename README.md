@@ -81,6 +81,59 @@ nohup python train_deep_cfr_texas.py \
 - 训练被中断（Ctrl+C）时会自动保存当前进度
 - 最终模型保存在主目录，不带 `_iter` 后缀
 
+### 推荐命令 (多进程并行版 - 真正的并行化) ⭐推荐
+使用多个 CPU 进程并行遍历游戏树，充分利用多核 CPU，显著提升训练速度。
+
+```bash
+# 多进程并行 + 多 GPU（4张卡，16个Worker，推荐配置）
+nohup python deep_cfr_parallel.py \
+    --num_players 6 \
+    --num_iterations 1000 \
+    --num_traversals 500 \
+    --num_workers 16 \
+    --batch_size 4096 \
+    --sync_interval 50 \
+    --use_gpu \
+    --gpu_ids 0 1 2 3 \
+    --checkpoint_interval 50 \
+    --skip_nashconv \
+    --learning_rate 0.001 \
+    --policy_network_layers 256 256 256 \
+    --advantage_network_layers 256 256 256 \
+    --memory_capacity 2000000 \
+    --betting_abstraction fchpa \
+    --save_prefix deepcfr_parallel_6p \
+    > train_parallel.log 2>&1 &
+```
+
+```bash
+# 快速测试命令（验证多GPU是否正常工作）
+python deep_cfr_parallel.py \
+    --num_players 6 \
+    --num_iterations 10 \
+    --num_traversals 100 \
+    --num_workers 4 \
+    --batch_size 1024 \
+    --use_gpu \
+    --gpu_ids 0 1 2 3 \
+    --skip_nashconv
+```
+
+**多进程并行说明**:
+- 多个 Worker 进程并行遍历游戏树（CPU 密集型）
+- 主进程在 GPU 上训练神经网络，支持多 GPU DataParallel
+- N 个 Worker 可以获得接近 N 倍的遍历速度
+- 适合多核 CPU 服务器，比纯 DataParallel 更高效
+- 支持 `--skip_nashconv` 跳过 NashConv 计算（6人局强烈建议）
+- 支持 `--checkpoint_interval` 保存中间 checkpoint
+- 训练中断时自动保存当前进度
+
+**参数建议**:
+- `--num_workers`: 建议设为 CPU 核心数的一半到全部（如 8-16）
+- `--batch_size`: 多 GPU 时建议 4096+，充分利用显存
+- `--sync_interval`: 每 N 次遍历同步网络参数，建议 50-100
+- `--gpu_ids`: 指定多张 GPU，如 `0 1 2 3` 使用 4 张卡
+
 ### 关键参数说明
 
 | 参数 | 默认值 | 推荐值 (6人局) | 说明 |
@@ -95,6 +148,19 @@ nohup python train_deep_cfr_texas.py \
 | `--multi_gpu` | `False` | - | 启用多 GPU 并行训练 (DataParallel)。 |
 | `--gpu_ids` | `None` | `0 1 2 3` | 指定使用的 GPU ID 列表。不指定则使用所有可用 GPU。 |
 | `--checkpoint_interval` | `0` | **`200`** | Checkpoint 保存间隔。0 表示不保存中间 checkpoint。 |
+
+**多进程并行版参数** (`deep_cfr_parallel.py`):
+
+| 参数 | 默认值 | 推荐值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `--num_workers` | `4` | **`8-16`** | Worker 进程数量。建议设为 CPU 核心数。 |
+| `--batch_size` | `2048` | **`4096`** | 训练批量大小。多 GPU 时越大利用率越高。 |
+| `--sync_interval` | `100` | **`50`** | 每 N 次遍历同步网络参数到 Worker。 |
+| `--skip_nashconv` | `False` | **`True`** | 跳过 NashConv 计算。6人局强烈建议开启。 |
+| `--use_gpu` | `True` | `True` | 使用 GPU 训练网络。 |
+| `--gpu_ids` | `None` | **`0 1 2 3`** | 指定多张 GPU，启用 DataParallel 并行训练。 |
+| `--policy_network_layers` | `128 128` | **`256 256 256`** | 策略网络结构。多 GPU 可用更大网络。 |
+| `--advantage_network_layers` | `128 128` | **`256 256 256`** | 优势网络结构。多 GPU 可用更大网络。 |
 
 ### 附录：动作映射表
 
@@ -232,6 +298,12 @@ python load_and_test_strategy.py
 *   **注意**: DeepCFR 的游戏树遍历（`_traverse_game_tree`）仍在 CPU 上进行，因此多 GPU 主要加速 `_learn_advantage_network()` 和 `_learn_strategy_network()` 阶段。
 *   **建议**: 增大 `memory_capacity` 以积累更多样本，使训练批次更大，多 GPU 效果更明显。
 
+### Q: 如何真正利用多核 CPU 加速训练？
+*   **解决**: 使用 `deep_cfr_parallel.py` 多进程并行版本。
+*   **原理**: 多个 Worker 进程并行遍历游戏树（CPU 密集型），主进程在 GPU 上训练网络。
+*   **效果**: N 个 Worker 可以获得接近 N 倍的遍历速度，显著提升整体训练效率。
+*   **命令**: `python deep_cfr_parallel.py --num_workers 8 --num_players 6 ...`
+
 ---
 
 ## 8. 进阶主题：特征转换 (Feature Engineering)
@@ -272,6 +344,7 @@ DeepCFR 的损失函数包含 `sqrt(iteration)` 加权项。因此，**随着迭
 ```
 .
 ├── train_deep_cfr_texas.py      # DeepCFR 训练主脚本 (支持多 GPU)
+├── deep_cfr_parallel.py         # 多进程并行 DeepCFR 训练脚本 (推荐)
 ├── inference_simple.py          # 快速推理/自对弈脚本
 ├── evaluate_models_head_to_head.py # 模型对战评测脚本
 ├── play_interactive.py          # 人机交互对战脚本

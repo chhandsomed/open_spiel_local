@@ -117,18 +117,17 @@ def nash_conv_gpu(
             if verbose:
                 print("  创建策略表格（这可能需要一些时间和内存）...")
             
-            # 使用直接调用方法，避免创建完整表格
-            # 创建一个包装策略，直接调用 action_probabilities
-            class DirectPolicy(policy.Policy):
-                def __init__(self, game, action_prob_fn):
-                    super().__init__(game, list(range(game.num_players())))
-                    self._action_prob_fn = action_prob_fn
-                
-                def action_probabilities(self, state, player_id=None):
-                    return self._action_prob_fn(state, player_id)
-            
-            direct_policy = DirectPolicy(game, deep_cfr_solver.action_probabilities)
-            pyspiel_policy = policy.python_policy_to_pyspiel_policy(direct_policy)
+            # 使用 tabular_policy_from_callable 创建完整的策略表格
+            # 这会遍历所有信息状态，可能需要较长时间和较多内存
+            try:
+                average_policy = policy.tabular_policy_from_callable(
+                    game, deep_cfr_solver.action_probabilities
+                )
+                pyspiel_policy = policy.python_policy_to_pyspiel_policy(average_policy)
+            except MemoryError:
+                if verbose:
+                    print("  ✗ 内存不足，无法创建策略表格")
+                raise
             
             # 使用 C++ 版本的 best response（更快）
             if use_cpp_br:

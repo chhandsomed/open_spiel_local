@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""使用 DeepCFR 训练德州扑克策略"""
+"""使用 DeepCFR 训练德州扑克策略
+
+支持多 GPU 并行训练（DataParallel）
+"""
 
 import os
 # 禁用 torch.compile 以避免导入问题
@@ -11,6 +14,7 @@ import time
 import json
 import numpy as np
 import torch
+import torch.nn as nn
 
 import pyspiel
 from open_spiel.python.games import pokerkit_wrapper  # noqa: F401
@@ -18,6 +22,28 @@ from open_spiel.python.pytorch import deep_cfr
 from open_spiel.python import policy
 from deep_cfr_with_feature_transform import DeepCFRWithFeatureTransform
 from deep_cfr_simple_feature import DeepCFRSimpleFeature
+
+
+def get_available_gpus():
+    """获取可用的 GPU 列表"""
+    if not torch.cuda.is_available():
+        return []
+    return list(range(torch.cuda.device_count()))
+
+
+def print_gpu_info():
+    """打印所有可用 GPU 的信息"""
+    if not torch.cuda.is_available():
+        print("  没有可用的 GPU")
+        return
+    
+    num_gpus = torch.cuda.device_count()
+    print(f"  可用 GPU 数量: {num_gpus}")
+    for i in range(num_gpus):
+        props = torch.cuda.get_device_properties(i)
+        print(f"    GPU {i}: {props.name}")
+        print(f"      - 内存: {props.total_memory / 1e9:.2f} GB")
+        print(f"      - 计算能力: {props.major}.{props.minor}")
 
 
 def json_serialize(obj):
@@ -64,6 +90,45 @@ def create_save_directory(save_prefix, save_dir="models"):
     
     return model_dir
 
+def save_checkpoint(deep_cfr_solver, game, model_dir, save_prefix, iteration, is_final=False):
+    """保存训练 checkpoint
+    
+    Args:
+        deep_cfr_solver: DeepCFR 求解器
+        game: 游戏实例
+        model_dir: 模型保存目录
+        save_prefix: 保存文件前缀
+        iteration: 当前迭代次数
+        is_final: 是否是最终模型
+    """
+    if is_final:
+        suffix = ""
+        checkpoint_dir = model_dir
+    else:
+        suffix = f"_iter{iteration}"
+        checkpoint_dir = os.path.join(model_dir, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # 保存策略网络
+    policy_path = os.path.join(checkpoint_dir, f"{save_prefix}_policy_network{suffix}.pt")
+    policy_net = deep_cfr_solver._policy_network
+    if isinstance(policy_net, nn.DataParallel):
+        torch.save(policy_net.module.state_dict(), policy_path)
+    else:
+        torch.save(policy_net.state_dict(), policy_path)
+    
+    # 保存优势网络
+    for player in range(game.num_players()):
+        advantage_path = os.path.join(checkpoint_dir, f"{save_prefix}_advantage_player_{player}{suffix}.pt")
+        adv_net = deep_cfr_solver._advantage_networks[player]
+        if isinstance(adv_net, nn.DataParallel):
+            torch.save(adv_net.module.state_dict(), advantage_path)
+        else:
+            torch.save(adv_net.state_dict(), advantage_path)
+    
+    return checkpoint_dir
+
+
 def train_deep_cfr(
     num_players=2,
     num_iterations=10,
@@ -84,6 +149,9 @@ def train_deep_cfr(
     transformed_size=150,  # 新增：转换后的特征大小（仅用于复杂版本）
     use_hybrid_transform=True,  # 新增：是否使用混合特征转换（仅用于复杂版本）
     betting_abstraction="fcpa", # 新增：下注抽象模式
+    multi_gpu=False,  # 新增：是否使用多 GPU 并行
+    gpu_ids=None,  # 新增：指定使用的 GPU ID 列表（None 表示使用所有可用 GPU）
+    checkpoint_interval=0,  # 新增：checkpoint 保存间隔（0 表示不保存中间 checkpoint）
 ):
     """使用 DeepCFR 训练德州扑克策略
     
@@ -97,6 +165,9 @@ def train_deep_cfr(
         memory_capacity: 内存容量
         save_prefix: 保存文件前缀
         betting_abstraction: 下注抽象 (fcpa, fchpa, etc.)
+        multi_gpu: 是否使用多 GPU 并行训练
+        gpu_ids: 指定使用的 GPU ID 列表（None 表示使用所有可用 GPU）
+        checkpoint_interval: checkpoint 保存间隔（0 表示不保存，建议设为 100-500）
     """
     print("=" * 70)
     print("DeepCFR 训练 - 德州扑克")
@@ -105,11 +176,37 @@ def train_deep_cfr(
     # 检查 PyTorch 和 GPU
     print(f"\nPyTorch 版本: {torch.__version__}")
     print(f"CUDA 可用: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"GPU 设备: {torch.cuda.get_device_name(0)}")
-        print(f"GPU 内存: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    print_gpu_info()
     
-    device = torch.device("cuda" if (use_gpu and torch.cuda.is_available()) else "cpu")
+    # 设置设备和多 GPU
+    available_gpus = get_available_gpus()
+    use_multi_gpu = False
+    
+    if use_gpu and torch.cuda.is_available():
+        if multi_gpu and len(available_gpus) > 1:
+            # 多 GPU 模式
+            if gpu_ids is None:
+                gpu_ids = available_gpus
+            else:
+                # 验证指定的 GPU ID 是否有效
+                gpu_ids = [gid for gid in gpu_ids if gid in available_gpus]
+            
+            if len(gpu_ids) > 1:
+                use_multi_gpu = True
+                device = torch.device(f"cuda:{gpu_ids[0]}")  # 主 GPU
+                print(f"\n🚀 多 GPU 模式已启用")
+                print(f"  使用的 GPU: {gpu_ids}")
+                print(f"  主设备: {device}")
+            else:
+                device = torch.device("cuda:0")
+                print(f"\n⚠️ 只有一个有效 GPU，使用单 GPU 模式")
+        else:
+            device = torch.device("cuda:0")
+            if multi_gpu:
+                print(f"\n⚠️ 只检测到一个 GPU，使用单 GPU 模式")
+    else:
+        device = torch.device("cpu")
+    
     print(f"使用设备: {device}")
     
     # 创建游戏 - 使用 universal_poker 因为 DeepCFR 需要 information_state_tensor
@@ -211,6 +308,8 @@ def train_deep_cfr(
                     batch_size_strategy=None,
                     memory_capacity=memory_capacity,
                     device=device,
+                    multi_gpu=use_multi_gpu,
+                    gpu_ids=gpu_ids if use_multi_gpu else None,
                 )
                 print("  ✓ DeepCFR Simple Feature 求解器创建成功（简单版本）")
                 print(f"  ✓ 原始信息状态大小: {deep_cfr_solver._embedding_size}")
@@ -232,6 +331,8 @@ def train_deep_cfr(
                     batch_size_strategy=None,
                     memory_capacity=memory_capacity,
                     device=device,
+                    multi_gpu=use_multi_gpu,
+                    gpu_ids=gpu_ids if use_multi_gpu else None,
                 )
                 print("  ✓ DeepCFR with Feature Transform 求解器创建成功（复杂版本）")
                 print(f"  ✓ 原始信息状态大小: {deep_cfr_solver._embedding_size} (自动检测，保留)")
@@ -256,14 +357,23 @@ def train_deep_cfr(
                 device=device,
             )
             print("  ✓ DeepCFR 求解器创建成功（标准版本）")
+        
+        if use_multi_gpu:
+            print(f"  ✓ 多 GPU 并行已启用: {gpu_ids}")
         if device.type == "cuda":
-            print(f"  ✓ 模型已移到 GPU: {device}")
+            print(f"  ✓ 主设备: {device}")
         sys.stdout.flush()
     except Exception as e:
         print(f"  ✗ 求解器创建失败: {e}")
         import traceback
         traceback.print_exc()
         raise
+    
+    # 提前创建保存目录（用于 checkpoint）
+    model_dir = create_save_directory(save_prefix, save_dir)
+    print(f"\n  模型保存目录: {model_dir}")
+    if checkpoint_interval > 0:
+        print(f"  Checkpoint 保存间隔: 每 {checkpoint_interval} 次迭代")
     
     # 训练
     print(f"\n[3/4] 开始训练...")
@@ -383,6 +493,15 @@ def train_deep_cfr(
                 except Exception as e:
                     # 评估失败不影响训练
                     print(f"  ⚠️ 评估失败: {e}")
+            
+            # 保存 checkpoint（独立于 eval_interval，按 checkpoint_interval 保存）
+            if checkpoint_interval > 0 and (iteration + 1) % checkpoint_interval == 0:
+                print(f"\n  💾 保存 checkpoint (迭代 {iteration + 1})...", end="", flush=True)
+                try:
+                    save_checkpoint(deep_cfr_solver, game, model_dir, save_prefix, iteration + 1)
+                    print(" 完成")
+                except Exception as e:
+                    print(f" 失败: {e}")
         
         # 训练策略网络
         print("  训练策略网络...", end="", flush=True)
@@ -418,38 +537,41 @@ def train_deep_cfr(
             print(f"  策略损失: {policy_loss:.6f}")
             
     except KeyboardInterrupt:
-        print("\n训练被中断")
+        print("\n\n⚠️ 训练被用户中断")
+        # 保存中断时的 checkpoint
+        current_iter = deep_cfr_solver._iteration
+        print(f"  💾 保存中断时的 checkpoint (迭代 {current_iter})...")
+        try:
+            checkpoint_dir = save_checkpoint(deep_cfr_solver, game, model_dir, save_prefix, current_iter)
+            print(f"  ✓ Checkpoint 已保存到: {checkpoint_dir}")
+        except Exception as save_e:
+            print(f"  ✗ Checkpoint 保存失败: {save_e}")
         sys.exit(1)
     except Exception as e:
         print(f"\n训练失败: {e}")
         import traceback
         traceback.print_exc()
+        # 尝试保存错误时的 checkpoint
+        try:
+            current_iter = deep_cfr_solver._iteration
+            print(f"  💾 尝试保存错误时的 checkpoint (迭代 {current_iter})...")
+            checkpoint_dir = save_checkpoint(deep_cfr_solver, game, model_dir, save_prefix, current_iter)
+            print(f"  ✓ Checkpoint 已保存到: {checkpoint_dir}")
+        except Exception:
+            pass
         sys.exit(1)
     
     # 保存模型
-    print(f"\n[4/4] 保存模型...")
+    print(f"\n[4/4] 保存最终模型...")
     try:
-        # 创建保存目录
-        model_dir = create_save_directory(save_prefix, save_dir)
+        # 目录已在训练开始前创建
         print(f"  保存目录: {model_dir}")
         
-        # DeepCFRSolver 使用 _policy_network (单数) 和 _advantage_networks (复数)
-        # 策略网络是所有玩家共享的
-        policy_path = os.path.join(model_dir, f"{save_prefix}_policy_network.pt")
-        torch.save(
-            deep_cfr_solver._policy_network.state_dict(),
-            policy_path
-        )
-        print(f"  ✓ 策略网络已保存: {policy_path}")
-        
-        # 优势网络是每个玩家一个
+        # 保存最终模型（使用 save_checkpoint 函数）
+        save_checkpoint(deep_cfr_solver, game, model_dir, save_prefix, num_iterations, is_final=True)
+        print(f"  ✓ 策略网络已保存: {os.path.join(model_dir, f'{save_prefix}_policy_network.pt')}")
         for player in range(game.num_players()):
-            advantage_path = os.path.join(model_dir, f"{save_prefix}_advantage_player_{player}.pt")
-            torch.save(
-                deep_cfr_solver._advantage_networks[player].state_dict(),
-                advantage_path
-            )
-            print(f"  ✓ 玩家 {player} 优势网络已保存: {advantage_path}")
+            print(f"  ✓ 玩家 {player} 优势网络已保存")
         
         # 计算 NashConv（可选，带资源限制）
         if not skip_nashconv:
@@ -530,6 +652,8 @@ def train_deep_cfr(
                 'transformed_size': transformed_size if (use_feature_transform and not use_simple_feature) else None,
                 'use_hybrid_transform': use_hybrid_transform if (use_feature_transform and not use_simple_feature) else None,
                 'betting_abstraction': betting_abstraction,
+                'multi_gpu': use_multi_gpu,
+                'gpu_ids': gpu_ids if use_multi_gpu else None,
                 'game_string': game_string,
                 'training_time': time.strftime('%Y-%m-%d %H:%M:%S'),
             }
@@ -573,6 +697,9 @@ if __name__ == "__main__":
     parser.add_argument("--use_hybrid_transform", action="store_true", default=True, help="使用混合特征转换（仅用于复杂版本，默认启用）")
     parser.add_argument("--no_hybrid_transform", dest="use_hybrid_transform", action="store_false", help="不使用混合特征转换（仅用于复杂版本）")
     parser.add_argument("--betting_abstraction", type=str, default="fcpa", help="下注抽象: fcpa (默认), fchpa (含半池), fc, fullgame")
+    parser.add_argument("--multi_gpu", action="store_true", help="启用多 GPU 并行训练")
+    parser.add_argument("--gpu_ids", type=int, nargs="+", default=None, help="指定使用的 GPU ID 列表（例如 --gpu_ids 0 1 2）")
+    parser.add_argument("--checkpoint_interval", type=int, default=0, help="Checkpoint 保存间隔（0=不保存中间checkpoint，建议100-500）")
     
     args = parser.parse_args()
     
@@ -596,4 +723,7 @@ if __name__ == "__main__":
         transformed_size=args.transformed_size,
         use_hybrid_transform=args.use_hybrid_transform,
         betting_abstraction=args.betting_abstraction,
+        multi_gpu=args.multi_gpu,
+        gpu_ids=args.gpu_ids,
+        checkpoint_interval=args.checkpoint_interval,
     )

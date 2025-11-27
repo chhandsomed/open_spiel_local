@@ -3,6 +3,8 @@
 
 流程：
 信息状态(281维) + 手动特征(7维) = 288维 -> MLP(288, [256, 256], num_actions)
+
+支持多 GPU 并行训练（DataParallel）
 """
 
 import torch
@@ -13,6 +15,39 @@ from deep_cfr_with_feature_transform import (
     calculate_position_advantage,
     calculate_hand_strength_features
 )
+
+
+def wrap_with_data_parallel(model, device, gpu_ids=None):
+    """将模型包装为 DataParallel（如果有多个 GPU）
+    
+    Args:
+        model: PyTorch 模型
+        device: 主设备
+        gpu_ids: GPU ID 列表
+    
+    Returns:
+        包装后的模型（DataParallel 或原模型）
+    """
+    if gpu_ids is not None and len(gpu_ids) > 1:
+        model = nn.DataParallel(model, device_ids=gpu_ids)
+        model = model.to(device)
+        return model
+    else:
+        return model.to(device)
+
+
+def unwrap_data_parallel(model):
+    """获取 DataParallel 包装的原始模型
+    
+    Args:
+        model: 可能被 DataParallel 包装的模型
+    
+    Returns:
+        原始模型
+    """
+    if isinstance(model, nn.DataParallel):
+        return model.module
+    return model
 
 
 class SimpleFeatureMLP(nn.Module):
@@ -107,7 +142,10 @@ class SimpleFeatureMLP(nn.Module):
 
 
 class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
-    """简化版本：直接拼接手动特征的DeepCFR"""
+    """简化版本：直接拼接手动特征的DeepCFR
+    
+    支持多 GPU 并行训练（DataParallel）
+    """
     
     def __init__(self,
                  game,
@@ -122,9 +160,15 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
                  policy_network_train_steps: int = 1,
                  advantage_network_train_steps: int = 1,
                  reinitialize_advantage_networks: bool = True,
-                 device=None):
+                 device=None,
+                 multi_gpu: bool = False,
+                 gpu_ids=None):
         """
         与原始DeepCFRSolver相同，但使用SimpleFeatureMLP
+        
+        Args:
+            multi_gpu: 是否使用多 GPU 并行
+            gpu_ids: GPU ID 列表（None 表示使用所有可用 GPU）
         """
         # 先初始化基础属性（不创建网络）
         import pyspiel
@@ -148,6 +192,10 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
         self._num_actions = game.num_distinct_actions()
         self._iteration = 1
         
+        # 多 GPU 设置
+        self._multi_gpu = multi_gpu
+        self._gpu_ids = gpu_ids
+        
         # Set device
         if device is None:
             self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -156,14 +204,20 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
         
         # 创建策略网络（使用SimpleFeatureMLP）
         self._strategy_memories = deep_cfr.ReservoirBuffer(memory_capacity)
-        self._policy_network = SimpleFeatureMLP(
+        policy_net = SimpleFeatureMLP(
             self._embedding_size,
             list(policy_network_layers),
             self._num_actions,
             num_players=self._num_players,
             max_game_length=game.max_game_length()
         )
-        self._policy_network = self._policy_network.to(self._device)
+        
+        # 多 GPU 包装
+        if multi_gpu and gpu_ids is not None and len(gpu_ids) > 1:
+            self._policy_network = wrap_with_data_parallel(policy_net, self._device, gpu_ids)
+        else:
+            self._policy_network = policy_net.to(self._device)
+        
         self._policy_sm = nn.Softmax(dim=-1)
         self._loss_policy = nn.MSELoss()
         self._optimizer_policy = torch.optim.Adam(
@@ -173,19 +227,21 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
         self._advantage_memories = [
             deep_cfr.ReservoirBuffer(memory_capacity) for _ in range(self._num_players)
         ]
-        self._advantage_networks = [
-            SimpleFeatureMLP(
+        self._advantage_networks = []
+        for _ in range(self._num_players):
+            adv_net = SimpleFeatureMLP(
                 self._embedding_size,
                 list(advantage_network_layers),
                 self._num_actions,
                 num_players=self._num_players,
                 max_game_length=game.max_game_length()
-            ) for _ in range(self._num_players)
-        ]
-        
-        # Move advantage networks to device
-        for i in range(self._num_players):
-            self._advantage_networks[i] = self._advantage_networks[i].to(self._device)
+            )
+            # 多 GPU 包装
+            if multi_gpu and gpu_ids is not None and len(gpu_ids) > 1:
+                adv_net = wrap_with_data_parallel(adv_net, self._device, gpu_ids)
+            else:
+                adv_net = adv_net.to(self._device)
+            self._advantage_networks.append(adv_net)
         
         self._loss_advantages = nn.MSELoss(reduction="mean")
         self._optimizer_advantages = []
@@ -197,8 +253,18 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
     
     def reinitialize_advantage_network(self, player):
         """重新初始化优势网络"""
-        self._advantage_networks[player].reset()
-        self._advantage_networks[player] = self._advantage_networks[player].to(self._device)
+        # 获取原始网络（如果被 DataParallel 包装）
+        adv_net = unwrap_data_parallel(self._advantage_networks[player])
+        adv_net.reset()
+        
+        # 重新包装（如果需要多 GPU）
+        if self._multi_gpu and self._gpu_ids is not None and len(self._gpu_ids) > 1:
+            self._advantage_networks[player] = wrap_with_data_parallel(
+                adv_net, self._device, self._gpu_ids
+            )
+        else:
+            self._advantage_networks[player] = adv_net.to(self._device)
+        
         self._optimizer_advantages[player] = torch.optim.Adam(
             self._advantage_networks[player].parameters(), lr=self._learning_rate)
 

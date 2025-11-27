@@ -30,7 +30,7 @@ pip install .
 
 使用 `train_deep_cfr_texas.py` 脚本来训练模型。
 
-### 推荐命令 (高性能版)
+### 推荐命令 (单 GPU 版)
 针对 RTX 4090 等高性能显卡，建议使用更大的网络和缓冲区以获得更强的策略。
 
 ```bash
@@ -46,9 +46,40 @@ nohup python train_deep_cfr_texas.py \
     --learning_rate 0.0005 \
     --eval_interval 50 \
     --eval_with_games \
+    --skip_nashconv \
     --save_prefix deepcfr_texas_6p_fchpa_large \
-    > train_log_large.txt 2>&1 &
+    > train_log_large.log 2>&1 &
 ```
+
+### 推荐命令 (多 GPU 版 + Checkpoint)
+支持多 GPU 并行训练和中间 checkpoint 保存，防止长时间训练中断丢失进度。
+
+```bash
+# 使用 4 张 GPU 并行训练，每 200 次迭代保存一次 checkpoint
+nohup python train_deep_cfr_texas.py \
+    --num_players 6 \
+    --betting_abstraction fchpa \
+    --policy_layers 128 128 \
+    --advantage_layers 128 128 \
+    --memory_capacity 4000000 \
+    --num_iterations 20 \
+    --num_traversals 40 \
+    --learning_rate 0.0005 \
+    --eval_interval 10 \
+    --eval_with_games \
+    --save_prefix deepcfr_texas_6p_multi_gpu \
+    --skip_nashconv \
+    --multi_gpu \
+    --gpu_ids 0 1 2 3 \
+    --checkpoint_interval 10 \
+    > train_log_multi_gpu.log 2>&1 &
+```
+
+**Checkpoint 说明**:
+- Checkpoint 保存在 `models/<save_prefix>/checkpoints/` 目录下
+- 文件命名格式: `*_iter{N}.pt`（如 `deepcfr_texas_policy_network_iter200.pt`）
+- 训练被中断（Ctrl+C）时会自动保存当前进度
+- 最终模型保存在主目录，不带 `_iter` 后缀
 
 ### 关键参数说明
 
@@ -61,6 +92,9 @@ nohup python train_deep_cfr_texas.py \
 | `--num_iterations` | `100` | **`2000`+** | 总迭代次数。DeepCFR 收敛较慢，需要较多迭代。 |
 | `--num_traversals` | `20` | **`40`** | 每次迭代采样的轨迹数。增加此值可减少方差，使训练更稳定。 |
 | `--learning_rate` | `1e-3` | **`5e-4`** | 学习率。网络变大后，适当降低学习率有助于稳定收敛。 |
+| `--multi_gpu` | `False` | - | 启用多 GPU 并行训练 (DataParallel)。 |
+| `--gpu_ids` | `None` | `0 1 2 3` | 指定使用的 GPU ID 列表。不指定则使用所有可用 GPU。 |
+| `--checkpoint_interval` | `0` | **`200`** | Checkpoint 保存间隔。0 表示不保存中间 checkpoint。 |
 
 ### 附录：动作映射表
 
@@ -187,10 +221,16 @@ python load_and_test_strategy.py
     1. 减小 `memory_capacity` (如 200万)。
     2. 减小 `batch_size` (在代码中默认较大，可修改 `DeepCFR` 构造函数参数)。
     3. 减小网络层数 (如回到 64x64)。
+    4. 使用多 GPU 分摊显存压力 (`--multi_gpu --gpu_ids 0 1 2 3`)。
 
 ### Q: 6人局模型表现不如 2人局？
 *   **原因**: 6人局复杂度是指数级增长的。
 *   **解决**: 需要指数级增加的训练资源。2000 次迭代对于 6 人局可能只是起步，可能需要 5000+ 次迭代才能达到较强水平。
+
+### Q: 多 GPU 训练效果如何？
+*   **说明**: 多 GPU 使用 PyTorch 的 `DataParallel` 实现，主要加速网络的前向/反向传播阶段。
+*   **注意**: DeepCFR 的游戏树遍历（`_traverse_game_tree`）仍在 CPU 上进行，因此多 GPU 主要加速 `_learn_advantage_network()` 和 `_learn_strategy_network()` 阶段。
+*   **建议**: 增大 `memory_capacity` 以积累更多样本，使训练批次更大，多 GPU 效果更明显。
 
 ---
 
@@ -231,15 +271,16 @@ DeepCFR 的损失函数包含 `sqrt(iteration)` 加权项。因此，**随着迭
 
 ```
 .
-├── train_deep_cfr_texas.py      # DeepCFR 训练主脚本
+├── train_deep_cfr_texas.py      # DeepCFR 训练主脚本 (支持多 GPU)
 ├── inference_simple.py          # 快速推理/自对弈脚本
 ├── evaluate_models_head_to_head.py # 模型对战评测脚本
 ├── play_interactive.py          # 人机交互对战脚本
 ├── analyze_training.py          # 训练日志分析与对比脚本
-├── deep_cfr_simple_feature.py   # 策略网络特征提取模块
+├── deep_cfr_simple_feature.py   # 策略网络特征提取模块 (支持多 GPU)
+├── deep_cfr_with_feature_transform.py # 复杂特征转换模块 (支持多 GPU)
 ├── models/                      # 模型保存目录
 │   └── deepcfr_texas_.../       # 每次训练的独立目录
-│       ├── config.json          # 训练配置
+│       ├── config.json          # 训练配置 (含 multi_gpu, gpu_ids)
 │       ├── *_policy_network.pt  # 策略网络权重 (用于推理)
 │       ├── *_advantage_player_*.pt # 优势网络权重 (仅用于训练)
 │       └── *_history.json       # 训练日志

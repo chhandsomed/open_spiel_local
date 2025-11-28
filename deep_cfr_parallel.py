@@ -572,7 +572,7 @@ class ParallelDeepCFRSolver:
     
     def solve(self, verbose=True, eval_interval=10, checkpoint_interval=0, 
               model_dir=None, save_prefix=None, game=None, start_iteration=0,
-              eval_with_games=False):
+              eval_with_games=False, num_test_games=50):
         """运行并行 DeepCFR 训练
         
         Args:
@@ -673,7 +673,7 @@ class ParallelDeepCFRSolver:
                                 game,
                                 self,
                                 include_test_games=eval_with_games,
-                                num_test_games=50,
+                                num_test_games=num_test_games,
                                 max_depth=None,
                                 verbose=False
                             )
@@ -937,6 +937,8 @@ def main():
                         help="从指定目录恢复训练（例如 --resume models/deepcfr_parallel_6p）")
     parser.add_argument("--eval_with_games", action="store_true",
                         help="评估时运行测试对局")
+    parser.add_argument("--num_test_games", type=int, default=50,
+                        help="评估时的测试对局数量（默认: 50）")
     
     args = parser.parse_args()
     
@@ -971,6 +973,8 @@ def main():
                 args.betting_abstraction = resume_config['betting_abstraction']
             if 'save_prefix' in resume_config:
                 args.save_prefix = resume_config['save_prefix']
+            if 'num_traversals' in resume_config:
+                args.num_traversals = resume_config['num_traversals']
                 
             print(f"  自动加载配置: {args.num_players}人局, 策略层{args.policy_layers}, 优势层{args.advantage_layers}")
             print(f"  save_prefix: {args.save_prefix}")
@@ -1075,6 +1079,7 @@ def main():
         game=game,
         start_iteration=start_iteration,
         eval_with_games=args.eval_with_games,
+        num_test_games=args.num_test_games,
     )
     
     # 保存最终模型

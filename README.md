@@ -146,6 +146,7 @@ nohup python deep_cfr_parallel.py \
     --checkpoint_interval 50 \
     --eval_interval 100 \
     --eval_with_games \
+    --num_test_games 100 \
     --skip_nashconv > train_parallel_resume.log 2>&1 &
 ```
 
@@ -153,7 +154,8 @@ nohup python deep_cfr_parallel.py \
 - `--num_workers`: 建议设为 CPU 核心数的一半到全部（如 8-16）
 - `--batch_size`: 多 GPU 时建议 4096+，充分利用显存
 - `--gpu_ids`: 指定多张 GPU，如 `0 1 2 3` 使用 4 张卡
-- `--resume`: 指定要恢复的模型目录，自动加载最新 checkpoint
+- `--resume`: 指定要恢复的模型目录，自动加载最新 checkpoint 和关键参数（玩家数、网络结构、遍历次数等）
+- `--num_test_games`: 评估时的测试对局数量。6人局建议 50-100，如果对局失败率较高可适当增加
 
 ### 关键参数说明
 
@@ -187,9 +189,10 @@ nohup python deep_cfr_parallel.py \
 | `--gpu_ids` | `None` | **`0 1 2 3`** | 指定多张 GPU，启用 DataParallel 并行训练。 |
 | `--eval_interval` | `10` | **`100`** | 评估间隔。每 N 次迭代评估一次策略质量。 |
 | `--eval_with_games` | `False` | `True` | 评估时运行测试对局。 |
+| `--num_test_games` | `50` | **`50-100`** | 评估时的测试对局数量。6人局可能因复杂度导致部分对局失败，可适当增加此值。 |
 | `--checkpoint_interval` | `0` | **`50`** | Checkpoint 保存间隔。 |
 | `--skip_nashconv` | `False` | **`True`** | 跳过 NashConv 计算。6人局强烈建议开启。 |
-| `--resume` | `None` | - | 从指定目录恢复训练。 |
+| `--resume` | `None` | - | 从指定目录恢复训练。自动从 config.json 加载关键参数（玩家数、网络结构、遍历次数等）。 |
 
 **性能对比** (6人德扑, 5次迭代, 50次遍历):
 

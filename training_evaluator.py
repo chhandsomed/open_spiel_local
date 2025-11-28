@@ -173,21 +173,24 @@ def play_test_game(
     game,
     deep_cfr_solver,
     opponent_strategy="random",
-    verbose=False
+    verbose=False,
+    use_trained_for_all=True
 ):
-    """测试对局（与随机策略对局）
+    """测试对局（自对弈或与随机策略对局）
     
     Args:
         game: OpenSpiel 游戏对象
         deep_cfr_solver: DeepCFRSolver 实例
         opponent_strategy: 对手策略 ("random" 或 "uniform")
         verbose: 是否显示详细信息
+        use_trained_for_all: 是否所有玩家都使用训练策略（自对弈模式）
     
     Returns:
         dict: 包含对局结果的字典
     """
     state = game.new_initial_state()
     returns = None
+    num_players = game.num_players()
     
     try:
         while not state.is_terminal():
@@ -200,7 +203,10 @@ def play_test_game(
                 player = state.current_player()
                 legal_actions = state.legal_actions()
                 
-                if player == 0:  # 使用训练的策略
+                # 决定是否使用训练策略
+                use_trained = use_trained_for_all or (player == 0)
+                
+                if use_trained:  # 使用训练的策略
                     probs = deep_cfr_solver.action_probabilities(state, player)
                     # 确保所有合法动作都有概率
                     action_probs = {a: probs.get(a, 0.0) for a in legal_actions}
@@ -224,11 +230,15 @@ def play_test_game(
             print(f"  ⚠️ 测试对局出错: {e}")
         return None
     
-    return {
+    # 返回所有玩家的收益
+    result = {
         'returns': returns,
-        'player0_return': returns[0] if returns else 0.0,
-        'player1_return': returns[1] if returns else 0.0,
+        'num_players': num_players,
     }
+    if returns:
+        for i in range(min(len(returns), num_players)):
+            result[f'player{i}_return'] = returns[i]
+    return result
 
 
 def evaluate_with_test_games(
@@ -237,7 +247,7 @@ def evaluate_with_test_games(
     num_games=100,
     verbose=True
 ):
-    """通过测试对局评估策略
+    """通过测试对局评估策略（自对弈模式）
     
     Args:
         game: OpenSpiel 游戏对象
@@ -248,36 +258,49 @@ def evaluate_with_test_games(
     Returns:
         dict: 包含测试结果的字典
     """
+    num_players = game.num_players()
+    
+    # 初始化每个玩家的结果
     results = {
-        'player0_returns': [],
-        'player1_returns': [],
-        'player0_wins': 0,
-        'player1_wins': 0,
-        'draws': 0,
+        'num_players': num_players,
+        'games_played': 0,
     }
+    for i in range(num_players):
+        results[f'player{i}_returns'] = []
+        results[f'player{i}_wins'] = 0
     
     for _ in range(num_games):
-        game_result = play_test_game(game, deep_cfr_solver, verbose=False)
+        game_result = play_test_game(game, deep_cfr_solver, verbose=False, use_trained_for_all=True)
         if game_result:
-            p0_return = game_result['player0_return']
-            p1_return = game_result['player1_return']
-            results['player0_returns'].append(p0_return)
-            results['player1_returns'].append(p1_return)
+            results['games_played'] += 1
+            returns = game_result.get('returns', [])
             
-            if p0_return > p1_return:
-                results['player0_wins'] += 1
-            elif p1_return > p0_return:
-                results['player1_wins'] += 1
-            else:
-                results['draws'] += 1
+            # 记录每个玩家的收益
+            for i in range(min(len(returns), num_players)):
+                results[f'player{i}_returns'].append(returns[i])
+            
+            # 找出赢家（收益最高的玩家）
+            if returns:
+                max_return = max(returns)
+                winners = [i for i, r in enumerate(returns) if r == max_return]
+                if len(winners) == 1:
+                    results[f'player{winners[0]}_wins'] += 1
     
-    if results['player0_returns']:
-        results['player0_avg_return'] = np.mean(results['player0_returns'])
-        results['player0_std_return'] = np.std(results['player0_returns'])
-        results['player0_win_rate'] = results['player0_wins'] / num_games
-    else:
-        results['player0_avg_return'] = 0.0
-        results['player0_win_rate'] = 0.0
+    # 计算统计信息
+    for i in range(num_players):
+        player_returns = results[f'player{i}_returns']
+        if player_returns:
+            results[f'player{i}_avg_return'] = np.mean(player_returns)
+            results[f'player{i}_std_return'] = np.std(player_returns)
+            results[f'player{i}_win_rate'] = results[f'player{i}_wins'] / max(results['games_played'], 1)
+        else:
+            results[f'player{i}_avg_return'] = 0.0
+            results[f'player{i}_win_rate'] = 0.0
+    
+    # 兼容旧接口
+    results['player0_returns'] = results.get('player0_returns', [])
+    results['player0_avg_return'] = results.get('player0_avg_return', 0.0)
+    results['player0_win_rate'] = results.get('player0_win_rate', 0.0)
     
     return results
 

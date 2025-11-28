@@ -89,12 +89,14 @@ nohup python train_deep_cfr_texas.py \
 # 多进程并行 + 多 GPU（4张卡，16个Worker，推荐配置）
 nohup python deep_cfr_parallel.py \
     --num_players 6 \
-    --num_iterations 1000 \
+    --num_iterations 2000 \
     --num_traversals 500 \
     --num_workers 16 \
     --batch_size 4096 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
+    --eval_interval 100 \
+    --eval_with_games \
     --checkpoint_interval 50 \
     --skip_nashconv \
     --learning_rate 0.001 \
@@ -117,6 +119,8 @@ python deep_cfr_parallel.py \
     --advantage_layers 256 256 256 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
+    --eval_interval 5 \
+    --eval_with_games \
     --skip_nashconv \
     --save_prefix test_parallel
 ```
@@ -128,12 +132,28 @@ python deep_cfr_parallel.py \
 - 适合多核 CPU 服务器，比纯 DataParallel 更高效
 - 支持 `--skip_nashconv` 跳过 NashConv 计算（6人局强烈建议）
 - 支持 `--checkpoint_interval` 保存中间 checkpoint
+- 支持 `--resume` 从 checkpoint 恢复训练
 - 训练中断时自动保存当前进度
+
+```bash
+# 恢复训练示例：从之前的模型目录继续训练
+nohup python deep_cfr_parallel.py \
+    --resume models/deepcfr_parallel_6p \
+    --num_iterations 20000 \
+    --num_workers 16 \
+    --use_gpu \
+    --gpu_ids 0 1 2 3 \
+    --checkpoint_interval 50 \
+    --eval_interval 100 \
+    --eval_with_games \
+    --skip_nashconv > train_parallel_resume.log 2>&1 &
+```
 
 **参数建议**:
 - `--num_workers`: 建议设为 CPU 核心数的一半到全部（如 8-16）
 - `--batch_size`: 多 GPU 时建议 4096+，充分利用显存
 - `--gpu_ids`: 指定多张 GPU，如 `0 1 2 3` 使用 4 张卡
+- `--resume`: 指定要恢复的模型目录，自动加载最新 checkpoint
 
 ### 关键参数说明
 
@@ -165,8 +185,11 @@ python deep_cfr_parallel.py \
 | `--learning_rate` | `1e-3` | **`1e-3`** | 学习率。 |
 | `--use_gpu` | `False` | **`True`** | 使用 GPU 训练网络。 |
 | `--gpu_ids` | `None` | **`0 1 2 3`** | 指定多张 GPU，启用 DataParallel 并行训练。 |
+| `--eval_interval` | `10` | **`100`** | 评估间隔。每 N 次迭代评估一次策略质量。 |
+| `--eval_with_games` | `False` | `True` | 评估时运行测试对局。 |
 | `--checkpoint_interval` | `0` | **`50`** | Checkpoint 保存间隔。 |
 | `--skip_nashconv` | `False` | **`True`** | 跳过 NashConv 计算。6人局强烈建议开启。 |
+| `--resume` | `None` | - | 从指定目录恢复训练。 |
 
 **性能对比** (6人德扑, 5次迭代, 50次遍历):
 

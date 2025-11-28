@@ -571,7 +571,8 @@ class ParallelDeepCFRSolver:
         return loss.detach().cpu().numpy()
     
     def solve(self, verbose=True, eval_interval=10, checkpoint_interval=0, 
-              model_dir=None, save_prefix=None, game=None):
+              model_dir=None, save_prefix=None, game=None, start_iteration=0,
+              eval_with_games=False):
         """运行并行 DeepCFR 训练
         
         Args:
@@ -581,6 +582,8 @@ class ParallelDeepCFRSolver:
             model_dir: 模型保存目录
             save_prefix: 保存文件前缀
             game: 游戏实例（用于保存 checkpoint）
+            start_iteration: 起始迭代次数（用于恢复训练）
+            eval_with_games: 是否在评估时运行测试对局
         
         Returns:
             policy_network: 训练好的策略网络
@@ -592,6 +595,8 @@ class ParallelDeepCFRSolver:
         print("=" * 70)
         print(f"  Worker 数量: {self.num_workers}")
         print(f"  迭代次数: {self.num_iterations}")
+        if start_iteration > 0:
+            print(f"  从迭代 {start_iteration + 1} 恢复")
         print(f"  每次迭代遍历次数: {self.num_traversals}")
         print(f"  设备: {self.device}")
         print()
@@ -619,7 +624,7 @@ class ParallelDeepCFRSolver:
             else:
                 print(f" 警告: Worker 启动超时，继续训练...")
             
-            for iteration in range(self.num_iterations):
+            for iteration in range(start_iteration, self.num_iterations):
                 iter_start = time.time()
                 
                 # 更新迭代计数器
@@ -658,6 +663,41 @@ class ParallelDeepCFRSolver:
                     for player, losses in advantage_losses.items():
                         if losses:
                             print(f"    玩家 {player} 损失: {losses[-1]:.6f}")
+                    
+                    # 运行评估
+                    if game is not None:
+                        try:
+                            from training_evaluator import quick_evaluate
+                            print(f"  评估训练效果...", end="", flush=True)
+                            eval_result = quick_evaluate(
+                                game,
+                                self,
+                                include_test_games=eval_with_games,
+                                num_test_games=50,
+                                max_depth=None,
+                                verbose=False
+                            )
+                            print(" 完成")
+                            
+                            # 打印简要评估信息
+                            metrics = eval_result['metrics']
+                            print(f"    策略熵: {metrics.get('avg_entropy', 0):.4f} | "
+                                  f"策略缓冲区: {len(self._strategy_memories):,} | "
+                                  f"优势样本: {sum(len(m) for m in self._advantage_memories):,}")
+                            
+                            if eval_with_games and eval_result.get('test_results'):
+                                test_results = eval_result['test_results']
+                                num_games = test_results.get('games_played', 0)
+                                avg_return = test_results.get('player0_avg_return', 0)
+                                win_rate = test_results.get('player0_win_rate', 0) * 100
+                                if num_games > 0:
+                                    print(f"    测试对局: {num_games} 局 | "
+                                          f"玩家0平均回报: {avg_return:.2f} | "
+                                          f"胜率: {win_rate:.1f}%")
+                        except ImportError:
+                            pass  # training_evaluator 不可用
+                        except Exception as e:
+                            print(f" 评估失败: {e}")
                 
                 # 保存 checkpoint
                 if checkpoint_interval > 0 and (iteration + 1) % checkpoint_interval == 0:
@@ -709,6 +749,120 @@ class ParallelDeepCFRSolver:
         return {action: probs[0][action] for action in legal_actions}
 
 
+def load_checkpoint(solver, model_dir, save_prefix, game):
+    """从 checkpoint 加载网络权重
+    
+    Args:
+        solver: ParallelDeepCFRSolver 实例
+        model_dir: 模型目录
+        save_prefix: 保存前缀
+        game: 游戏实例
+        
+    Returns:
+        start_iteration: 恢复的迭代次数
+    """
+    import glob
+    import re
+    
+    # 查找最新的 checkpoint
+    checkpoint_root = os.path.join(model_dir, "checkpoints")
+    
+    latest_file = None
+    max_iter = 0
+    
+    # 优先从 checkpoints 目录加载
+    if os.path.exists(checkpoint_root):
+        # 尝试新的目录结构: checkpoints/iter_X/prefix_policy_iterX.pt
+        iter_dirs = glob.glob(os.path.join(checkpoint_root, "iter_*"))
+        for d in iter_dirs:
+            match = re.search(r'iter_(\d+)$', d)
+            if match:
+                iter_num = int(match.group(1))
+                policy_file = os.path.join(d, f"{save_prefix}_policy_network_iter{iter_num}.pt")
+                if os.path.exists(policy_file) and iter_num > max_iter:
+                    max_iter = iter_num
+                    latest_file = policy_file
+        
+        # 如果没找到（或者是旧结构），尝试旧的扁平结构: checkpoints/prefix_policy_iterX.pt
+        if latest_file is None:
+            policy_files = glob.glob(os.path.join(checkpoint_root, f"{save_prefix}_policy_network_iter*.pt"))
+            for f in policy_files:
+                match = re.search(r'_iter(\d+)\.pt$', f)
+                if match:
+                    iter_num = int(match.group(1))
+                    if iter_num > max_iter:
+                        max_iter = iter_num
+                        latest_file = f
+            
+        if latest_file:
+            print(f"  找到 checkpoint: 迭代 {max_iter}")
+            policy_path = latest_file
+            start_iteration = max_iter
+        else:
+            policy_path = None
+            start_iteration = 0
+    else:
+        # ... (后续逻辑不变)
+        policy_path = None
+        start_iteration = 0
+
+    if policy_path is None: # 如果 checkpoint 没找到，尝试加载最终模型
+        policy_path = os.path.join(model_dir, f"{save_prefix}_policy_network.pt")
+        if os.path.exists(policy_path):
+            print(f"  找到最终模型")
+            start_iteration = 0  # 最终模型没有迭代信息
+        else:
+            policy_path = None
+            start_iteration = 0
+    
+    if policy_path is None or not os.path.exists(policy_path):
+        print(f"  ✗ 未找到可加载的模型")
+        return 0
+    
+    # 加载策略网络
+    print(f"  加载策略网络: {policy_path}")
+    policy_state = torch.load(policy_path, map_location=solver.device)
+    policy_net = solver._policy_network
+    if isinstance(policy_net, nn.DataParallel):
+        policy_net.module.load_state_dict(policy_state)
+    else:
+        policy_net.load_state_dict(policy_state)
+    print(f"  ✓ 策略网络已加载")
+    
+    # 加载优势网络
+    # 确定优势网络所在的目录
+    if start_iteration > 0:
+        # 检查是新结构还是旧结构
+        if "iter_" in os.path.dirname(policy_path):
+            # 新结构: checkpoints/iter_X/
+            adv_dir = os.path.dirname(policy_path)
+        else:
+            # 旧结构: checkpoints/
+            adv_dir = checkpoint_root
+    else:
+        adv_dir = model_dir
+
+    for player in range(game.num_players()):
+        if start_iteration > 0:
+            adv_path = os.path.join(adv_dir, f"{save_prefix}_advantage_player_{player}_iter{start_iteration}.pt")
+        else:
+            adv_path = os.path.join(adv_dir, f"{save_prefix}_advantage_player_{player}.pt")
+        
+        if os.path.exists(adv_path):
+            # ... (加载逻辑不变)
+            adv_state = torch.load(adv_path, map_location=solver.device)
+            adv_net = solver._advantage_networks[player]
+            if isinstance(adv_net, nn.DataParallel):
+                adv_net.module.load_state_dict(adv_state)
+            else:
+                adv_net.load_state_dict(adv_state)
+            print(f"  ✓ 玩家 {player} 优势网络已加载")
+        else:
+            print(f"  ⚠️ 玩家 {player} 优势网络未找到: {adv_path}")
+    
+    return start_iteration
+
+
 def create_save_directory(save_prefix, save_dir="models"):
     """创建保存目录"""
     import time as time_module
@@ -732,7 +886,8 @@ def save_checkpoint(solver, game, model_dir, save_prefix, iteration, is_final=Fa
         checkpoint_dir = model_dir
     else:
         suffix = f"_iter{iteration}"
-        checkpoint_dir = os.path.join(model_dir, "checkpoints")
+        # 将每个 iteration 的 checkpoint 放入独立子目录
+        checkpoint_dir = os.path.join(model_dir, "checkpoints", f"iter_{iteration}")
         os.makedirs(checkpoint_dir, exist_ok=True)
     
     # 保存策略网络（处理 DataParallel）
@@ -778,9 +933,50 @@ def main():
                         help="使用 GPU 训练")
     parser.add_argument("--gpu_ids", type=int, nargs="+", default=None,
                         help="使用的 GPU ID 列表（例如 --gpu_ids 0 1 2 3）")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="从指定目录恢复训练（例如 --resume models/deepcfr_parallel_6p）")
+    parser.add_argument("--eval_with_games", action="store_true",
+                        help="评估时运行测试对局")
     
     args = parser.parse_args()
     
+    # 处理恢复训练配置（必须在创建游戏之前）
+    if args.resume:
+        model_dir = args.resume
+        if not os.path.exists(model_dir):
+            print(f"✗ 恢复目录不存在: {model_dir}")
+            import sys
+            sys.exit(1)
+        
+        # 尝试从 config.json 读取配置
+        config_path = os.path.join(model_dir, "config.json")
+        if os.path.exists(config_path):
+            import json
+            with open(config_path, 'r') as f:
+                resume_config = json.load(f)
+            
+            print(f"从 {model_dir} 恢复训练")
+            
+            # 自动覆盖关键参数，确保网络结构一致
+            # 注意：命令行显式指定的参数优先级应该更高，但为了简化续训，这里默认使用 config 中的值
+            # 除非用户想要改变某些训练超参数（如 batch_size, learning_rate）
+            
+            if 'num_players' in resume_config:
+                args.num_players = resume_config['num_players']
+            if 'policy_layers' in resume_config:
+                args.policy_layers = resume_config['policy_layers']
+            if 'advantage_layers' in resume_config:
+                args.advantage_layers = resume_config['advantage_layers']
+            if 'betting_abstraction' in resume_config:
+                args.betting_abstraction = resume_config['betting_abstraction']
+            if 'save_prefix' in resume_config:
+                args.save_prefix = resume_config['save_prefix']
+                
+            print(f"  自动加载配置: {args.num_players}人局, 策略层{args.policy_layers}, 优势层{args.advantage_layers}")
+            print(f"  save_prefix: {args.save_prefix}")
+        else:
+            print(f"⚠️ 未找到 config.json，使用命令行参数")
+
     # 创建游戏
     num_players = args.num_players
     if num_players == 2:
@@ -831,8 +1027,15 @@ def main():
     print(f"创建游戏: {game_string}")
     game = pyspiel.load_game(game_string)
     
-    # 创建保存目录
-    model_dir = create_save_directory(args.save_prefix, args.save_dir)
+    # 处理恢复训练
+    start_iteration = 0
+    if args.resume:
+        # 目录检查已在前面完成
+        model_dir = args.resume
+    else:
+        # 创建新的保存目录
+        model_dir = create_save_directory(args.save_prefix, args.save_dir)
+    
     print(f"模型保存目录: {model_dir}")
     if args.checkpoint_interval > 0:
         print(f"Checkpoint 保存间隔: 每 {args.checkpoint_interval} 次迭代")
@@ -853,6 +1056,15 @@ def main():
         gpu_ids=gpu_ids,
     )
     
+    # 如果是恢复训练，加载 checkpoint
+    if args.resume:
+        print(f"\n加载 checkpoint...")
+        start_iteration = load_checkpoint(solver, model_dir, args.save_prefix, game)
+        if start_iteration > 0:
+            print(f"  ✓ 将从迭代 {start_iteration + 1} 继续训练")
+        else:
+            print(f"  ⚠️ 未找到有效 checkpoint，从头开始训练")
+    
     # 训练（带 checkpoint 支持）
     policy_network, advantage_losses, policy_loss = solver.solve(
         verbose=True,
@@ -861,6 +1073,8 @@ def main():
         model_dir=model_dir,
         save_prefix=args.save_prefix,
         game=game,
+        start_iteration=start_iteration,
+        eval_with_games=args.eval_with_games,
     )
     
     # 保存最终模型

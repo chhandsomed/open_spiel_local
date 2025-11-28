@@ -247,9 +247,18 @@ def get_model_action(state, model, device, player):
             probs = model.action_probabilities(state, player)
             actions = list(probs.keys())
             probabilities = np.array([probs[a] for a in actions])
-            probabilities = probabilities / probabilities.sum()
+            # 归一化概率（确保概率和为1）
+            total = probabilities.sum()
+            if total > 1e-10:
+                probabilities = probabilities / total
+            else:
+                # 如果所有概率都是0，使用均匀分布
+                probabilities = np.ones(len(actions)) / len(actions)
+            
+            # 更新 probs 字典为归一化后的值（用于显示）
+            probs_normalized = {a: float(prob) for a, prob in zip(actions, probabilities)}
             action = np.random.choice(actions, p=probabilities)
-            return action, probs
+            return action, probs_normalized
         except Exception as e:
             print(f"  ⚠️ 使用 action_probabilities 失败: {e}，尝试直接使用网络")
     

@@ -250,6 +250,7 @@ def main():
     print("=" * 70)
     
     # 处理 model_dir 和 model_prefix 参数
+    config = None
     if args.model_dir:
         # 新方式：只传目录，从 config.json 读取 save_prefix
         model_dir = args.model_dir
@@ -265,14 +266,54 @@ def main():
         else:
             # 尝试自动检测模型文件
             import glob
-            pt_files = glob.glob(os.path.join(model_dir, "*_policy_network.pt"))
+            import re
+            # 支持两种格式：
+            # 1. prefix_policy_network.pt (最终模型)
+            # 2. prefix_policy_network_iterN.pt (checkpoint)
+            pt_files = glob.glob(os.path.join(model_dir, "*_policy_network*.pt"))
             if pt_files:
                 # 从文件名推断 prefix
                 policy_file = os.path.basename(pt_files[0])
-                save_prefix = policy_file.replace("_policy_network.pt", "")
-                args.model_prefix = os.path.join(model_dir, save_prefix)
-                config = load_config(args.model_prefix)
-                print(f"  ⚠️ 未找到 config.json，从文件名推断前缀: {save_prefix}")
+                # 处理 checkpoint 格式: prefix_policy_network_iterN.pt
+                # 或最终模型格式: prefix_policy_network.pt
+                if "_iter" in policy_file:
+                    # checkpoint 格式: prefix_policy_network_iterN.pt
+                    # 提取 prefix 和 iterN
+                    match = re.match(r"(.+)_policy_network_iter(\d+)\.pt", policy_file)
+                    if match:
+                        base_prefix = match.group(1)
+                        iter_num = match.group(2)
+                        # 构建完整路径：目录 + base_prefix + _iter + iter_num
+                        args.model_prefix = os.path.join(model_dir, f"{base_prefix}_iter{iter_num}")
+                    else:
+                        # 回退到简单替换
+                        save_prefix = policy_file.replace("_policy_network.pt", "")
+                        args.model_prefix = os.path.join(model_dir, save_prefix)
+                else:
+                    # 最终模型格式: prefix_policy_network.pt
+                    save_prefix = policy_file.replace("_policy_network.pt", "")
+                    args.model_prefix = os.path.join(model_dir, save_prefix)
+                
+                # 尝试从父目录加载 config（checkpoint 目录可能没有 config.json）
+                import json
+                parent_dir = os.path.dirname(model_dir)
+                parent_config = os.path.join(parent_dir, "config.json")
+                if os.path.exists(parent_config):
+                    with open(parent_config, 'r') as f:
+                        config = json.load(f)
+                    print(f"  ✓ 从父目录加载配置文件: {parent_config}")
+                else:
+                    # 尝试从主模型目录加载
+                    main_dir = os.path.dirname(parent_dir) if "checkpoints" in parent_dir else model_dir
+                    main_config = os.path.join(main_dir, "config.json")
+                    if os.path.exists(main_config):
+                        with open(main_config, 'r') as f:
+                            config = json.load(f)
+                        print(f"  ✓ 从主目录加载配置文件: {main_config}")
+                    else:
+                        config = load_config(args.model_prefix)
+                        if not config:
+                            print(f"  ⚠️ 未找到 config.json，从文件名推断前缀")
             else:
                 print(f"  ✗ 目录中未找到模型文件: {model_dir}")
                 sys.exit(1)
@@ -314,41 +355,66 @@ def main():
     # 创建游戏
     print(f"\n[0/2] 创建游戏 ({num_players}人场)...")
     
-    if num_players == 2:
-        blinds_str = "100 50"
-        first_player_str = "2 1 1 1"
-    else:
-        blinds_list = ["50", "100"] + ["0"] * (num_players - 2)
-        blinds_str = " ".join(blinds_list)
-        first_player_str = " ".join(["3"] + ["1"] * 3)
-        
-    stacks_str = " ".join(["2000"] * num_players)
+    # 优先使用 config.json 中的 game_string（确保与训练时完全一致）
+    game = None
+    if config and 'game_string' in config:
+        game_string = config['game_string']
+        try:
+            print(f"  使用 config.json 中的 game_string")
+            game = pyspiel.load_game(game_string)
+            print(f"  ✓ 游戏创建成功: {game.get_type().short_name}")
+        except Exception as e:
+            print(f"  ⚠️ 使用 game_string 创建游戏失败: {e}，尝试手动配置")
+            game = None
     
-    game_string = (
-        f"universal_poker("
-        f"betting=nolimit,"
-        f"numPlayers={num_players},"
-        f"numRounds=4,"
-        f"blind={blinds_str},"
-        f"stack={stacks_str},"
-        f"numHoleCards=2,"
-        f"numBoardCards=0 3 1 1,"
-        f"firstPlayer={first_player_str},"
-        f"numSuits=4,"
-        f"numRanks=13,"
-        f"bettingAbstraction={betting_abstraction}"
-        f")"
-    )
-    try:
-        game = pyspiel.load_game(game_string)
-        print(f"  ✓ 游戏创建成功: {game.get_type().short_name}")
-    except Exception as e:
-        print(f"  ✗ 游戏创建失败: {e}")
-        return
+    # 如果 game_string 不可用，手动构建
+    if game is None:
+        if num_players == 2:
+            blinds_str = "100 50"
+            first_player_str = "2 1 1 1"
+        else:
+            blinds_list = ["50", "100"] + ["0"] * (num_players - 2)
+            blinds_str = " ".join(blinds_list)
+            first_player_str = " ".join(["3"] + ["1"] * 3)
+            
+        stacks_str = " ".join(["2000"] * num_players)
+        
+        game_string = (
+            f"universal_poker("
+            f"betting=nolimit,"
+            f"numPlayers={num_players},"
+            f"numRounds=4,"
+            f"blind={blinds_str},"
+            f"stack={stacks_str},"
+            f"numHoleCards=2,"
+            f"numBoardCards=0 3 1 1,"
+            f"firstPlayer={first_player_str},"
+            f"numSuits=4,"
+            f"numRanks=13,"
+            f"bettingAbstraction={betting_abstraction}"
+            f")"
+        )
+        try:
+            game = pyspiel.load_game(game_string)
+            print(f"  ✓ 游戏创建成功: {game.get_type().short_name}")
+        except Exception as e:
+            print(f"  ✗ 游戏创建失败: {e}")
+            return
     
     # 加载模型
     print(f"\n[1/2] 加载模型...")
-    policy_path = f"{args.model_prefix}_policy_network.pt"
+    # 检查是否是 checkpoint 格式（包含 _iter）
+    if "_iter" in args.model_prefix:
+        # checkpoint 格式: prefix_iterN -> prefix_policy_network_iterN.pt
+        # 例如: models/.../iter_1750/deepcfr_parallel_6p_iter1750 
+        #  -> models/.../iter_1750/deepcfr_parallel_6p_policy_network_iter1750.pt
+        base_prefix = args.model_prefix.rsplit("_iter", 1)[0]
+        iter_suffix = args.model_prefix.rsplit("_iter", 1)[1]
+        policy_path = os.path.join(os.path.dirname(args.model_prefix), 
+                                   f"{os.path.basename(base_prefix)}_policy_network_iter{iter_suffix}.pt")
+    else:
+        # 最终模型格式: prefix -> prefix_policy_network.pt
+        policy_path = f"{args.model_prefix}_policy_network.pt"
     
     policy_network = load_policy_network(
         policy_path,

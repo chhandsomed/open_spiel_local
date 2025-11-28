@@ -222,6 +222,12 @@ python inference_simple.py \
     --num_games 1000 \
     --use_gpu
 
+# 支持 checkpoint 目录（自动选择最新的 checkpoint）
+python inference_simple.py \
+    --model_dir models/deepcfr_parallel_6p/checkpoints/iter_1750 \
+    --num_games 1000 \
+    --use_gpu
+
 # 兼容旧方式：传完整路径前缀
 python inference_simple.py \
     --model_prefix models/deepcfr_parallel_6p/deepcfr_parallel_6p \
@@ -241,14 +247,47 @@ python inference_simple.py \
 使用 `evaluate_models_head_to_head.py` 让两个不同的模型进行对战（例如：新模型 vs 旧模型）。
 
 ```bash
+# 对比两个不同的模型目录
 python evaluate_models_head_to_head.py \
     --model_a models/deepcfr_texas_6p_fchpa_large \
     --model_b models/deepcfr_texas_6p_fchpa_baseline \
     --num_games 2000 \
     --use_gpu
+
+# 支持 checkpoint 目录（对比不同迭代的模型）
+python evaluate_models_head_to_head.py \
+    --model_a models/deepcfr_parallel_6p/checkpoints/iter_1750 \
+    --model_b models/deepcfr_parallel_6p/checkpoints/iter_1600 \
+    --num_games 1000 \
+    --use_gpu
 ```
 
 **注意**: 两个模型必须具有**相同的游戏配置**（玩家数、下注抽象必须一致）。脚本会自动进行两轮测试（交换座位），以消除位置优势带来的偏差。
+
+### 3.1 批量评估所有 Checkpoint
+
+使用 `evaluate_all_checkpoints.py` 自动评估所有 checkpoint，找出最佳模型：
+
+```bash
+# 评估所有 checkpoint，每个测试 500 局
+python evaluate_all_checkpoints.py \
+    --model_dir models/deepcfr_parallel_6p \
+    --num_games 500 \
+    --use_gpu \
+    --top_k 10
+
+# 保存结果到文件
+python evaluate_all_checkpoints.py \
+    --model_dir models/deepcfr_parallel_6p \
+    --num_games 500 \
+    --use_gpu \
+    --output checkpoint_evaluation.json
+```
+
+**输出说明**:
+- 按玩家0平均收益排序，显示前 K 个最佳模型
+- 显示每个 checkpoint 的迭代号、平均收益、胜率、收益方差等指标
+- 收益方差越小，说明策略越平衡（所有位置表现相近）
 
 ---
 
@@ -278,6 +317,12 @@ python analyze_training.py \
 # 作为玩家 0 (SB) 与模型对战
 python play_interactive.py \
     --model_dir models/deepcfr_texas_6p_fchpa_large \
+    --num_players 6 \
+    --human_player 0
+
+# 支持 checkpoint 目录
+python play_interactive.py \
+    --model_dir models/deepcfr_parallel_6p/checkpoints/iter_1750 \
     --num_players 6 \
     --human_player 0
 ```
@@ -390,9 +435,10 @@ DeepCFR 的损失函数包含 `sqrt(iteration)` 加权项。因此，**随着迭
 .
 ├── train_deep_cfr_texas.py      # DeepCFR 训练主脚本 (支持多 GPU)
 ├── deep_cfr_parallel.py         # 多进程并行 DeepCFR 训练脚本 (推荐)
-├── inference_simple.py          # 快速推理/自对弈脚本
-├── evaluate_models_head_to_head.py # 模型对战评测脚本
-├── play_interactive.py          # 人机交互对战脚本
+├── inference_simple.py          # 快速推理/自对弈脚本 (支持 checkpoint)
+├── evaluate_models_head_to_head.py # 模型对战评测脚本 (支持 checkpoint)
+├── evaluate_all_checkpoints.py  # 批量评估所有 checkpoint，找出最佳模型
+├── play_interactive.py          # 人机交互对战脚本 (支持 checkpoint)
 ├── analyze_training.py          # 训练日志分析与对比脚本
 ├── deep_cfr_simple_feature.py   # 策略网络特征提取模块 (支持多 GPU)
 ├── deep_cfr_with_feature_transform.py # 复杂特征转换模块 (支持多 GPU)
@@ -400,6 +446,10 @@ DeepCFR 的损失函数包含 `sqrt(iteration)` 加权项。因此，**随着迭
 │   └── deepcfr_texas_.../       # 每次训练的独立目录
 │       ├── config.json          # 训练配置 (含 multi_gpu, gpu_ids)
 │       ├── *_policy_network.pt  # 策略网络权重 (用于推理)
+│       ├── checkpoints/         # Checkpoint 目录
+│       │   └── iter_N/          # 迭代 N 的 checkpoint
+│       │       ├── *_policy_network_iterN.pt
+│       │       └── *_advantage_player_*_iterN.pt
 │       ├── *_advantage_player_*.pt # 优势网络权重 (仅用于训练)
 │       └── *_history.json       # 训练日志
 └── train_texas_holdem_mccfr.py  # MCCFR 训练脚本

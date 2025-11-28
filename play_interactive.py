@@ -21,17 +21,32 @@ except ImportError:
 
 
 def load_model(model_dir, num_players=None, device='cpu'):
-    """加载训练好的模型"""
+    """加载训练好的模型（支持 checkpoint 格式）"""
     print(f"\n[1/2] 加载模型: {model_dir}")
     
     # 读取配置文件
     config_path = os.path.join(model_dir, 'config.json')
     config = {}
+    
+    # 如果当前目录没有 config，尝试从父目录加载（checkpoint 子目录的情况）
+    if not os.path.exists(config_path):
+        if "checkpoints" in model_dir:
+            parent_dir = os.path.dirname(model_dir)
+            # 如果父目录还是 checkpoints，再往上一级
+            if "checkpoints" in parent_dir:
+                main_dir = os.path.dirname(parent_dir)
+            else:
+                main_dir = parent_dir
+            config_path = os.path.join(main_dir, 'config.json')
+            if os.path.exists(config_path):
+                print(f"  ✓ 从主目录加载配置文件: {config_path}")
+    
     if os.path.exists(config_path):
         import json
         with open(config_path, 'r') as f:
             config = json.load(f)
-        print(f"  ✓ 读取配置文件")
+        if "checkpoints" not in model_dir:
+            print(f"  ✓ 读取配置文件")
         
         # 从配置获取玩家数量
         if num_players is None:
@@ -103,24 +118,58 @@ def load_model(model_dir, num_players=None, device='cpu'):
     
     # 加载模型
     # 优先使用 config 中的 prefix，否则尝试默认名称
+    import glob
+    import re
+    
+    policy_path = None
+    
+    # 1. 尝试最终模型格式: prefix_policy_network.pt
     policy_filename = f"{save_prefix}_policy_network.pt"
     policy_path = os.path.join(model_dir, policy_filename)
     
-    # 如果找不到，尝试旧的默认名称作为回退
     if not os.path.exists(policy_path):
-        fallback_path = os.path.join(model_dir, 'deepcfr_texas_policy_network.pt')
-        if os.path.exists(fallback_path):
-            print(f"  ⚠️ 未找到 {policy_filename}，尝试加载 {os.path.basename(fallback_path)}")
-            policy_path = fallback_path
+        # 2. 尝试 checkpoint 格式: prefix_policy_network_iterN.pt
+        pt_files = glob.glob(os.path.join(model_dir, "*_policy_network*.pt"))
+        if pt_files:
+            # 如果是 checkpoint 格式，选择最新的
+            checkpoint_files = [f for f in pt_files if "_iter" in os.path.basename(f)]
+            if checkpoint_files:
+                # 提取迭代号，选择最大的
+                max_iter = 0
+                latest_file = None
+                for f in checkpoint_files:
+                    match = re.search(r'_iter(\d+)\.pt$', f)
+                    if match:
+                        iter_num = int(match.group(1))
+                        if iter_num > max_iter:
+                            max_iter = iter_num
+                            latest_file = f
+                if latest_file:
+                    policy_path = latest_file
+                    print(f"  ✓ 找到 checkpoint: 迭代 {max_iter}")
+            else:
+                # 如果找到文件但不是 checkpoint 格式，使用第一个
+                policy_path = pt_files[0]
+                print(f"  ✓ 找到模型文件: {os.path.basename(policy_path)}")
+        else:
+            # 3. 尝试旧的默认名称作为回退
+            fallback_path = os.path.join(model_dir, 'deepcfr_texas_policy_network.pt')
+            if os.path.exists(fallback_path):
+                print(f"  ⚠️ 未找到 {policy_filename}，尝试加载 {os.path.basename(fallback_path)}")
+                policy_path = fallback_path
     
-    if not os.path.exists(policy_path):
-        print(f"  ✗ 模型文件不存在: {policy_path}")
+    if not policy_path or not os.path.exists(policy_path):
+        print(f"  ✗ 模型文件不存在")
+        if policy_path:
+            print(f"    尝试的路径: {policy_path}")
         return None, None
     
     # 根据配置选择模型类型
     if use_simple_feature and USE_SIMPLE_FEATURE:
         # 使用简单特征版本
-        print(f"  使用简单特征版本（266维 + 7维特征）")
+        state = game.new_initial_state()
+        embedding_size = len(state.information_state_tensor(0))
+        print(f"  使用简单特征版本（{embedding_size}维 + 7维特征 = {embedding_size + 7}维）")
         solver = DeepCFRSimpleFeature(
             game,
             policy_network_layers=policy_layers,
@@ -130,12 +179,17 @@ def load_model(model_dir, num_players=None, device='cpu'):
             learning_rate=1e-4,
             device=device
         )
-        solver._policy_network.load_state_dict(
-            torch.load(policy_path, map_location=device)
-        )
-        solver._policy_network.eval()
-        print(f"  ✓ 模型加载成功（简单特征版本）")
-        return game, solver
+        try:
+            solver._policy_network.load_state_dict(
+                torch.load(policy_path, map_location=device)
+            )
+            solver._policy_network.eval()
+            print(f"  ✓ 模型加载成功（简单特征版本）")
+            return game, solver
+        except RuntimeError as e:
+            print(f"  ✗ 权重加载失败: {e}")
+            print(f"  提示: 模型结构可能不匹配，请检查游戏配置是否与训练时一致")
+            return None, None
     elif use_feature_transform and USE_SIMPLE_FEATURE:
         # 使用复杂特征转换版本
         print(f"  使用复杂特征转换版本")

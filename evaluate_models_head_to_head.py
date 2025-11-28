@@ -25,7 +25,8 @@ except ImportError:
 
 
 def load_config(model_dir):
-    """加载配置文件"""
+    """加载配置文件（支持从父目录查找）"""
+    # 1. 先尝试从当前目录加载
     config_path = os.path.join(model_dir, "config.json")
     if os.path.exists(config_path):
         try:
@@ -33,13 +34,43 @@ def load_config(model_dir):
                 return json.load(f)
         except Exception as e:
             print(f"  ⚠️ 无法读取配置文件 {config_path}: {e}")
+    
+    # 2. 如果是 checkpoint 子目录，尝试从父目录加载
+    if "checkpoints" in model_dir:
+        parent_dir = os.path.dirname(model_dir)
+        # 如果父目录还是 checkpoints，再往上一级
+        if "checkpoints" in parent_dir:
+            main_dir = os.path.dirname(parent_dir)
+        else:
+            main_dir = parent_dir
+        
+        config_path = os.path.join(main_dir, "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"  ⚠️ 无法读取配置文件 {config_path}: {e}")
+    
     return None
 
 
 def load_model_network(model_dir, game, device):
-    """加载单个模型的策略网络"""
+    """加载单个模型的策略网络（支持 checkpoint 格式）"""
     print(f"  加载模型: {model_dir}")
+    
+    # 尝试从当前目录加载 config
     config = load_config(model_dir)
+    
+    # 如果当前目录没有 config，尝试从父目录加载（checkpoint 子目录的情况）
+    if not config:
+        parent_dir = os.path.dirname(model_dir)
+        if "checkpoints" in model_dir:
+            # 尝试从主模型目录加载
+            main_dir = os.path.dirname(parent_dir) if "checkpoints" in parent_dir else parent_dir
+            config = load_config(main_dir)
+            if config:
+                print(f"    ✓ 从主目录加载配置文件: {os.path.join(main_dir, 'config.json')}")
     
     # 确定前缀
     save_prefix = "deepcfr_texas"
@@ -47,15 +78,49 @@ def load_model_network(model_dir, game, device):
         save_prefix = config['save_prefix']
     
     # 寻找策略网络文件
+    import glob
+    import re
+    
+    policy_path = None
+    
+    # 1. 尝试最终模型格式: prefix_policy_network.pt
     policy_path = os.path.join(model_dir, f"{save_prefix}_policy_network.pt")
     if not os.path.exists(policy_path):
-        # 尝试旧命名
-        fallback_path = os.path.join(model_dir, "deepcfr_texas_policy_network.pt")
-        if os.path.exists(fallback_path):
-            policy_path = fallback_path
+        # 2. 尝试 checkpoint 格式: prefix_policy_network_iterN.pt
+        pt_files = glob.glob(os.path.join(model_dir, "*_policy_network*.pt"))
+        if pt_files:
+            # 如果是 checkpoint 格式，选择最新的
+            checkpoint_files = [f for f in pt_files if "_iter" in os.path.basename(f)]
+            if checkpoint_files:
+                # 提取迭代号，选择最大的
+                max_iter = 0
+                latest_file = None
+                for f in checkpoint_files:
+                    match = re.search(r'_iter(\d+)\.pt$', f)
+                    if match:
+                        iter_num = int(match.group(1))
+                        if iter_num > max_iter:
+                            max_iter = iter_num
+                            latest_file = f
+                if latest_file:
+                    policy_path = latest_file
+                    print(f"    ✓ 找到 checkpoint: 迭代 {max_iter}")
+            else:
+                # 如果找到文件但不是 checkpoint 格式，使用第一个
+                policy_path = pt_files[0]
+                print(f"    ✓ 找到模型文件: {os.path.basename(policy_path)}")
         else:
-            print(f"  ✗ 找不到策略网络文件: {policy_path}")
-            return None, None
+            # 3. 尝试旧命名
+            fallback_path = os.path.join(model_dir, "deepcfr_texas_policy_network.pt")
+            if os.path.exists(fallback_path):
+                policy_path = fallback_path
+            else:
+                print(f"  ✗ 找不到策略网络文件")
+                return None, None
+    
+    if not policy_path or not os.path.exists(policy_path):
+        print(f"  ✗ 策略网络文件不存在: {policy_path}")
+        return None, None
 
     # 确定模型结构参数
     policy_layers = [64, 64]

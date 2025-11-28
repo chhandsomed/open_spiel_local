@@ -230,8 +230,10 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="简化的 DeepCFR 推理")
-    parser.add_argument("--model_prefix", type=str, default="deepcfr_texas",
-                       help="模型文件路径前缀 (例如: models/run1/deepcfr_texas)")
+    parser.add_argument("--model_dir", type=str, default=None,
+                       help="模型目录路径 (例如: models/deepcfr_texas_6p)，推荐使用")
+    parser.add_argument("--model_prefix", type=str, default=None,
+                       help="模型文件路径前缀 (例如: models/run1/deepcfr_texas)，兼容旧版")
     parser.add_argument("--num_games", type=int, default=10,
                        help="测试游戏数量")
     parser.add_argument("--num_players", type=int, default=None,
@@ -247,11 +249,44 @@ def main():
     print("DeepCFR 简化推理")
     print("=" * 70)
     
-    # 加载配置
-    config = load_config(args.model_prefix)
-    if config:
-        print("  ✓ 找到并加载配置文件 config.json")
+    # 处理 model_dir 和 model_prefix 参数
+    if args.model_dir:
+        # 新方式：只传目录，从 config.json 读取 save_prefix
+        model_dir = args.model_dir
+        config_path = os.path.join(model_dir, "config.json")
+        if os.path.exists(config_path):
+            import json
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            save_prefix = config.get('save_prefix', 'deepcfr_texas')
+            args.model_prefix = os.path.join(model_dir, save_prefix)
+            print(f"  ✓ 找到并加载配置文件 config.json")
+            print(f"  模型前缀: {save_prefix}")
+        else:
+            # 尝试自动检测模型文件
+            import glob
+            pt_files = glob.glob(os.path.join(model_dir, "*_policy_network.pt"))
+            if pt_files:
+                # 从文件名推断 prefix
+                policy_file = os.path.basename(pt_files[0])
+                save_prefix = policy_file.replace("_policy_network.pt", "")
+                args.model_prefix = os.path.join(model_dir, save_prefix)
+                config = load_config(args.model_prefix)
+                print(f"  ⚠️ 未找到 config.json，从文件名推断前缀: {save_prefix}")
+            else:
+                print(f"  ✗ 目录中未找到模型文件: {model_dir}")
+                sys.exit(1)
+    elif args.model_prefix:
+        # 兼容旧方式
+        config = load_config(args.model_prefix)
+        if config:
+            print("  ✓ 找到并加载配置文件 config.json")
     else:
+        print("  ✗ 请指定 --model_dir 或 --model_prefix")
+        sys.exit(1)
+    
+    # 如果还没有 config，显示警告
+    if config is None:
         print("  ⚠️ 未找到配置文件，将使用默认参数或命令行参数")
 
     # 确定 num_players
@@ -300,7 +335,8 @@ def main():
         f"numBoardCards=0 3 1 1,"
         f"firstPlayer={first_player_str},"
         f"numSuits=4,"
-        f"numRanks=13"
+        f"numRanks=13,"
+        f"bettingAbstraction={betting_abstraction}"
         f")"
     )
     try:

@@ -443,10 +443,28 @@ class ParallelDeepCFRSolver:
     def _stop_workers(self):
         """停止 Worker 进程"""
         self._stop_event.set()
+        
+        # 清空所有队列，防止 Worker 阻塞在 put 操作
+        def drain_queue(q):
+            try:
+                while not q.empty():
+                    q.get_nowait()
+            except:
+                pass
+        
+        for q in self._advantage_queues:
+            drain_queue(q)
+        drain_queue(self._strategy_queue)
+        for q in self._network_params_queues:
+            drain_queue(q)
+        
+        # 等待 Worker 退出
         for p in self._workers:
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
+                p.join(timeout=1)
+        
         self._workers = []
         print("所有 Worker 已停止")
     
@@ -871,6 +889,9 @@ def main():
         'game_string': game_string,
         'multi_gpu': gpu_ids is not None and len(gpu_ids) > 1,
         'parallel': True,
+        'use_feature_transform': True,
+        'use_simple_feature': True,
+        'save_prefix': args.save_prefix,
     }
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)

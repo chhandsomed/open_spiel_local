@@ -38,41 +38,42 @@ export CUDA_VISIBLE_DEVICES=0
 nohup python train_deep_cfr_texas.py \
     --num_players 6 \
     --betting_abstraction fchpa \
-    --policy_layers 128 128 \
-    --advantage_layers 128 128 \
+    --policy_layers 256 256 256 \
+    --advantage_layers 256 256 256 \
     --memory_capacity 4000000 \
     --num_iterations 2000 \
-    --num_traversals 40 \
-    --learning_rate 0.0005 \
-    --eval_interval 50 \
-    --eval_with_games \
+    --num_traversals 100 \
+    --learning_rate 0.001 \
+    --batch_size 4096 \
+    --eval_interval 100 \
+    --checkpoint_interval 100 \
     --skip_nashconv \
-    --save_prefix deepcfr_texas_6p_fchpa_large \
-    > train_log_large.log 2>&1 &
+    --save_prefix deepcfr_texas_6p_single \
+    > train_single_gpu.log 2>&1 &
 ```
 
 ### 推荐命令 (多 GPU 版 + Checkpoint)
 支持多 GPU 并行训练和中间 checkpoint 保存，防止长时间训练中断丢失进度。
 
 ```bash
-# 使用 4 张 GPU 并行训练，每 200 次迭代保存一次 checkpoint
+# 使用 4 张 GPU 并行训练，每 100 次迭代保存一次 checkpoint
 nohup python train_deep_cfr_texas.py \
     --num_players 6 \
     --betting_abstraction fchpa \
-    --policy_layers 128 128 \
-    --advantage_layers 128 128 \
+    --policy_layers 256 256 256 \
+    --advantage_layers 256 256 256 \
     --memory_capacity 4000000 \
-    --num_iterations 20 \
-    --num_traversals 40 \
-    --learning_rate 0.0005 \
-    --eval_interval 10 \
-    --eval_with_games \
-    --save_prefix deepcfr_texas_6p_multi_gpu \
+    --num_iterations 2000 \
+    --num_traversals 100 \
+    --learning_rate 0.001 \
+    --batch_size 4096 \
+    --eval_interval 100 \
     --skip_nashconv \
     --multi_gpu \
     --gpu_ids 0 1 2 3 \
-    --checkpoint_interval 10 \
-    > train_log_multi_gpu.log 2>&1 &
+    --checkpoint_interval 100 \
+    --save_prefix deepcfr_texas_6p_multi_gpu \
+    > train_multi_gpu.log 2>&1 &
 ```
 
 **Checkpoint 说明**:
@@ -92,31 +93,32 @@ nohup python deep_cfr_parallel.py \
     --num_traversals 500 \
     --num_workers 16 \
     --batch_size 4096 \
-    --sync_interval 50 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
     --checkpoint_interval 50 \
     --skip_nashconv \
     --learning_rate 0.001 \
-    --policy_network_layers 256 256 256 \
-    --advantage_network_layers 256 256 256 \
+    --policy_layers 256 256 256 \
+    --advantage_layers 256 256 256 \
     --memory_capacity 2000000 \
     --betting_abstraction fchpa \
-    --save_prefix deepcfr_parallel_6p \
-    > train_parallel.log 2>&1 &
+    --save_prefix deepcfr_parallel_6p > train_parallel.log 2>&1 &
 ```
 
 ```bash
-# 快速测试命令（验证多GPU是否正常工作）
+# 快速测试命令（验证多Worker+多GPU是否正常工作）
 python deep_cfr_parallel.py \
     --num_players 6 \
     --num_iterations 10 \
     --num_traversals 100 \
-    --num_workers 4 \
-    --batch_size 1024 \
+    --num_workers 8 \
+    --batch_size 2048 \
+    --policy_layers 256 256 256 \
+    --advantage_layers 256 256 256 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
-    --skip_nashconv
+    --skip_nashconv \
+    --save_prefix test_parallel
 ```
 
 **多进程并行说明**:
@@ -131,7 +133,6 @@ python deep_cfr_parallel.py \
 **参数建议**:
 - `--num_workers`: 建议设为 CPU 核心数的一半到全部（如 8-16）
 - `--batch_size`: 多 GPU 时建议 4096+，充分利用显存
-- `--sync_interval`: 每 N 次遍历同步网络参数，建议 50-100
 - `--gpu_ids`: 指定多张 GPU，如 `0 1 2 3` 使用 4 张卡
 
 ### 关键参数说明
@@ -139,28 +140,40 @@ python deep_cfr_parallel.py \
 | 参数 | 默认值 | 推荐值 (6人局) | 说明 |
 | :--- | :--- | :--- | :--- |
 | `--betting_abstraction` | `fcpa` | **`fchpa`** | 下注抽象。`fchpa` 包含半池加注(Half-pot)，策略更灵活。 |
-| `--policy_layers` | `64 64` | **`128 128`** | 策略网络层数。6人局状态复杂，增加层数可提升拟合能力。 |
-| `--advantage_layers` | `32 32` | **`128 128`** | 优势网络层数。用于估计后悔值，建议与策略网络相当或略小。 |
+| `--policy_layers` | `64 64` | **`256 256 256`** | 策略网络结构。6人局状态复杂，建议3层256节点。 |
+| `--advantage_layers` | `32 32` | **`256 256 256`** | 优势网络结构。用于估计后悔值，建议与策略网络相同。 |
 | `--memory_capacity` | `1e6` | **`4e6` (400万)** | 经验回放缓冲区。越大越好，防止模型遗忘早期策略。 |
 | `--num_iterations` | `100` | **`2000`+** | 总迭代次数。DeepCFR 收敛较慢，需要较多迭代。 |
-| `--num_traversals` | `20` | **`40`** | 每次迭代采样的轨迹数。增加此值可减少方差，使训练更稳定。 |
-| `--learning_rate` | `1e-3` | **`5e-4`** | 学习率。网络变大后，适当降低学习率有助于稳定收敛。 |
-| `--multi_gpu` | `False` | - | 启用多 GPU 并行训练 (DataParallel)。 |
+| `--num_traversals` | `20` | **`100`** | 每次迭代采样的轨迹数。增加此值可减少方差，使训练更稳定。 |
+| `--learning_rate` | `1e-3` | **`1e-3`** | 学习率。 |
+| `--batch_size` | `2048` | **`4096`** | 训练批量大小。多 GPU 时越大利用率越高。 |
+| `--multi_gpu` | `False` | `True` | 启用多 GPU 并行训练 (DataParallel)。 |
 | `--gpu_ids` | `None` | `0 1 2 3` | 指定使用的 GPU ID 列表。不指定则使用所有可用 GPU。 |
-| `--checkpoint_interval` | `0` | **`200`** | Checkpoint 保存间隔。0 表示不保存中间 checkpoint。 |
+| `--checkpoint_interval` | `0` | **`100`** | Checkpoint 保存间隔。0 表示不保存中间 checkpoint。 |
+| `--skip_nashconv` | `False` | **`True`** | 跳过 NashConv 计算。6人局强烈建议开启。 |
 
 **多进程并行版参数** (`deep_cfr_parallel.py`):
 
 | 参数 | 默认值 | 推荐值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `--num_workers` | `4` | **`8-16`** | Worker 进程数量。建议设为 CPU 核心数。 |
+| `--num_workers` | `4` | **`16`** | Worker 进程数量。建议设为 CPU 核心数。 |
+| `--num_traversals` | `100` | **`500`** | 每次迭代遍历次数。多 Worker 时可设更大值。 |
 | `--batch_size` | `2048` | **`4096`** | 训练批量大小。多 GPU 时越大利用率越高。 |
-| `--sync_interval` | `100` | **`50`** | 每 N 次遍历同步网络参数到 Worker。 |
-| `--skip_nashconv` | `False` | **`True`** | 跳过 NashConv 计算。6人局强烈建议开启。 |
-| `--use_gpu` | `True` | `True` | 使用 GPU 训练网络。 |
+| `--policy_layers` | `128 128` | **`256 256 256`** | 策略网络结构。多 GPU 可用更大网络。 |
+| `--advantage_layers` | `128 128` | **`256 256 256`** | 优势网络结构。多 GPU 可用更大网络。 |
+| `--memory_capacity` | `1e6` | **`2e6`** | 经验回放缓冲区大小。 |
+| `--learning_rate` | `1e-3` | **`1e-3`** | 学习率。 |
+| `--use_gpu` | `False` | **`True`** | 使用 GPU 训练网络。 |
 | `--gpu_ids` | `None` | **`0 1 2 3`** | 指定多张 GPU，启用 DataParallel 并行训练。 |
-| `--policy_network_layers` | `128 128` | **`256 256 256`** | 策略网络结构。多 GPU 可用更大网络。 |
-| `--advantage_network_layers` | `128 128` | **`256 256 256`** | 优势网络结构。多 GPU 可用更大网络。 |
+| `--checkpoint_interval` | `0` | **`50`** | Checkpoint 保存间隔。 |
+| `--skip_nashconv` | `False` | **`True`** | 跳过 NashConv 计算。6人局强烈建议开启。 |
+
+**性能对比** (6人德扑, 5次迭代, 50次遍历):
+
+| 版本 | 时间 | 加速比 |
+| :--- | :--- | :--- |
+| `train_deep_cfr_texas.py` (多GPU版) | 65.8 秒 | 1x |
+| `deep_cfr_parallel.py` (16 Workers) | 8.48 秒 | **7.8x** |
 
 ### 附录：动作映射表
 
@@ -177,9 +190,15 @@ python deep_cfr_parallel.py \
 使用 `inference_simple.py` 让模型自己打自己，快速评估模型在各个位置的平均收益和胜率。
 
 ```bash
-# 运行 1000 局自对弈
+# 推荐方式：只传模型目录（自动从 config.json 读取配置）
 python inference_simple.py \
-    --model_prefix models/deepcfr_texas_6p_fchpa_large/deepcfr_texas_6p_fchpa_large \
+    --model_dir models/deepcfr_parallel_6p \
+    --num_games 1000 \
+    --use_gpu
+
+# 兼容旧方式：传完整路径前缀
+python inference_simple.py \
+    --model_prefix models/deepcfr_parallel_6p/deepcfr_parallel_6p \
     --num_games 1000 \
     --use_gpu
 ```

@@ -53,14 +53,15 @@ def get_action_from_network(state, policy_network, device):
     action_probs = {a: float(probs[a]) for a in legal_actions}
     total = sum(action_probs.values())
     if total > 1e-10:
-        action_probs = {a: p/total for a, p in action_probs.items()}
+        action_probs = {a: p / total for a, p in action_probs.items()}
     else:
-        action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
+        # 所有概率接近 0 时，退化为均匀策略
+        action_probs = {a: 1.0 / len(legal_actions) for a in legal_actions}
     
-    actions = list(action_probs.keys())
-    probabilities = np.array([action_probs[a] for a in actions])
-    probabilities = probabilities / probabilities.sum()
-    action = np.random.choice(actions, p=probabilities)
+    # 使用 argmax 选择动作（确定性策略）。
+    # 为了在概率完全相同时有确定性行为，按动作编号最小的打破平局。
+    best_action = max(sorted(action_probs.keys()), key=lambda a: action_probs[a])
+    action = best_action
     
     return action, action_probs
 

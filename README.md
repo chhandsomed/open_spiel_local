@@ -314,24 +314,39 @@ python analyze_training.py \
 使用 `play_interactive.py` 亲自与训练好的模型对战。
 
 ```bash
-# 作为玩家 0 (SB) 与模型对战
+# 作为玩家 0 (SB) 与模型对战（交互模式，一局一问是否继续）
 python play_interactive.py \
     --model_dir models/deepcfr_texas_6p_fchpa_large \
     --num_players 6 \
     --human_player 0
 
-# 支持 checkpoint 目录
+# 支持 checkpoint 目录（从某个迭代的 checkpoint 加载）
 python play_interactive.py \
-    --model_dir models/deepcfr_parallel_6p/checkpoints/iter_1750 \
+    --model_dir models/deepcfr_parallel_6p/checkpoints/iter_16550 \
     --num_players 6 \
     --human_player 0
+
+# 自动自对弈模式：人类座位也由模型控制，连续打 10 局并输出详细日志
+python play_interactive.py \
+    --model_dir models/deepcfr_parallel_6p/checkpoints/iter_16550 \
+    --num_players 6 \
+    --human_player 0 \
+    --auto_play \
+    --num_games 10 \
+    > play_interactive_16550_10games.log
 ```
 
 ### 游戏流程
 1.  **启动**: 脚本自动检测模型配置，加载环境。
 2.  **状态**: 显示当前轮次（Preflop/Flop/Turn/River）、公共牌、底池、你的手牌。
-3.  **行动**: 输入数字选择动作（弃牌/跟注/加注）。
+3.  **行动**:
+    - 交互模式：输入数字选择动作（弃牌/跟注/加注）。
+    - 自动模式（`--auto_play`）：人类位置也由模型决策，并打印该状态下各动作的概率分布。
 4.  **结束**: 结算收益，显示所有玩家手牌。
+
+> 说明：`play_interactive.py` / `evaluate_model.py` / `inference_simple.py` / `compare_models.py`
+> 在执行动作时，会先根据模型输出的 logits 计算概率分布，
+> 然后**选择概率最大的动作（贪心 argmax 策略）**，同时保留完整的动作概率用于日志展示。
 
 ### 故障排除
 *   **"RuntimeError: size mismatch"**: 检查模型是否使用了不同的 `bettingAbstraction` 或特征配置。确保 `config.json` 存在且正确。

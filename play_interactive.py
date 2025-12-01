@@ -246,18 +246,20 @@ def get_model_action(state, model, device, player):
         try:
             probs = model.action_probabilities(state, player)
             actions = list(probs.keys())
-            probabilities = np.array([probs[a] for a in actions])
+            probabilities = np.array([probs[a] for a in actions], dtype=float)
             # 归一化概率（确保概率和为1）
             total = probabilities.sum()
             if total > 1e-10:
                 probabilities = probabilities / total
             else:
                 # 如果所有概率都是0，使用均匀分布
-                probabilities = np.ones(len(actions)) / len(actions)
+                probabilities = np.ones(len(actions), dtype=float) / len(actions)
             
             # 更新 probs 字典为归一化后的值（用于显示）
             probs_normalized = {a: float(prob) for a, prob in zip(actions, probabilities)}
-            action = np.random.choice(actions, p=probabilities)
+            # 使用 argmax 选择动作（贪心策略）
+            best_idx = int(np.argmax(probabilities))
+            action = actions[best_idx]
             return action, probs_normalized
         except Exception as e:
             print(f"  ⚠️ 使用 action_probabilities 失败: {e}，尝试直接使用网络")
@@ -281,14 +283,15 @@ def get_model_action(state, model, device, player):
     action_probs = {a: float(probs[a]) for a in legal_actions}
     total = sum(action_probs.values())
     if total > 1e-10:
-        action_probs = {a: p/total for a, p in action_probs.items()}
+        action_probs = {a: p / total for a, p in action_probs.items()}
     else:
-        action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
+        # 所有概率接近 0 时，退化为均匀策略
+        action_probs = {a: 1.0 / len(legal_actions) for a in legal_actions}
     
-    actions = list(action_probs.keys())
-    probabilities = np.array([action_probs[a] for a in actions])
-    probabilities = probabilities / probabilities.sum()
-    action = np.random.choice(actions, p=probabilities)
+    # 使用 argmax 选择动作（确定性策略）
+    # 为了有稳定的行为，在概率相同的情况下按动作编号最小的打破平局
+    best_action = max(sorted(action_probs.keys()), key=lambda a: action_probs[a])
+    action = best_action
     
     return action, action_probs
 
@@ -527,7 +530,7 @@ def get_human_action(state, player):
             sys.exit(0)
 
 
-def play_interactive_game(game, model, device, human_player=0, model_player=1):
+def play_interactive_game(game, model, device, human_player=0, model_player=1, auto_play=False):
     """进行一局交互式游戏"""
     state = game.new_initial_state()
     action_history = []  # 记录动作历史
@@ -647,19 +650,22 @@ def play_interactive_game(game, model, device, human_player=0, model_player=1):
             # 显示游戏状态（传入按轮次分组的公共牌）
             display_game_state(state, human_player, model_player, action_history, board_cards_by_round, board_cards_ordered)
             
-            if current_player == human_player:
-                # 人类玩家行动
+            if current_player == human_player and not auto_play:
+                # 人类玩家行动（交互模式）
                 action = get_human_action(state, current_player)
                 action_str = action_to_string(action)
                 action_history.append((current_player, action, action_str))
             else:
-                # 模型行动
+                # 模型行动（包含 auto_play 时的人类位置）
                 action, probs = get_model_action(state, model, device, current_player)
                 action_str = action_to_string(action)
                 action_history.append((current_player, action, action_str))
                 
                 # 显示模型的选择
-                print(f"\n玩家 {current_player} (模型) 选择了: {action_str}")
+                if current_player == human_player and auto_play:
+                    print(f"\n你 (自动模式) 选择了: {action_str}")
+                else:
+                    print(f"\n玩家 {current_player} (模型) 选择了: {action_str}")
                 
                 # 显示动作概率（简化显示）
                 if len(probs) <= 5:
@@ -747,7 +753,10 @@ def main():
                        help="人类玩家编号（0 或 1）")
     parser.add_argument("--use_gpu", action="store_true", default=True,
                        help="使用 GPU")
-    
+    parser.add_argument("--num_games", type=int, default=None,
+                       help="自动连续对局的局数（指定后不再询问是否继续）")
+    parser.add_argument("--auto_play", action="store_true",
+                       help="人类位置也由模型自动行动（用于批量自博弈/日志记录）")
     args = parser.parse_args()
     
     # 检查模型目录
@@ -777,27 +786,54 @@ def main():
     print("=" * 70)
     print(f"人类玩家: {args.human_player}")
     print(f"模型玩家: {model_player}")
+    if args.auto_play:
+        print("\n模式: 自动对局 (人类位置也由模型控制)")
     print("\n提示: 输入 Ctrl+C 可以退出游戏")
     
     # 游戏循环
-    while True:
-        try:
-            returns = play_interactive_game(game, model, device, 
-                                          args.human_player, model_player)
-            
-            # 询问是否继续
-            print("\n" + "-" * 70)
-            choice = input("是否继续下一局? (y/n): ").strip().lower()
-            if choice != 'y':
+    if args.num_games is not None:
+        # 非交互批量模式
+        for i in range(args.num_games):
+            try:
+                print("\n" + "-" * 70)
+                print(f"开始第 {i + 1}/{args.num_games} 局")
+                print("-" * 70)
+                returns = play_interactive_game(
+                    game, model, device,
+                    args.human_player, model_player,
+                    auto_play=args.auto_play,
+                )
+            except KeyboardInterrupt:
+                print("\n\n游戏被中断，退出")
                 break
-        except KeyboardInterrupt:
-            print("\n\n游戏被中断，退出")
-            break
-        except Exception as e:
-            print(f"\n错误: {e}")
-            import traceback
-            traceback.print_exc()
-            break
+            except Exception as e:
+                print(f"\n错误: {e}")
+                import traceback
+                traceback.print_exc()
+                break
+    else:
+        # 原来的交互循环
+        while True:
+            try:
+                returns = play_interactive_game(
+                    game, model, device,
+                    args.human_player, model_player,
+                    auto_play=args.auto_play,
+                )
+                
+                # 询问是否继续
+                print("\n" + "-" * 70)
+                choice = input("是否继续下一局? (y/n): ").strip().lower()
+                if choice != 'y':
+                    break
+            except KeyboardInterrupt:
+                print("\n\n游戏被中断，退出")
+                break
+            except Exception as e:
+                print(f"\n错误: {e}")
+                import traceback
+                traceback.print_exc()
+                break
     
     print("\n" + "=" * 70)
     print("感谢游戏！")

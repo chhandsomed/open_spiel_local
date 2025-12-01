@@ -72,36 +72,42 @@ def evaluate_checkpoint(checkpoint_path, num_games=500, use_gpu=True):
         output = result.stdout
         metrics = {}
         
-        # 提取平均收益和胜率
-        # 格式: "玩家 0: 平均收益: X.XXXX 胜率: XX.X%"
-        for line in output.split('\n'):
-            if '平均收益:' in line and '玩家 0' in line:
-                # 提取平均收益
-                match = re.search(r'平均收益:\s*([-\d.]+)', line)
-                if match:
-                    metrics['player0_avg_return'] = float(match.group(1))
-            
-            if '胜率:' in line and '玩家 0' in line:
-                # 提取胜率
-                match = re.search(r'胜率:\s*([\d.]+)%', line)
-                if match:
-                    metrics['player0_win_rate'] = float(match.group(1))
-        
-        # 提取所有玩家的收益（用于计算总体表现）
+        # 提取所有玩家的收益和胜率（多行格式）
+        # 格式:
+        #   玩家 0:
+        #     平均收益: X.XXXX
+        #     胜率: XX.X%
         player_returns = []
+        player_win_rates = []
+        
+        # 使用多行正则表达式匹配
         for i in range(6):  # 6人局
-            pattern = f'玩家 {i}:.*?平均收益:\s*([-\d.]+)'
-            match = re.search(pattern, output)
+            # 匹配玩家i的收益和胜率（允许跨行）
+            pattern = rf'玩家 {i}:.*?平均收益:\s*([-\d.]+).*?胜率:\s*([\d.]+)%'
+            match = re.search(pattern, output, re.DOTALL)
             if match:
                 player_returns.append(float(match.group(1)))
+                player_win_rates.append(float(match.group(2)))
         
         if player_returns:
+            # 玩家0的指标
+            if len(player_returns) > 0:
+                metrics['player0_avg_return'] = player_returns[0]
+            if len(player_win_rates) > 0:
+                metrics['player0_win_rate'] = player_win_rates[0]
+            
+            # 所有玩家的统计
             metrics['all_players_returns'] = player_returns
+            metrics['all_players_win_rates'] = player_win_rates
             metrics['avg_return_all'] = sum(player_returns) / len(player_returns)
             metrics['max_return'] = max(player_returns)
             metrics['min_return'] = min(player_returns)
             # 计算收益方差（越小越好，说明策略更平衡）
             metrics['return_variance'] = sum((r - metrics['avg_return_all'])**2 for r in player_returns) / len(player_returns)
+        
+        # 如果没有提取到数据，返回None表示失败
+        if not player_returns:
+            return None
         
         return metrics
         

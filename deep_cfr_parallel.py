@@ -133,27 +133,46 @@ def worker_process(
         device: 计算设备
     """
     # 设置进程名称
-    import setproctitle
     try:
+        import setproctitle
         setproctitle.setproctitle(f"deepcfr_worker_{worker_id}")
+    except ImportError:
+        pass
     except:
         pass
     
-    print(f"[Worker {worker_id}] 启动，设备: {device}")
-    
-    # 创建游戏
+    # 设置异常处理
+    try:
+        print(f"[Worker {worker_id}] 启动，设备: {device}")
+        
+        # 创建游戏
     game = pyspiel.load_game(game_string)
     root_node = game.new_initial_state()
     
     # 创建本地优势网络（用于采样动作）
     advantage_networks = []
     for _ in range(num_players):
+        # 从游戏字符串中解析max_stack
+        import re
+        game_string = str(game)
+        match = re.search(r'stack=([\d\s]+)', game_string)
+        max_stack = 2000  # 默认值
+        if match:
+            stack_str = match.group(1).strip()
+            stack_values = stack_str.split()
+            if stack_values:
+                try:
+                    max_stack = int(stack_values[0])
+                except ValueError:
+                    pass
+        
         net = SimpleFeatureMLP(
             embedding_size,
             list(advantage_network_layers),
             num_actions,
             num_players=num_players,
-            max_game_length=game.max_game_length()
+            max_game_length=game.max_game_length(),
+            max_stack=max_stack
         )
         net = net.to(device)
         net.eval()
@@ -271,7 +290,13 @@ def worker_process(
                     break
                 traverse_game_tree(root_node.clone(), player, current_iteration)
     
-    print(f"[Worker {worker_id}] 停止")
+    except Exception as e:
+        print(f"\n[Worker {worker_id}] 发生异常: {e}")
+        import traceback
+        traceback.print_exc()
+        raise e
+    finally:
+        print(f"[Worker {worker_id}] 停止")
 
 
 class ParallelDeepCFRSolver:
@@ -325,6 +350,9 @@ class ParallelDeepCFRSolver:
         # 游戏字符串（用于 Worker 创建游戏）
         self._game_string = str(game)
         
+        # 从游戏配置中解析max_stack（用于归一化下注统计特征）
+        self._max_stack = self._parse_max_stack_from_game_string(self._game_string)
+        
         # 网络层配置
         self._policy_network_layers = policy_network_layers
         self._advantage_network_layers = advantage_network_layers
@@ -349,6 +377,31 @@ class ParallelDeepCFRSolver:
         
         self._iteration = 1
     
+    def _parse_max_stack_from_game_string(self, game_string):
+        """从游戏字符串中解析max_stack值
+        
+        Args:
+            game_string: 游戏配置字符串，例如 "universal_poker(...,stack=2000 2000 2000,...)"
+        
+        Returns:
+            max_stack: 单个玩家的最大筹码量（默认2000）
+        """
+        import re
+        # 匹配 stack=后面的值
+        match = re.search(r'stack=([\d\s]+)', game_string)
+        if match:
+            stack_str = match.group(1).strip()
+            # 解析第一个玩家的筹码量（所有玩家应该相同）
+            stack_values = stack_str.split()
+            if stack_values:
+                try:
+                    max_stack = int(stack_values[0])
+                    return max_stack
+                except ValueError:
+                    pass
+        # 如果解析失败，返回默认值2000
+        return 2000
+    
     def _create_networks(self):
         """创建神经网络"""
         # 策略网络
@@ -357,8 +410,15 @@ class ParallelDeepCFRSolver:
             list(self._policy_network_layers),
             self._num_actions,
             num_players=self.num_players,
-            max_game_length=self.game.max_game_length()
+            max_game_length=self.game.max_game_length(),
+            max_stack=self._max_stack
         )
+        
+        # 验证策略网络输入维度
+        actual_input_size = policy_net.mlp.model[0]._weight.shape[1]
+        expected_input_size = self._embedding_size + 7  # 7维手动特征（位置4 + 手牌强度1 + 下注统计2）
+        assert actual_input_size == expected_input_size, \
+            f"策略网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
         
         # 多 GPU 包装
         if self.use_multi_gpu:
@@ -376,14 +436,21 @@ class ParallelDeepCFRSolver:
         # 优势网络（每个玩家一个）
         self._advantage_networks = []
         self._optimizer_advantages = []
-        for _ in range(self.num_players):
+        for player in range(self.num_players):
             net = SimpleFeatureMLP(
                 self._embedding_size,
                 list(self._advantage_network_layers),
                 self._num_actions,
                 num_players=self.num_players,
-                max_game_length=self.game.max_game_length()
+                max_game_length=self.game.max_game_length(),
+                max_stack=self._max_stack
             )
+            
+            # 验证优势网络输入维度
+            actual_input_size = net.mlp.model[0]._weight.shape[1]
+            expected_input_size = self._embedding_size + 7  # 7维手动特征（位置4 + 手牌强度1 + 下注统计2）
+            assert actual_input_size == expected_input_size, \
+                f"玩家 {player} 优势网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
             
             # 多 GPU 包装
             if self.use_multi_gpu:
@@ -413,9 +480,12 @@ class ParallelDeepCFRSolver:
         self._network_params_queues = [Queue(maxsize=10) for _ in range(self.num_workers)]
         
         # 计算每个 Worker 的遍历次数
-        traversals_per_worker = max(1, self.num_traversals // self.num_workers)
+        # 关键修正：不再一次性分配 huge number，而是分配一个小批次，让 Worker 快速响应
+        # 主进程会通过控制收集样本的数量来保证总遍历次数
+        traversals_per_worker = 10  # 每个 Worker 每次只跑 10 次遍历，然后检查同步
         
         # 启动 Worker
+        print(f"  正在平滑启动 {self.num_workers} 个 Worker (每组5个)...")
         for i in range(self.num_workers):
             p = Process(
                 target=worker_process,
@@ -433,12 +503,18 @@ class ParallelDeepCFRSolver:
                     self._iteration_counter,
                     traversals_per_worker,
                     'cpu',  # Worker 在 CPU 上运行
-                )
+                ),
+                daemon=True  # 设置为守护进程，主进程退出时自动杀死
             )
             p.start()
             self._workers.append(p)
+            
+            # 平滑启动：每启动 5 个 Worker 稍微暂停一下，避免瞬间 IO/CPU 拥堵
+            if (i + 1) % 5 == 0:
+                print(f"    已启动 {i + 1}/{self.num_workers}...", end="\r", flush=True)
+                time.sleep(1)
         
-        print(f"已启动 {self.num_workers} 个 Worker 进程")
+        print(f"\n  ✓ 已启动 {self.num_workers} 个 Worker 进程")
     
     def _stop_workers(self):
         """停止 Worker 进程"""
@@ -492,6 +568,16 @@ class ParallelDeepCFRSolver:
     
     def _collect_samples(self, timeout=0.1):
         """从队列收集样本"""
+        # 检查 Worker 状态
+        dead_workers = []
+        for i, p in enumerate(self._workers):
+            if not p.is_alive():
+                dead_workers.append(i)
+        
+        if dead_workers:
+            # 如果有 Worker 死亡，抛出异常，触发主进程清理和退出
+            raise RuntimeError(f"检测到 Worker {dead_workers} 已死亡！训练无法继续。")
+
         # 收集优势样本
         for player in range(self.num_players):
             while True:
@@ -630,19 +716,45 @@ class ParallelDeepCFRSolver:
                 # 更新迭代计数器
                 self._iteration_counter.value = iteration + 1
                 
-                # 等待 Worker 收集样本（根据遍历次数动态调整）
-                # 每次遍历大约需要 0.2-0.5 秒，总共需要 num_traversals / num_workers 次
-                wait_time = max(0.5, (self.num_traversals / self.num_workers) * 0.3)
-                time.sleep(wait_time)
+                # 动态收集样本：直到收集到足够数量的新样本
+                # 这样可以确保每次迭代的数据量是恒定的，不受 Worker 速度影响
+                # 同时通过循环 sleep(1) 避免了主进程长时间无响应
                 
-                # 收集样本
-                self._collect_samples()
+                current_total_samples = sum(len(m) for m in self._advantage_memories)
+                # 目标：本轮新增 num_traversals 个样本
+                # 注意：由于可能有多个 Worker 同时提交，可能会略多一点，没关系
+                target_total_samples = current_total_samples + self.num_traversals
+                
+                # 设置一个超时保护（例如 10 分钟），防止 Worker 全部挂死导致主进程死循环
+                collection_start_time = time.time()
+                
+                while True:
+                    self._collect_samples()
+                    new_current_samples = sum(len(m) for m in self._advantage_memories)
+                    
+                    # 检查是否达标
+                    if new_current_samples >= target_total_samples:
+                        break
+                        
+                    # 检查超时 (10分钟)
+                    if time.time() - collection_start_time > 600:
+                        if verbose:
+                            print(f"\n  ⚠️ 警告: 样本收集超时 (已收集 {new_current_samples - current_total_samples}/{self.num_traversals})")
+                        break
+                    
+                    # 稍微睡一下，避免 CPU 空转，同时也给 Worker 提交数据的机会
+                    time.sleep(0.5)
                 
                 # 训练优势网络
                 for player in range(self.num_players):
                     loss = self._learn_advantage_network(player)
                     if loss is not None:
                         advantage_losses[player].append(loss)
+                
+                # 训练策略网络
+                # 为了加速 checkpoint 保存时的策略网络更新，我们在每次迭代中增量训练策略网络
+                # 这样可以分摊计算成本，使得 checkpoint 时策略网络已经接近就绪
+                policy_loss = self._learn_strategy_network()
                 
                 # 同步网络参数到 Worker
                 if (iteration + 1) % self.sync_interval == 0:
@@ -675,7 +787,7 @@ class ParallelDeepCFRSolver:
                                 include_test_games=eval_with_games,
                                 num_test_games=num_test_games,
                                 max_depth=None,
-                                verbose=False
+                                verbose=True  # 启用详细输出以查看错误
                             )
                             print(" 完成")
                             
@@ -699,15 +811,24 @@ class ParallelDeepCFRSolver:
                         except Exception as e:
                             print(f" 评估失败: {e}")
                 
-                # 保存 checkpoint
-                if checkpoint_interval > 0 and (iteration + 1) % checkpoint_interval == 0:
-                    if model_dir and save_prefix and game:
-                        print(f"\n  💾 保存 checkpoint (迭代 {iteration + 1})...", end="", flush=True)
-                        try:
-                            save_checkpoint(self, game, model_dir, save_prefix, iteration + 1)
-                            print(" 完成")
-                        except Exception as e:
-                            print(f" 失败: {e}")
+                    # 保存 checkpoint
+                    if checkpoint_interval > 0 and (iteration + 1) % checkpoint_interval == 0:
+                        if model_dir and save_prefix and game:
+                            print(f"\n  💾 保存 checkpoint (迭代 {iteration + 1})...", end="", flush=True)
+                            try:
+                                # 虽然已经增量训练了，但在保存前再多训练几次以确保最新
+                                print("\n    正在最终优化策略网络 (用于 Checkpoint)...", end="")
+                                for _ in range(5):  # 额外训练 5 次
+                                    policy_loss = self._learn_strategy_network()
+                                if policy_loss is not None:
+                                    print(f" 完成 (Loss: {policy_loss:.6f})")
+                                else:
+                                    print(" 完成 (无足够样本训练)")
+                                
+                                save_checkpoint(self, game, model_dir, save_prefix, iteration + 1)
+                                print("  ✓ Checkpoint 已保存")
+                            except Exception as e:
+                                print(f" 失败: {e}")
             
             print()
             
@@ -746,7 +867,19 @@ class ParallelDeepCFRSolver:
                 torch.FloatTensor(info_state_vector).to(self.device)
             )
             probs = self._policy_sm(logits).cpu().numpy()
-        return {action: probs[0][action] for action in legal_actions}
+        
+        # 确保只返回合法动作的概率，并重新归一化
+        action_probs = {action: float(probs[0][action]) for action in legal_actions}
+        total_prob = sum(action_probs.values())
+        
+        if total_prob > 1e-10:
+            # 重新归一化
+            action_probs = {a: p / total_prob for a, p in action_probs.items()}
+        else:
+            # 如果所有概率都接近0，使用均匀分布
+            action_probs = {a: 1.0 / len(legal_actions) for a in legal_actions}
+            
+        return action_probs
 
 
 def load_checkpoint(solver, model_dir, save_prefix, game):
@@ -911,6 +1044,16 @@ def save_checkpoint(solver, game, model_dir, save_prefix, iteration, is_final=Fa
 
 
 def main():
+    # 注册信号处理，确保被 kill 时也能清理子进程
+    def signal_handler(signum, frame):
+        print(f"\n接收到信号 {signum}，正在清理并退出...")
+        # 注意：这里不能直接调用 solver._stop_workers() 因为 solver 不在作用域内
+        # 但由于 worker 进程已设置为 daemon=True，主进程退出时它们会自动被系统清理
+        sys.exit(0)
+        
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
     parser = argparse.ArgumentParser(description="多进程并行 DeepCFR 训练")
     parser.add_argument("--num_players", type=int, default=2, help="玩家数量")
     parser.add_argument("--num_workers", type=int, default=4, help="Worker 进程数量")
@@ -1059,6 +1202,34 @@ def main():
         device=device,
         gpu_ids=gpu_ids,
     )
+    
+    # 立即保存配置（方便在训练过程中查看或恢复）
+    if not args.resume:
+        import json
+        config_path = os.path.join(model_dir, "config.json")
+        config = {
+            'num_players': num_players,
+            'num_workers': args.num_workers,
+            'num_iterations': args.num_iterations,
+            'num_traversals': args.num_traversals,
+            'policy_layers': args.policy_layers,
+            'advantage_layers': args.advantage_layers,
+            'learning_rate': args.learning_rate,
+            'batch_size': args.batch_size,
+            'memory_capacity': args.memory_capacity,
+            'betting_abstraction': args.betting_abstraction,
+            'device': device,
+            'gpu_ids': gpu_ids,
+            'game_string': game_string,
+            'multi_gpu': gpu_ids is not None and len(gpu_ids) > 1,
+            'parallel': True,
+            'use_feature_transform': True,
+            'use_simple_feature': True,
+            'save_prefix': args.save_prefix,
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"  ✓ 配置已保存: {config_path}")
     
     # 如果是恢复训练，加载 checkpoint
     if args.resume:

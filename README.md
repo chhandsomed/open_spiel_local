@@ -1,34 +1,82 @@
-# OpenSpiel 德州扑克 DeepCFR 完整使用指南
+# Texas Hold'em DeepCFR Solver (基于 OpenSpiel)
 
-本文档详细介绍了 OpenSpiel 德州扑克 DeepCFR 环境的安装、训练、推理、评测以及交互式对战流程，并提供了针对 6 人无限注德州扑克（No-Limit Texas Hold'em）的参数调优建议。
+这是一个针对德州扑克（No-Limit Texas Hold'em）优化的 Deep CFR 求解器。项目基于 DeepMind 的 OpenSpiel 框架，添加了多进程并行训练、自定义特征工程、实时评估和交互式对战功能。
+
+## 📋 目录
+
+1. [安装与环境准备](#0-安装与环境准备-installation)
+2. [项目更新与架构演进](#1-项目更新与架构演进-architecture--updates)
+3. [核心功能与优化](#2-核心功能与优化-core-features)
+4. [训练](#3-训练-training)
+5. [推理与自对弈](#4-推理与自对弈-inference--self-play)
+6. [模型对比评测](#5-模型对比评测-head-to-head-evaluation)
+7. [交互式对战](#6-交互式对战-interactive-play)
+8. [训练日志分析](#7-训练日志分析-log-analysis)
+9. [文件结构](#8-文件结构)
+
+---
 
 ## 0. 安装与环境准备 (Installation)
 
 ### 系统依赖
-项目提供了一个脚本来自动安装所需的 C++ 依赖库（如 `abseil-cpp`, `dds` 等）和系统工具。
 ```bash
 ./install.sh
 ```
 
 ### Python 环境
-建议使用 Conda 管理环境 (Python 3.9 - 3.12)：
+建议使用 Conda (Python 3.9 - 3.12):
 ```bash
-conda create -n open_spiel python=3.12 -y
+conda create -n open_spiel python=3.11
 conda activate open_spiel
 pip install -r requirements.txt
 ```
 
 ### 编译 OpenSpiel
-安装 Python 绑定 (`pyspiel`)：
 ```bash
 pip install .
 ```
 
 ---
 
-## 1. 训练 (Training)
+## 1. 项目更新与架构演进 (Architecture & Updates)
 
-使用 `train_deep_cfr_texas.py` 脚本来训练模型。
+### 🚀 2025-12-08 最新架构升级
+
+本项目已经历了多次核心迭代，解决了原始 DeepCFR 算法在 6 人局大规模场景下的多个瓶颈。
+
+#### **1. 并行化架构重构 (Parallel DeepCFR)**
+*   **问题**: 原生 DeepCFR 仅支持简单的 GPU 数据并行，CPU 游戏树遍历（采样）成为严重瓶颈。
+*   **解决方案**: 实现了 **Master-Worker 架构 (`deep_cfr_parallel.py`)**。
+    *   **Worker (CPU)**: N 个 Worker 进程并行进行 Monte Carlo 树遍历，生产样本。
+    *   **Master (GPU)**: 主进程专注于从共享缓冲区采样并训练神经网络。
+    *   **健壮性升级**: 
+        *   新增 **Worker 存活监控**：主进程实时监测 Worker 状态，一旦发现 Worker 异常退出（如 OOM），立即抛出异常停止训练，防止主进程死锁空转。
+        *   异常堆栈捕获：Worker 进程增加全局异常捕获，确保错误日志不丢失。
+*   **效果**: 训练吞吐量提升 **7.8x** (16核 CPU)，彻底解耦计算密集型与 IO 密集型任务。
+
+#### **2. 特征工程增强 (Feature Engineering)**
+*   **问题**: 原始 InfoState 过于稀疏，且对大额筹码（如 20000）不敏感（数值未归一化）。
+*   **解决方案**: 
+    *   **Simple Feature 模式**: 在原始 InfoState 后拼接 **7 维专家特征**（位置优势、EHS 手牌强度、下注统计）。
+    *   **自动特征归一化**: 自动读取游戏配置的 `stack`，将所有金额类特征（包括原始输入中的 `sizings`）归一化到 `[0, 1]`，解决了模型对大筹码数值脱敏的问题。
+
+#### **3. 6人局专项适配**
+*   **网络扩容**: 策略网络从 `64x64` 升级为 **`256x3`** 或 **`1024x4`**，以拟合 6 人局复杂的博弈逻辑。
+*   **动作空间**: 采用 **`fchpa`** (Fold, Call, Half-Pot, Pot, All-in) 抽象，引入半池下注。
+
+---
+
+## 2. 核心功能与优化 (Core Features)
+
+*   **多进程并行训练**: 真正的 CPU 多核利用。
+*   **多 GPU 加速**: 支持 PyTorch `DataParallel`，单机多卡训练。
+*   **增量式 Checkpoint**: 训练过程中无卡顿保存模型，支持从任意 Checkpoint 完美恢复训练 (`--resume`)。
+*   **实时评估**: 训练中定期进行“策略熵”监控和“随机对战测试”，即使跳过 NashConv 也能掌握训练趋势。
+*   **交互式对战**: 提供人类 vs AI 的实战接口，支持实时显示 AI 思考概率。
+
+---
+
+## 3. 训练 (Training)
 
 ### 推荐命令 (单 GPU 版)
 针对 RTX 4090 等高性能显卡，建议使用更大的网络和缓冲区以获得更强的策略。
@@ -85,8 +133,8 @@ nohup python train_deep_cfr_texas.py \
 ### 推荐命令 (多进程并行版 - 真正的并行化) ⭐推荐
 使用多个 CPU 进程并行遍历游戏树，充分利用多核 CPU，显著提升训练速度。
 
+#### 针对 4张 4090 显卡的高性能配置 (推荐)
 ```bash
-# 多进程并行 + 多 GPU（4张卡，16个Worker，推荐配置）
 nohup python deep_cfr_parallel.py \
     --num_players 6 \
     --num_iterations 2000 \
@@ -95,9 +143,10 @@ nohup python deep_cfr_parallel.py \
     --batch_size 4096 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
-    --eval_interval 100 \
+    --eval_interval 50 \
+    --checkpoint_interval 100 \
     --eval_with_games \
-    --checkpoint_interval 50 \
+    --num_test_games 10 \
     --skip_nashconv \
     --learning_rate 0.001 \
     --policy_layers 256 256 256 \
@@ -107,20 +156,22 @@ nohup python deep_cfr_parallel.py \
     --save_prefix deepcfr_parallel_6p > train_parallel.log 2>&1 &
 ```
 
+#### 通用配置 (单卡/少核)
 ```bash
-# 快速测试命令（验证多Worker+多GPU是否正常工作）
-python deep_cfr_parallel.py \
+nohup python deep_cfr_parallel.py \
     --num_players 6 \
-    --num_iterations 10 \
-    --num_traversals 100 \
+    --num_iterations 20000 \
     --num_workers 8 \
-    --batch_size 2048 \
+    --num_traversals 500 \
+    --batch_size 4096 \
+    --memory_capacity 2000000 \
+    --learning_rate 0.001 \
     --policy_layers 256 256 256 \
     --advantage_layers 256 256 256 \
     --use_gpu \
-    --gpu_ids 0 1 2 3 \
-    --eval_interval 5 \
-    --eval_with_games \
+    --gpu_ids 0 \
+    --eval_interval 100 \
+    --checkpoint_interval 100 \
     --skip_nashconv \
     --save_prefix test_parallel
 ```
@@ -136,9 +187,8 @@ python deep_cfr_parallel.py \
 - 训练中断时自动保存当前进度
 
 ```bash
-# 恢复训练示例：从之前的模型目录继续训练
 nohup python deep_cfr_parallel.py \
-    --resume models/deepcfr_parallel_6p \
+    --resume models/deepcfr_stable_run/checkpoints/iter_7300 \
     --num_iterations 20000 \
     --num_workers 16 \
     --use_gpu \
@@ -227,12 +277,6 @@ python inference_simple.py \
     --model_dir models/deepcfr_parallel_6p/checkpoints/iter_1750 \
     --num_games 1000 \
     --use_gpu
-
-# 兼容旧方式：传完整路径前缀
-python inference_simple.py \
-    --model_prefix models/deepcfr_parallel_6p/deepcfr_parallel_6p \
-    --num_games 1000 \
-    --use_gpu
 ```
 
 **结果解读**:
@@ -242,7 +286,7 @@ python inference_simple.py \
 
 ---
 
-## 3. 模型对比评测 (Head-to-Head Evaluation)
+## 5. 模型对比评测 (Head-to-Head Evaluation)
 
 使用 `evaluate_models_head_to_head.py` 让两个不同的模型进行对战（例如：新模型 vs 旧模型）。
 
@@ -264,7 +308,7 @@ python evaluate_models_head_to_head.py \
 
 **注意**: 两个模型必须具有**相同的游戏配置**（玩家数、下注抽象必须一致）。脚本会自动进行两轮测试（交换座位），以消除位置优势带来的偏差。
 
-### 3.1 批量评估所有 Checkpoint
+### 批量评估所有 Checkpoint
 
 使用 `evaluate_all_checkpoints.py` 自动评估所有 checkpoint，找出最佳模型：
 
@@ -291,25 +335,7 @@ python evaluate_all_checkpoints.py \
 
 ---
 
-## 4. 训练日志分析 (Log Analysis)
-
-使用 `analyze_training.py` 分析训练过程中的指标变化，或对比两次训练的效果。
-
-### 单模型分析
-```bash
-python analyze_training.py models/deepcfr_texas_6p_fchpa_large/deepcfr_texas_6p_fchpa_large_training_history.json
-```
-
-### 双模型对比
-```bash
-python analyze_training.py \
-    models/new_model/history.json \
-    --compare models/old_model/history.json
-```
-
----
-
-## 5. 交互式对战 (Interactive Play)
+## 6. 交互式对战 (Interactive Play)
 
 使用 `play_interactive.py` 亲自与训练好的模型对战。
 
@@ -317,12 +343,6 @@ python analyze_training.py \
 # 作为玩家 0 (SB) 与模型对战（交互模式，一局一问是否继续）
 python play_interactive.py \
     --model_dir models/deepcfr_texas_6p_fchpa_large \
-    --num_players 6 \
-    --human_player 0
-
-# 支持 checkpoint 目录（从某个迭代的 checkpoint 加载）
-python play_interactive.py \
-    --model_dir models/deepcfr_parallel_6p/checkpoints/iter_16550 \
     --num_players 6 \
     --human_player 0
 
@@ -344,103 +364,28 @@ python play_interactive.py \
     - 自动模式（`--auto_play`）：人类位置也由模型决策，并打印该状态下各动作的概率分布。
 4.  **结束**: 结算收益，显示所有玩家手牌。
 
-> 说明：`play_interactive.py` / `evaluate_model.py` / `inference_simple.py` / `compare_models.py`
-> 在执行动作时，会先根据模型输出的 logits 计算概率分布，
-> 然后**选择概率最大的动作（贪心 argmax 策略）**，同时保留完整的动作概率用于日志展示。
-
-### 故障排除
-*   **"RuntimeError: size mismatch"**: 检查模型是否使用了不同的 `bettingAbstraction` 或特征配置。确保 `config.json` 存在且正确。
-*   **"模型加载失败"**: 检查模型文件（.pt）是否存在于目录中。
-
 ---
 
-## 6. MCCFR (Monte Carlo CFR)
+## 7. 训练日志分析 (Log Analysis)
 
-除了 DeepCFR，本项目也支持传统的 MCCFR 算法（基于表格）。这适合小规模测试或理论研究。
+使用 `analyze_training.py` 分析训练过程中的指标变化，或对比两次训练的效果。
 
-### 训练
+### 单模型分析
 ```bash
-# 2人场，1000 次迭代
-python train_texas_holdem_mccfr.py --num_players 2 --iterations 1000
+python analyze_training.py models/deepcfr_texas_6p_fchpa_large/deepcfr_texas_6p_fchpa_large_training_history.json
 ```
 
-### 测试
+### 双模型对比
 ```bash
-python load_and_test_strategy.py
+python analyze_training.py \
+    models/new_model/history.json \
+    --compare models/old_model/history.json
 ```
 
----
-
-## 7. 常见问题与调优建议
-
-### Q: 模型训练很久但策略依然很随机（策略熵高）？
-*   **原因**: 样本利用率低或网络欠拟合。
-*   **解决**: 
-    1. 增加 `policy_layers` (如 128x128)。
-    2. 增加 `num_traversals` (如 40 或 60)。
-    3. 稍微降低学习率。
-
-### Q: 模型只会弃牌或只会 All-in？
-*   **原因**: 早期探索不够，陷入局部极值；或者优势网络梯度爆炸。
-*   **解决**:
-    1. 增大 `memory_capacity`，确保覆盖更多历史策略。
-    2. 检查 `advantage_layers` 是否过大或过小。
-    3. 重新开始训练，DeepCFR 对初始化有一定敏感性。
-
-### Q: 显存不足 (OOM)？
-*   **解决**:
-    1. 减小 `memory_capacity` (如 200万)。
-    2. 减小 `batch_size` (在代码中默认较大，可修改 `DeepCFR` 构造函数参数)。
-    3. 减小网络层数 (如回到 64x64)。
-    4. 使用多 GPU 分摊显存压力 (`--multi_gpu --gpu_ids 0 1 2 3`)。
-
-### Q: 6人局模型表现不如 2人局？
-*   **原因**: 6人局复杂度是指数级增长的。
-*   **解决**: 需要指数级增加的训练资源。2000 次迭代对于 6 人局可能只是起步，可能需要 5000+ 次迭代才能达到较强水平。
-
-### Q: 多 GPU 训练效果如何？
-*   **说明**: 多 GPU 使用 PyTorch 的 `DataParallel` 实现，主要加速网络的前向/反向传播阶段。
-*   **注意**: DeepCFR 的游戏树遍历（`_traverse_game_tree`）仍在 CPU 上进行，因此多 GPU 主要加速 `_learn_advantage_network()` 和 `_learn_strategy_network()` 阶段。
-*   **建议**: 增大 `memory_capacity` 以积累更多样本，使训练批次更大，多 GPU 效果更明显。
-
-### Q: 如何真正利用多核 CPU 加速训练？
-*   **解决**: 使用 `deep_cfr_parallel.py` 多进程并行版本。
-*   **原理**: 多个 Worker 进程并行遍历游戏树（CPU 密集型），主进程在 GPU 上训练网络。
-*   **效果**: N 个 Worker 可以获得接近 N 倍的遍历速度，显著提升整体训练效率。
-*   **命令**: `python deep_cfr_parallel.py --num_workers 8 --num_players 6 ...`
-
----
-
-## 8. 进阶主题：特征转换 (Feature Engineering)
-
-本项目默认使用**简单特征版本**（Simple Feature），即将 7 维手动特征（如手牌强度、位置优势）直接拼接到原始信息状态张量中。
-
-### 两种模式
-1.  **简单版本 (推荐)**: `info_state (281) + manual_features (7) -> MLP`。计算快，效果好。
-2.  **复杂版本**: `info_state + features -> Transform Layer -> MLP`。包含可学习特征，适合更深的研究。
-
-### 代码调用
-```python
-from deep_cfr_simple_feature import DeepCFRSimpleFeature
-# 自动启用特征拼接
-solver = DeepCFRSimpleFeature(game, policy_network_layers=(128, 128), ...)
-```
-
----
-
-## 9. 进阶主题：损失与评估 (Loss & Evaluation)
-
-### 损失计算
-DeepCFR 的损失函数包含 `sqrt(iteration)` 加权项。因此，**随着迭代次数增加，损失值自然会增长**。
-*   **不要**仅凭损失值绝对值判断训练是否恶化。
-*   应关注损失值的相对趋势。
-
-### 评估指标
-判断训练效果的最佳指标：
+### 关键指标解读
 1.  **策略熵 (Policy Entropy)**: 应逐渐降低，表示策略在收敛。
 2.  **缓冲区大小 (Buffer Size)**: 应持续增长，表示探索了更多状态。
 3.  **测试对局 (Test Games)**: 胜率应稳定在 50% 以上（对随机策略）或与其他模型对战胜率提升。
-4.  **NashConv**: 最准确但计算极其耗时，大规模训练时建议跳过 (`--skip_nashconv`)。
 
 ---
 

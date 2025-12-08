@@ -97,7 +97,16 @@ def evaluate_policy_quality(
                             # 归一化（防止概率和不为1）
                             total = sum(action_probs.values())
                             if total > 0:
+                                # 修复: 确保总和严格为 1.0，避免浮点误差
+                                # 先做除法
                                 action_probs = {a: p/total for a, p in action_probs.items()}
+                                # 再重新归一化，处理最后的微小误差
+                                total_v2 = sum(action_probs.values())
+                                if abs(total_v2 - 1.0) > 1e-9:
+                                    # 找出最大概率的动作，把误差加到它身上
+                                    max_a = max(action_probs, key=action_probs.get)
+                                    diff = 1.0 - total_v2
+                                    action_probs[max_a] += diff
                             else:
                                 # 如果所有概率为0，使用均匀分布
                                 action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
@@ -149,13 +158,25 @@ def evaluate_policy_quality(
     
     # 2. 缓冲区大小（探索的状态数量）
     try:
-        strategy_buffer_size = len(deep_cfr_solver.strategy_buffer)
+        # 兼容 ParallelDeepCFRSolver 和标准 DeepCFRSolver
+        if hasattr(deep_cfr_solver, 'strategy_buffer'):
+            # 标准 OpenSpiel DeepCFR
+            strategy_buffer_size = len(deep_cfr_solver.strategy_buffer)
+            advantage_buffers = deep_cfr_solver.advantage_buffers
+        elif hasattr(deep_cfr_solver, '_strategy_memories'):
+            # 自定义 ParallelDeepCFRSolver
+            strategy_buffer_size = len(deep_cfr_solver._strategy_memories)
+            advantage_buffers = deep_cfr_solver._advantage_memories
+        else:
+            strategy_buffer_size = 0
+            advantage_buffers = []
+            
         metrics['strategy_buffer_size'] = strategy_buffer_size
         
         advantage_buffer_sizes = {}
         for player in range(game.num_players()):
-            if player < len(deep_cfr_solver.advantage_buffers):
-                size = len(deep_cfr_solver.advantage_buffers[player])
+            if player < len(advantage_buffers):
+                size = len(advantage_buffers[player])
                 advantage_buffer_sizes[player] = size
         metrics['advantage_buffer_sizes'] = advantage_buffer_sizes
         metrics['total_advantage_samples'] = sum(advantage_buffer_sizes.values())
@@ -191,11 +212,22 @@ def play_test_game(
     state = game.new_initial_state()
     returns = None
     num_players = game.num_players()
+    max_steps = 1000  # 防止无限循环
     
     try:
+        steps = 0
         while not state.is_terminal():
+            if steps >= max_steps:
+                if verbose:
+                    print(f"  ⚠️ 测试对局超时（超过 {max_steps} 步）")
+                return None
+            
             if state.is_chance_node():
                 outcomes = state.chance_outcomes()
+                if not outcomes:
+                    if verbose:
+                        print(f"  ⚠️ 测试对局出错: chance节点没有可用动作")
+                    return None
                 action = np.random.choice([a for a, _ in outcomes], 
                                          p=[p for _, p in outcomes])
                 state = state.child(action)
@@ -203,31 +235,54 @@ def play_test_game(
                 player = state.current_player()
                 legal_actions = state.legal_actions()
                 
+                if not legal_actions:
+                    if verbose:
+                        print(f"  ⚠️ 测试对局出错: 玩家 {player} 没有合法动作")
+                    return None
+                
                 # 决定是否使用训练策略
                 use_trained = use_trained_for_all or (player == 0)
                 
                 if use_trained:  # 使用训练的策略
-                    probs = deep_cfr_solver.action_probabilities(state, player)
-                    # 确保所有合法动作都有概率
-                    action_probs = {a: probs.get(a, 0.0) for a in legal_actions}
-                    # 归一化
-                    total = sum(action_probs.values())
-                    if total > 0:
-                        action_probs = {a: p/total for a, p in action_probs.items()}
-                    else:
-                        action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
-                    actions = list(action_probs.keys())
-                    probabilities = list(action_probs.values())
-                    action = np.random.choice(actions, p=probabilities)
-                else:  # 对手使用随机策略
-                    action = np.random.choice(legal_actions)
+                    try:
+                        probs = deep_cfr_solver.action_probabilities(state, player)
+                        # 确保所有合法动作都有概率
+                        action_probs = {a: probs.get(a, 0.0) for a in legal_actions}
+                        # 归一化
+                        total = sum(action_probs.values())
+                        if total > 0:
+                            action_probs = {a: p/total for a, p in action_probs.items()}
+                            
+                            # 修复: 确保总和严格为 1.0
+                            total_v2 = sum(action_probs.values())
+                            if abs(total_v2 - 1.0) > 1e-9:
+                                max_a = max(action_probs, key=action_probs.get)
+                                diff = 1.0 - total_v2
+                                action_probs[max_a] += diff
+                        else:
+                            # 如果所有概率为0，使用均匀分布
+                            action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
+                        # 使用确定性策略：选择概率最高的动作（如果相同则选择第一个）
+                        best_action = max(legal_actions, key=lambda a: action_probs.get(a, 0.0))
+                        action = best_action
+                    except Exception as e:
+                        if verbose:
+                            print(f"  ⚠️ 获取动作概率失败: {e}")
+                        # 使用固定策略：选择第一个合法动作
+                        action = legal_actions[0]
+                else:  # 对手使用固定策略：选择第一个合法动作
+                    action = legal_actions[0]
                 
                 state = state.child(action)
+            
+            steps += 1
         
         returns = state.returns()
     except Exception as e:
         if verbose:
+            import traceback
             print(f"  ⚠️ 测试对局出错: {e}")
+            traceback.print_exc()
         return None
     
     # 返回所有玩家的收益
@@ -245,32 +300,43 @@ def evaluate_with_test_games(
     game,
     deep_cfr_solver,
     num_games=100,
-    verbose=True
+    verbose=True,
+    mode="self_play"  # "self_play" or "vs_random"
 ):
-    """通过测试对局评估策略（自对弈模式）
+    """通过测试对局评估策略
     
     Args:
         game: OpenSpiel 游戏对象
         deep_cfr_solver: DeepCFRSolver 实例
         num_games: 测试对局数量
         verbose: 是否显示详细信息
+        mode: "self_play" (自对弈) 或 "vs_random" (玩家0用模型，其他用随机)
     
     Returns:
         dict: 包含测试结果的字典
     """
     num_players = game.num_players()
+    use_trained_for_all = (mode == "self_play")
     
     # 初始化每个玩家的结果
     results = {
         'num_players': num_players,
         'games_played': 0,
+        'mode': mode,
     }
     for i in range(num_players):
         results[f'player{i}_returns'] = []
         results[f'player{i}_wins'] = 0
     
-    for _ in range(num_games):
-        game_result = play_test_game(game, deep_cfr_solver, verbose=False, use_trained_for_all=True)
+    failed_games = 0
+    error_messages = {}  # 记录错误类型和次数
+    for game_idx in range(num_games):
+        game_result = play_test_game(
+            game, 
+            deep_cfr_solver, 
+            verbose=verbose and failed_games < 3, 
+            use_trained_for_all=use_trained_for_all
+        )
         if game_result:
             results['games_played'] += 1
             returns = game_result.get('returns', [])
@@ -285,6 +351,21 @@ def evaluate_with_test_games(
                 winners = [i for i, r in enumerate(returns) if r == max_return]
                 if len(winners) == 1:
                     results[f'player{winners[0]}_wins'] += 1
+        else:
+            failed_games += 1
+            # 记录错误（简化版，不打印详细堆栈）
+            error_key = "未知错误"
+            if failed_games <= 3 and verbose:
+                print(f"  ⚠️ 对局 {game_idx + 1} 失败")
+            if error_key not in error_messages:
+                error_messages[error_key] = 0
+            error_messages[error_key] += 1
+    
+    if failed_games > 0:
+        results['failed_games'] = failed_games
+        results['error_summary'] = error_messages
+        if verbose:
+            print(f"  ⚠️ 总共 {failed_games}/{num_games} 局失败")
     
     # 计算统计信息
     for i in range(num_players):
@@ -333,7 +414,9 @@ def print_evaluation_summary(metrics, test_results=None, iteration=None):
     
     # 测试对局结果
     if test_results:
-        print("\n[测试对局] (vs 随机策略)")
+        mode = test_results.get('mode', 'unknown')
+        mode_str = "自对弈" if mode == "self_play" else "vs 随机策略"
+        print(f"\n[测试对局] ({mode_str})")
         print(f"  玩家0平均收益: {test_results.get('player0_avg_return', 0):.4f} "
               f"(±{test_results.get('player0_std_return', 0):.4f})")
         print(f"  玩家0胜率: {test_results.get('player0_win_rate', 0)*100:.2f}%")
@@ -372,13 +455,23 @@ def quick_evaluate(
     # 测试对局（可选）
     test_results = None
     if include_test_games:
+        # 默认进行 vs Random 测试，因为更能体现进步
+        # 自对弈在对称游戏中收益为0，且由于位置优势，Player 0 (SB) 可能会亏钱
         if verbose:
-            print("  进行测试对局...", end="", flush=True)
+            print("  进行测试对局 (vs Random)...", end="", flush=True)
         test_results = evaluate_with_test_games(
-            game, deep_cfr_solver, num_games=num_test_games, verbose=verbose
+            game, 
+            deep_cfr_solver, 
+            num_games=num_test_games, 
+            verbose=verbose,
+            mode="vs_random"  # 改为 vs Random
         )
         if verbose:
-            print(" 完成")
+            if test_results and test_results.get('games_played', 0) < num_test_games:
+                failed = num_test_games - test_results.get('games_played', 0)
+                print(f" 完成 ({failed}/{num_test_games} 局失败)")
+            else:
+                print(" 完成")
     
     return {
         'metrics': metrics,

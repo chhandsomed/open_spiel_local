@@ -312,6 +312,25 @@ def worker_process(
                     if stop_event.is_set():
                         break
                     traverse_game_tree(root_node.clone(), player, current_iteration)
+            
+            # 强制刷新缓冲区：无论是否达到 batch_limit，都将手中的样本发送出去
+            # 这防止了在多玩家游戏中，某些玩家的样本积累太慢导致的主进程饥饿
+            for p in list(local_advantage_batches.keys()):
+                batch = local_advantage_batches[p]
+                if batch:
+                    try:
+                        advantage_queues[p].put(batch, timeout=0.01)
+                    except queue.Full:
+                        pass # 队列满就算了
+                # 清空该玩家的缓冲区
+                local_advantage_batches[p] = []
+            
+            if local_strategy_batch:
+                try:
+                    strategy_queue.put(local_strategy_batch, timeout=0.01)
+                    local_strategy_batch = []
+                except queue.Full:
+                    pass
         
     except Exception as e:
         print(f"\n[Worker {worker_id}] 发生异常: {e}")

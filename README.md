@@ -191,7 +191,6 @@ nohup python deep_cfr_parallel.py \
     --resume models/deepcfr_stable_run \
     --memory_capacity 1000000  \
     --num_iterations 20000 \
-    --num_test_games 10 \
     --num_workers 16 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \

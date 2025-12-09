@@ -146,150 +146,173 @@ def worker_process(
         print(f"[Worker {worker_id}] 启动，设备: {device}")
         
         # 创建游戏
-    game = pyspiel.load_game(game_string)
-    root_node = game.new_initial_state()
-    
-    # 创建本地优势网络（用于采样动作）
-    advantage_networks = []
-    for _ in range(num_players):
-        # 从游戏字符串中解析max_stack
-        import re
-        game_string = str(game)
-        match = re.search(r'stack=([\d\s]+)', game_string)
-        max_stack = 2000  # 默认值
-        if match:
-            stack_str = match.group(1).strip()
-            stack_values = stack_str.split()
-            if stack_values:
-                try:
-                    max_stack = int(stack_values[0])
-                except ValueError:
-                    pass
+        game = pyspiel.load_game(game_string)
+        root_node = game.new_initial_state()
         
-        net = SimpleFeatureMLP(
-            embedding_size,
-            list(advantage_network_layers),
-            num_actions,
-            num_players=num_players,
-            max_game_length=game.max_game_length(),
-            max_stack=max_stack
-        )
-        net = net.to(device)
-        net.eval()
-        advantage_networks.append(net)
-    
-    def sample_action_from_advantage(state, player):
-        """使用优势网络采样动作"""
-        info_state = state.information_state_tensor(player)
-        legal_actions = state.legal_actions(player)
-        
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(np.expand_dims(info_state, axis=0)).to(device)
-            raw_advantages = advantage_networks[player](state_tensor)[0].cpu().numpy()
-        
-        advantages = [max(0., advantage) for advantage in raw_advantages]
-        cumulative_regret = sum(advantages[action] for action in legal_actions)
-        
-        matched_regrets = np.array([0.] * num_actions)
-        if cumulative_regret > 0.:
-            for action in legal_actions:
-                matched_regrets[action] = advantages[action] / cumulative_regret
-        else:
-            matched_regrets[max(legal_actions, key=lambda a: raw_advantages[a])] = 1
-        
-        return advantages, matched_regrets
-    
-    def traverse_game_tree(state, player, iteration):
-        """遍历游戏树，收集样本"""
-        if state.is_terminal():
-            return state.returns()[player]
-        
-        if state.is_chance_node():
-            chance_outcome, chance_proba = zip(*state.chance_outcomes())
-            action = np.random.choice(chance_outcome, p=chance_proba)
-            return traverse_game_tree(state.child(action), player, iteration)
-        
-        if state.current_player() == player:
-            expected_payoff = {}
-            sampled_regret = {}
+        # 创建本地优势网络（用于采样动作）
+        advantage_networks = []
+        for _ in range(num_players):
+            # 从游戏字符串中解析max_stack
+            import re
+            game_string = str(game)
+            match = re.search(r'stack=([\d\s]+)', game_string)
+            max_stack = 2000  # 默认值
+            if match:
+                stack_str = match.group(1).strip()
+                stack_values = stack_str.split()
+                if stack_values:
+                    try:
+                        max_stack = int(stack_values[0])
+                    except ValueError:
+                        pass
             
-            _, strategy = sample_action_from_advantage(state, player)
+            net = SimpleFeatureMLP(
+                embedding_size,
+                list(advantage_network_layers),
+                num_actions,
+                num_players=num_players,
+                max_game_length=game.max_game_length(),
+                max_stack=max_stack
+            )
+            net = net.to(device)
+            net.eval()
+            advantage_networks.append(net)
+        
+        def sample_action_from_advantage(state, player):
+            """使用优势网络采样动作"""
+            info_state = state.information_state_tensor(player)
+            legal_actions = state.legal_actions(player)
             
-            for action in state.legal_actions():
-                expected_payoff[action] = traverse_game_tree(
-                    state.child(action), player, iteration
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(np.expand_dims(info_state, axis=0)).to(device)
+                raw_advantages = advantage_networks[player](state_tensor)[0].cpu().numpy()
+            
+            advantages = [max(0., advantage) for advantage in raw_advantages]
+            cumulative_regret = sum(advantages[action] for action in legal_actions)
+            
+            matched_regrets = np.array([0.] * num_actions)
+            if cumulative_regret > 0.:
+                for action in legal_actions:
+                    matched_regrets[action] = advantages[action] / cumulative_regret
+            else:
+                matched_regrets[max(legal_actions, key=lambda a: raw_advantages[a])] = 1
+            
+            return advantages, matched_regrets
+        
+        def traverse_game_tree(state, player, iteration):
+            """遍历游戏树，收集样本"""
+            nonlocal local_strategy_batch
+            if state.is_terminal():
+                return state.returns()[player]
+            
+            if state.is_chance_node():
+                chance_outcome, chance_proba = zip(*state.chance_outcomes())
+                action = np.random.choice(chance_outcome, p=chance_proba)
+                return traverse_game_tree(state.child(action), player, iteration)
+            
+            if state.current_player() == player:
+                expected_payoff = {}
+                sampled_regret = {}
+                
+                _, strategy = sample_action_from_advantage(state, player)
+                
+                for action in state.legal_actions():
+                    expected_payoff[action] = traverse_game_tree(
+                        state.child(action), player, iteration
+                    )
+                
+                cfv = sum(strategy[a] * expected_payoff[a] for a in state.legal_actions())
+                
+                for action in state.legal_actions():
+                    sampled_regret[action] = expected_payoff[action] - cfv
+                
+                sampled_regret_arr = [0] * num_actions
+                for action in sampled_regret:
+                    sampled_regret_arr[action] = sampled_regret[action]
+                
+                # 发送优势样本
+                sample = AdvantageMemory(
+                    state.information_state_tensor(),
+                    iteration,
+                    sampled_regret_arr,
+                    action
                 )
+                
+                # --- 修改开始 ---
+                # 累积到批次
+                if player not in local_advantage_batches:
+                    local_advantage_batches[player] = []
+                local_advantage_batches[player].append(sample)
+                
+                # 如果批次满了，发送
+                if len(local_advantage_batches[player]) >= batch_size_limit:
+                    try:
+                        advantage_queues[player].put(local_advantage_batches[player], timeout=0.01)
+                        local_advantage_batches[player] = []  # 清空批次
+                    except queue.Full:
+                        pass  # 队列满了就丢弃整个批次
+
+
+                return cfv
+            else:
+                other_player = state.current_player()
+                _, strategy = sample_action_from_advantage(state, other_player)
+                
+                probs = np.array(strategy)
+                probs /= probs.sum()
+                sampled_action = np.random.choice(range(num_actions), p=probs)
+                
+                sample = StrategyMemory(
+                    state.information_state_tensor(other_player),
+                    iteration,
+                    strategy
+                )
+                
+                # --- 修改开始 ---
+                # 累积到批次
+                local_strategy_batch.append(sample)
+                
+                # 如果批次满了，发送
+                if len(local_strategy_batch) >= batch_size_limit:
+                    try:
+                        strategy_queue.put(local_strategy_batch, timeout=0.01)
+                        local_strategy_batch = []  # 清空批次
+                    except queue.Full:
+                        pass
+                
+                return traverse_game_tree(state.child(sampled_action), player, iteration)
+        
+        # 主循环
+        last_sync_iteration = 0
+        # 本地批次缓冲区（减少 Queue.put 调用频率）
+        local_advantage_batches = {}  # {player_id: [samples]}
+        local_strategy_batch = []
+        batch_size_limit = 100  # 每积累 100 个样本发送一次
+        
+        while not stop_event.is_set():
+            current_iteration = iteration_counter.value
             
-            cfv = sum(strategy[a] * expected_payoff[a] for a in state.legal_actions())
-            
-            for action in state.legal_actions():
-                sampled_regret[action] = expected_payoff[action] - cfv
-            
-            sampled_regret_arr = [0] * num_actions
-            for action in sampled_regret:
-                sampled_regret_arr[action] = sampled_regret[action]
-            
-            # 发送优势样本
-            sample = AdvantageMemory(
-                state.information_state_tensor(),
-                iteration,
-                sampled_regret_arr,
-                action
-            )
+            # 检查是否需要同步网络参数
             try:
-                advantage_queues[player].put_nowait(sample)
-            except queue.Full:
-                pass  # 队列满了就丢弃
-            
-            return cfv
-        else:
-            other_player = state.current_player()
-            _, strategy = sample_action_from_advantage(state, other_player)
-            
-            probs = np.array(strategy)
-            probs /= probs.sum()
-            sampled_action = np.random.choice(range(num_actions), p=probs)
-            
-            # 发送策略样本
-            sample = StrategyMemory(
-                state.information_state_tensor(other_player),
-                iteration,
-                strategy
-            )
-            try:
-                strategy_queue.put_nowait(sample)
-            except queue.Full:
+                while True:
+                    params = network_params_queue.get_nowait()
+                    for player in range(num_players):
+                        if player in params:
+                            numpy_dict = params[player]
+                            state_dict = {k: torch.from_numpy(v) for k, v in numpy_dict.items()}
+                            advantage_networks[player].load_state_dict(state_dict)
+                            advantage_networks[player] = advantage_networks[player].to(device)
+                    last_sync_iteration = current_iteration
+            except queue.Empty:
                 pass
             
-            return traverse_game_tree(state.child(sampled_action), player, iteration)
-    
-    # 主循环
-    last_sync_iteration = 0
-    
-    while not stop_event.is_set():
-        current_iteration = iteration_counter.value
+            # 遍历游戏树
+            for player in range(num_players):
+                for _ in range(num_traversals_per_batch):
+                    if stop_event.is_set():
+                        break
+                    traverse_game_tree(root_node.clone(), player, current_iteration)
         
-        # 检查是否需要同步网络参数
-        try:
-            while True:
-                params = network_params_queue.get_nowait()
-                for player in range(num_players):
-                    if player in params:
-                        numpy_dict = params[player]
-                        state_dict = {k: torch.from_numpy(v) for k, v in numpy_dict.items()}
-                        advantage_networks[player].load_state_dict(state_dict)
-                        advantage_networks[player] = advantage_networks[player].to(device)
-                last_sync_iteration = current_iteration
-        except queue.Empty:
-            pass
-        
-        # 遍历游戏树
-        for player in range(num_players):
-            for _ in range(num_traversals_per_batch):
-                if stop_event.is_set():
-                    break
-                traverse_game_tree(root_node.clone(), player, current_iteration)
-    
     except Exception as e:
         print(f"\n[Worker {worker_id}] 发生异常: {e}")
         import traceback
@@ -568,30 +591,48 @@ class ParallelDeepCFRSolver:
     
     def _collect_samples(self, timeout=0.1):
         """从队列收集样本"""
-        # 检查 Worker 状态
+        # 检查 Worker 状态 (保持不变)
         dead_workers = []
         for i, p in enumerate(self._workers):
             if not p.is_alive():
                 dead_workers.append(i)
         
         if dead_workers:
-            # 如果有 Worker 死亡，抛出异常，触发主进程清理和退出
             raise RuntimeError(f"检测到 Worker {dead_workers} 已死亡！训练无法继续。")
 
+        # --- 修改开始 ---
         # 收集优势样本
         for player in range(self.num_players):
-            while True:
+            collected_count = 0
+            max_collect = 10000 
+            while collected_count < max_collect:
                 try:
-                    sample = self._advantage_queues[player].get_nowait()
-                    self._advantage_memories[player].add(sample)
+                    batch = self._advantage_queues[player].get_nowait()
+                    # 检查是单个样本还是批次
+                    if isinstance(batch, list):
+                        for sample in batch:
+                            self._advantage_memories[player].add(sample)
+                        collected_count += len(batch)
+                    else:
+                        self._advantage_memories[player].add(batch)
+                        collected_count += 1
                 except queue.Empty:
                     break
         
         # 收集策略样本
-        while True:
+        collected_count = 0
+        max_collect = 10000
+        while collected_count < max_collect:
             try:
-                sample = self._strategy_queue.get_nowait()
-                self._strategy_memories.add(sample)
+                batch = self._strategy_queue.get_nowait()
+                # 检查是单个样本还是批次
+                if isinstance(batch, list):
+                    for sample in batch:
+                        self._strategy_memories.add(sample)
+                    collected_count += len(batch)
+                else:
+                    self._strategy_memories.add(batch)
+                    collected_count += 1
             except queue.Empty:
                 break
     

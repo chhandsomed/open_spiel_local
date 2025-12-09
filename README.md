@@ -188,8 +188,10 @@ nohup python deep_cfr_parallel.py \
 
 ```bash
 nohup python deep_cfr_parallel.py \
-    --resume models/deepcfr_stable_run/checkpoints/iter_7300 \
+    --resume models/deepcfr_stable_run \
+    --memory_capacity 1000000  \
     --num_iterations 20000 \
+    --num_test_games 10 \
     --num_workers 16 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
@@ -342,7 +344,7 @@ python evaluate_all_checkpoints.py \
 ```bash
 # 作为玩家 0 (SB) 与模型对战（交互模式，一局一问是否继续）
 python play_interactive.py \
-    --model_dir models/deepcfr_texas_6p_fchpa_large \
+    --model_dir models/deepcfr_stable_run/checkpoints/iter_10900 \
     --num_players 6 \
     --human_player 0
 

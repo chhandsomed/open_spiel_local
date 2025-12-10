@@ -153,7 +153,7 @@ def strip_ansi(text):
 # 1. 配置与模型加载
 # ==========================================
 
-MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_12500"
+MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_17900"
 DEVICE = "cpu"
 
 def load_model(model_dir, num_players=None, device='cpu'):
@@ -329,6 +329,90 @@ def load_model(model_dir, num_players=None, device='cpu'):
     return game, network, config
 
 
+# ==========================================
+# 1.5 锦标赛状态管理
+# ==========================================
+
+# 全局变量来管理锦标赛状态
+TOURNAMENT_STATE = {
+    "stacks": None,  # [2000, 2000, ...]
+    "dealer_pos": 5, # 默认 Dealer=5 (P0=SB)
+    "blinds": [50, 100],
+    "game_config": None
+}
+
+def load_game_with_config(stacks=None, dealer_pos=5):
+    """根据筹码和 Dealer 位置重新加载游戏"""
+    global GAME, CONFIG
+    
+    if CONFIG is None:
+        # 尝试先加载默认模型配置
+        _, _, CONFIG = load_model(MODEL_DIR, device=DEVICE)
+        
+    num_players = CONFIG.get('num_players', 6)
+    
+    # 默认筹码
+    if stacks is None:
+        stacks = [2000] * num_players
+        
+    # 构造 blind 字符串
+    blinds = [0] * num_players
+    
+    # 计算 firstPlayer (注意: universal_poker 使用 1-based indexing)
+    if num_players == 2:
+        # Heads Up: Dealer is SB.
+        sb_pos = dealer_pos
+        bb_pos = (dealer_pos + 1) % num_players
+        
+        blinds[sb_pos] = 50
+        blinds[bb_pos] = 100
+        
+        # Preflop: SB(D) starts. Postflop: BB starts.
+        # indices + 1
+        first_players = [sb_pos + 1] + [bb_pos + 1] * 3
+        
+    else:
+        # Ring Game (3+ players)
+        # Dealer -> SB -> BB -> UTG
+        sb_pos = (dealer_pos + 1) % num_players
+        bb_pos = (dealer_pos + 2) % num_players
+        utg_pos = (dealer_pos + 3) % num_players
+        
+        blinds[sb_pos] = 50
+        blinds[bb_pos] = 100
+        
+        # Preflop: UTG starts. Postflop: SB starts.
+        first_players = [utg_pos + 1] + [sb_pos + 1] * 3
+    
+    first_player_str = " ".join(map(str, first_players))
+    blind_str = " ".join(map(str, blinds))
+    stack_str = " ".join(map(str, stacks))
+    
+    game_config = {
+        'numPlayers': num_players,
+        'numBoardCards': '0 3 1 1',
+        'numRanks': 13,
+        'numSuits': 4,
+        'firstPlayer': first_player_str,
+        'stack': stack_str,
+        'blind': blind_str,
+        'numHoleCards': 2,
+        'numRounds': 4,
+        'betting': 'nolimit',
+        'maxRaises': '3',
+        'bettingAbstraction': CONFIG.get('betting_abstraction', 'fcpa'),
+    }
+    
+    print(f"Reloading game with Dealer={dealer_pos}, Stacks={stacks}, First={first_player_str}")
+    try:
+        GAME = pyspiel.load_game('universal_poker', game_config)
+    except Exception as e:
+        print(f"CRITICAL: Failed to reload game: {e}")
+        raise e
+        
+    return GAME
+
+
 # 全局加载
 try:
     GAME, MODEL, CONFIG = load_model(MODEL_DIR, device=DEVICE)
@@ -486,7 +570,15 @@ def run_game_step(history, user_action=None, user_seat=0):
     # 我们使用暂存列表来收集同一个阶段发出的牌（例如 Flop 的 3 张）
     pending_deal_cards = []
     
+    steps_count = 0
+    MAX_STEPS = 1000 # 防止死循环
+    
     while not state.is_terminal():
+        steps_count += 1
+        if steps_count > MAX_STEPS:
+            logs.append("⚠️ 错误: 游戏步数过多，强制终止")
+            break
+            
         current_player = state.current_player()
         
         if state.is_chance_node():
@@ -1001,14 +1093,20 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
 
 def start_new_game():
     if GAME is None:
-        return [], None, "<h1>❌ 模型加载失败</h1>", "Check console logs", gr.update(choices=[], value=None, interactive=False), gr.update(interactive=False)
-        
+        return [], None, "<h1>❌ 模型加载失败</h1>", "Check console logs", gr.update(choices=[], value=None, interactive=False), gr.update(interactive=False), gr.update(visible=False)
+    
+    # 重置锦标赛状态
+    num_players = CONFIG['num_players']
+    TOURNAMENT_STATE["stacks"] = [2000] * num_players
+    TOURNAMENT_STATE["dealer_pos"] = 5 # P0=SB
+    
+    # 重新加载游戏
+    load_game_with_config(TOURNAMENT_STATE["stacks"], TOURNAMENT_STATE["dealer_pos"])
+    
     history = []
-    # Reset game
     new_history, state, logs, is_user_turn, folded_players = run_game_step(history, user_action=None, user_seat=0)
     
-    # 初始日志
-    logs.insert(0, "🏁 新游戏开始")
+    logs.insert(0, "🏁 新锦标赛开始 (Stacks: 2000)")
     log_text = "\n".join(logs)
     
     html, _ = format_state_html(state, user_seat=0, logs=logs, folded_players=folded_players)
@@ -1023,18 +1121,88 @@ def start_new_game():
         html,
         log_text,
         gr.update(choices=choices_display, value=None, interactive=is_user_turn),
-        gr.update(interactive=is_user_turn)
+        gr.update(interactive=is_user_turn),
+        gr.update(visible=False) # Next hand button hidden
+    )
+
+def continue_next_hand(history):
+    """继续下一局：更新 Dealer，保留筹码"""
+    if not history:
+        return start_new_game()
+        
+    # Replay game to get returns
+    state = GAME.new_initial_state()
+    try:
+        for action in history:
+            state.apply_action(action)
+    except Exception as e:
+        print(f"Error replaying history: {e}")
+        return start_new_game()
+
+    if not state.is_terminal():
+        print("Warning: Game not terminal when continue_next_hand called.")
+        
+    returns = state.returns()
+    old_stacks = TOURNAMENT_STATE["stacks"]
+    new_stacks = []
+    
+    rebuy_logs = []
+    for i in range(len(old_stacks)):
+        # Update stack
+        s = int(old_stacks[i] + returns[i])
+        # 破产保护/自动重买：如果筹码不足大盲注的一半，则补充
+        if s < 50: 
+            s = 2000
+            p_name = "您" if i == 0 else f"AI {i}"
+            rebuy_logs.append(f"💰 {p_name} 筹码耗尽，自动补充至 2000")
+        new_stacks.append(s)
+    
+    TOURNAMENT_STATE["stacks"] = new_stacks
+    
+    # Rotate Dealer
+    num_players = CONFIG['num_players']
+    TOURNAMENT_STATE["dealer_pos"] = (TOURNAMENT_STATE["dealer_pos"] + 1) % num_players
+    
+    # Reload game
+    load_game_with_config(TOURNAMENT_STATE["stacks"], TOURNAMENT_STATE["dealer_pos"])
+    
+    history = []
+    print("DEBUG: Starting new hand...")
+    new_history, state, current_hand_logs, is_user_turn, folded_players = run_game_step(history, user_action=None, user_seat=0)
+    print("DEBUG: New hand started.")
+    
+    # Add rebuy logs
+    for msg in reversed(rebuy_logs):
+        current_hand_logs.insert(0, msg)
+    
+    current_hand_logs.insert(0, f"🔄 下一局 (Dealer: P{TOURNAMENT_STATE['dealer_pos']})")
+    log_text = "\n".join(current_hand_logs)
+    
+    html, _ = format_state_html(state, user_seat=0, logs=current_hand_logs, folded_players=folded_players)
+    
+    choices_display = []
+    if is_user_turn:
+        legal_actions = state.legal_actions()
+        choices_display = [f"{state.action_to_string(0, a)} (ID: {a})" for a in legal_actions]
+        
+    return (
+        new_history, 
+        html,
+        log_text,
+        gr.update(choices=choices_display, value=None, interactive=is_user_turn),
+        gr.update(interactive=is_user_turn),
+        gr.update(visible=False)
     )
 
 def on_submit_action(history, action_str, current_logs):
     if not action_str:
-        return history, None, current_logs, gr.update(), gr.update()
+        return history, None, current_logs, gr.update(), gr.update(), gr.update()
         
     # Extract ID
     try:
         action_id = int(re.search(r'ID: (\d+)', action_str).group(1))
     except:
-        return history, None, current_logs + "\n❌ 动作解析错误", gr.update(), gr.update()
+        return history, None, current_logs + "\n❌ 动作解析错误", gr.update(), gr.update(), gr.update()
         
     new_history, state, new_logs, is_user_turn, folded_players = run_game_step(history, user_action=action_id, user_seat=0)
     
@@ -1049,13 +1217,19 @@ def on_submit_action(history, action_str, current_logs):
     if is_user_turn:
         legal_actions = state.legal_actions()
         choices_display = [f"{state.action_to_string(0, a)} (ID: {a})" for a in legal_actions]
+    
+    # Check if terminal
+    next_hand_visible = False
+    if state.is_terminal():
+        next_hand_visible = True
         
     return (
         new_history,
         html,
         full_log_text,
         gr.update(choices=choices_display, value=None, interactive=is_user_turn),
-        gr.update(interactive=is_user_turn)
+        gr.update(interactive=is_user_turn),
+        gr.update(visible=next_hand_visible)
     )
 
 # 构建界面
@@ -1073,7 +1247,9 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
             gr.Markdown("### 🎮 操作区")
             action_radio = gr.Radio(label="选择动作", choices=[], interactive=False)
             submit_btn = gr.Button("✅ 确认动作", variant="primary", interactive=False)
-            new_game_btn = gr.Button("🔄 开始新游戏", variant="secondary")
+            
+            next_hand_btn = gr.Button("🔄 继续下一局 (轮转位置)", variant="primary", visible=False)
+            new_game_btn = gr.Button("⚠️ 重置并开始新游戏", variant="secondary")
             
             gr.Markdown("""
             ### ℹ️ 说明
@@ -1084,19 +1260,22 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
     new_game_btn.click(
         fn=start_new_game,
         inputs=[],
-        outputs=[history_state, board_display, game_log, action_radio, submit_btn]
+        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn]
+    )
+    
+    next_hand_btn.click(
+        fn=continue_next_hand,
+        inputs=[history_state],
+        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn]
     )
     
     submit_btn.click(
         fn=on_submit_action,
         inputs=[history_state, action_radio, game_log],
-        outputs=[history_state, board_display, game_log, action_radio, submit_btn]
+        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn]
     )
 
 if __name__ == "__main__":
     print(f"Starting Gradio...")
-    try:
-        demo.launch(server_name="0.0.0.0", server_port=8827)
-    except OSError:
-        print("Port 8827 in use, trying random port...")
-        demo.launch(server_name="0.0.0.0")
+    demo.launch(server_name="0.0.0.0", server_port=8827)
+

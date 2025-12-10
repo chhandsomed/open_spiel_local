@@ -1151,7 +1151,27 @@ def continue_next_hand(history):
         # Update stack
         s = int(old_stacks[i] + returns[i])
         # 破产保护/自动重买：如果筹码不足大盲注的一半，则补充
-        if s < 50: 
+        # 还要确保大于盲注（OpenSpiel 要求盲注 < stack）
+        # 获取当前玩家的盲注大小
+        current_blind = 0
+        
+        # 计算该玩家在这局是否是盲注位
+        # 下一局 dealer = TOURNAMENT_STATE["dealer_pos"] (在循环外面已经 +1 了)
+        # 这里的 new_stacks 是为下一局准备的
+        # 在 6 人局中：
+        # Dealer = D
+        # SB = (D+1)%6 -> blind 50
+        # BB = (D+2)%6 -> blind 100
+        
+        next_dealer = (TOURNAMENT_STATE["dealer_pos"] + 1) % CONFIG['num_players']
+        sb_pos = (next_dealer + 1) % CONFIG['num_players']
+        bb_pos = (next_dealer + 2) % CONFIG['num_players']
+        
+        needed = 0
+        if i == sb_pos: needed = 50
+        elif i == bb_pos: needed = 100
+            
+        if s <= needed or s < 50: 
             s = 2000
             p_name = "您" if i == 0 else f"AI {i}"
             rebuy_logs.append(f"💰 {p_name} 筹码耗尽，自动补充至 2000")

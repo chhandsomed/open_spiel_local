@@ -301,6 +301,67 @@ class SimpleFeatureMLP(nn.Module):
         if len(x.shape) == 1:
             x = x.unsqueeze(0)
         
+        # 自动适配输入维度 (Auto-adapt input dimension)
+        # 当游戏配置(如筹码)变化导致 max_game_length 变化时，输入维度会变
+        # 我们需要将其适配回训练时的维度 raw_input_size
+        current_dim = x.shape[1]
+        if current_dim != self.raw_input_size:
+            # 计算 Header 大小: Player(N) + Private(52) + Public(52)
+            header_size = self.num_players + 52 + 52
+            
+            # 计算 Old 和 New 的 max_game_length (L)
+            # Dim = Header + 2*L + L = Header + 3*L
+            L_old = (self.raw_input_size - header_size) // 3
+            L_new = (current_dim - header_size) // 3
+            
+            # 只有当计算出的 L 也是整数且合理时才进行适配
+            if (self.raw_input_size - header_size) % 3 == 0 and \
+               (current_dim - header_size) % 3 == 0:
+                   
+                # print(f"【维度适配】检测到维度变化: {current_dim} -> {self.raw_input_size} (L: {L_new} -> {L_old})")
+                
+                # 分解 New Tensor
+                header = x[:, :header_size]
+                
+                action_seq_start = header_size
+                action_seq_len_new = 2 * L_new
+                action_seq_new = x[:, action_seq_start : action_seq_start + action_seq_len_new]
+                
+                sizings_start = action_seq_start + action_seq_len_new
+                sizings_len_new = L_new
+                sizings_new = x[:, sizings_start : sizings_start + sizings_len_new]
+                
+                # 构造 Old Parts
+                if L_new > L_old:
+                    # 检查是否有非零数据被截断
+                    truncated_actions = action_seq_new[:, int(2*L_old):]
+                    truncated_sizings = sizings_new[:, int(L_old):]
+                    
+                    if torch.sum(truncated_actions) > 0 or torch.sum(truncated_sizings) > 0:
+                        print(f"【警告】超长对局截断: 当前游戏长度超过模型训练上限 ({int(L_old)}步)。部分动作历史已丢失，可能影响决策。")
+                    
+                    # 截断 (保留前 L_old 个动作，通常是按时间顺序的)
+                    # OpenSpiel 通常按顺序填充，尾部是 Padding (0)
+                    action_seq_old = action_seq_new[:, :int(2*L_old)]
+                    sizings_old = sizings_new[:, :int(L_old)]
+                else:
+                    # 填充 (Padding)
+                    batch_size = x.shape[0]
+                    device = x.device
+                    
+                    # Pad Action Seq
+                    pad_len_action = 2 * (L_old - L_new)
+                    zeros_action = torch.zeros(batch_size, pad_len_action, device=device)
+                    action_seq_old = torch.cat([action_seq_new, zeros_action], dim=1)
+                    
+                    # Pad Sizings
+                    pad_len_sizing = L_old - L_new
+                    zeros_sizing = torch.zeros(batch_size, pad_len_sizing, device=device)
+                    sizings_old = torch.cat([sizings_new, zeros_sizing], dim=1)
+                
+                # 重组
+                x = torch.cat([header, action_seq_old, sizings_old], dim=1)
+
         # 验证输入维度
         assert x.shape[1] == self.raw_input_size, \
             f"输入维度不匹配: 期望 {self.raw_input_size}，实际 {x.shape[1]}"

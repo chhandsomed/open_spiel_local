@@ -456,11 +456,23 @@ def run_game_step(history, user_action=None, user_seat=0):
     curr_board, _ = get_cards_from_state(str(state))
     prev_board_count = len(curr_board)
 
+    # 预先计算位置，用于日志显示
+    num_players = GAME.num_players()
+    player_positions = get_player_positions(state, num_players)
+    
+    def get_player_name_log(p_idx):
+        pos = player_positions[p_idx]
+        pos_str = f" ({pos})" if pos else ""
+        if p_idx == user_seat:
+            return f"👤 您{pos_str}"
+        return f"🤖 AI {p_idx}{pos_str}"
+
     # 2. 应用用户动作
     if user_action is not None:
         if state.current_player() == user_seat:
             act_str = state.action_to_string(user_seat, user_action)
-            logs.append(f"👤 您: {act_str}")
+            p_name = get_player_name_log(user_seat)
+            logs.append(f"{p_name}: {act_str}")
             
             if "Fold" in act_str:
                 folded_players.add(user_seat)
@@ -483,9 +495,28 @@ def run_game_step(history, user_action=None, user_seat=0):
             action = np.random.choice(action_list, p=prob_list)
             
             # 检查这个 chance action 是否是发公共牌
-            # OpenSpiel universal_poker 的 chance action string 通常是 "Deal 2h" 格式
+            # 关键修复：排除 Round 0 的发牌（那是发手牌）
+            # 我们通过尝试解析 state string 里的 Round 信息，或者简单地看 state_str
+            # 更可靠的是：OpenSpiel universal_poker 的 state string 包含 "Round: N"
+            # 或者我们可以依赖 prev_board_count？不，发牌前 count 也是 0。
+            
+            # 使用简单的启发式：
+            # 如果是 Round 0，那么 Deal 动作通常是发私有牌。
+            # 如果是 Round > 0，Deal 动作是发公共牌。
+            # 获取当前 Round
+            current_round = 0
+            try:
+                # 尝试从 state string 解析 Round
+                # 格式: Round: 0
+                state_str = str(state)
+                round_match = re.search(r'Round: (\d+)', state_str)
+                if round_match:
+                    current_round = int(round_match.group(1))
+            except:
+                pass
+
             action_str = state.action_to_string(current_player, action)
-            if "Deal" in action_str:
+            if "Deal" in action_str and current_round > 0:
                 # 提取牌
                 # 格式通常是 "Deal 2h"
                 card_match = re.search(r'Deal\s+([2-9TJQKA][shdc])', action_str)
@@ -496,30 +527,19 @@ def run_game_step(history, user_action=None, user_seat=0):
             state.apply_action(action)
             history.append(action)
             
-            # 检查发牌是否结束（进入下一阶段或下一个动作不是 Deal）
-            # 最简单的方法是检查 pending_deal_cards 的数量是否达到了阶段要求
-            # 或者看 state 是否不再是 chance node (这可能不准确，因为可能连续 deal)
-            # 我们在下一次循环开头检查
-            
         elif current_player == user_seat:
              # 在返回给用户前，把积攒的 pending cards 输出日志
             if pending_deal_cards:
                 formatted_cards = [format_card_log(c) for c in pending_deal_cards]
                 cards_str = " ".join(formatted_cards)
                 
-                # 确定阶段
-                # 此时 state 已经是发完牌后的状态
-                # 总牌数
                 total_board_count = prev_board_count + len(pending_deal_cards)
-                # 这只是近似，因为 pending 可能跨越多个阶段？通常不会。
-                # Flop=3, Turn=4, River=5
                 stage = "Flop"
                 if total_board_count == 4: stage = "Turn"
                 elif total_board_count == 5: stage = "River"
                 
                 logs.append(f"🎴 发牌 ({stage}): {cards_str}")
                 
-                # 更新 prev_board_count 并清空 pending
                 prev_board_count = total_board_count
                 pending_deal_cards = []
 
@@ -543,7 +563,8 @@ def run_game_step(history, user_action=None, user_seat=0):
             
             action = get_ai_action(state, MODEL)
             act_str = state.action_to_string(current_player, action)
-            logs.append(f"🤖 AI {current_player}: {act_str}")
+            p_name = get_player_name_log(current_player)
+            logs.append(f"{p_name}: {act_str}")
             
             if "Fold" in act_str:
                 folded_players.add(current_player)
@@ -641,56 +662,118 @@ def format_card_html(card_str):
 
 def get_player_positions(state, num_players):
     """推断玩家位置 (BTN, SB, BB, etc.)"""
-    # 简单的基于 Round 0 的盲注动作推断
-    # 找到第一个 SmallBlind 动作的玩家作为 SB
-    # 前一个就是 BTN
     positions = [""] * num_players
     
+    # 尝试 1: 解析 Spent 信息来确定 SB/BB
+    # Spent: [P0: 50  P1: 100  P2: 0 ... ]
     try:
-        # 去除 ANSI
         state_str = strip_ansi(str(state))
         
-        # 尝试从 state_str 的 action log 中找 (如果有的话)
-        # 否则，默认配置: 
-        # 6人局: P0=SB? 不一定。
-        # 让我们尝试找一下
-        
-        # 如果找不到，就按默认顺序给个大概位置，或者不显示
-        # 假设 Dealer 是随机的。
+        # 匹配 Spent 行
+        spent_match = re.search(r'Spent: \[([\s\S]*?)\]', state_str)
+        if spent_match:
+            spent_content = spent_match.group(1)
+            # 解析每个玩家的花费
+            # 格式: P0: 50  P1: 100 ...
+            spents = {}
+            parts = spent_content.split()
+            current_p = -1
+            for part in parts:
+                if part.startswith('P') and part.endswith(':'):
+                    current_p = int(part[1:-1])
+                elif current_p != -1:
+                    try:
+                        val = int(part)
+                        spents[current_p] = val
+                        current_p = -1
+                    except:
+                        pass
+            
+            # 假设: 最小的非零花费是 SB，且通常是 50 或 100 (如果是 HU)
+            # 或者我们直接找 50 和 100 (基于默认配置)
+            # 但如果游戏深入了，spent 会增加。
+            # 只有在 Round 0 且刚开始时比较准。
+            # 更好的方法是找 blind 配置。默认是 50/100。
+            
+            sb_player = -1
+            bb_player = -1
+            
+            # 策略：如果处于 Round 0，且花费恰好是盲注
+            # 但我们可能处于游戏后期。
+            # 不过，位置是固定的。我们可以回溯到初始状态？
+            # 或者我们假设 P0, P1, P2... 的相对位置是不变的，只需找到谁是 Dealer/SB。
+            
+            # 让我们尝试找 "SmallBlind" 动作在历史记录里？
+            # 遍历历史记录最靠谱。
+            history = state.history()
+            temp_state = GAME.new_initial_state()
+            for action in history:
+                if not temp_state.is_chance_node():
+                    player = temp_state.current_player()
+                    action_str = temp_state.action_to_string(player, action)
+                    
+                    # OpenSpiel 的盲注通常是自动动作吗？
+                    # 在 universal_poker 中，blind 是强制动作。
+                    # 如果我们能匹配到 "Small Blind" 或类似的字符串
+                    if "Small" in action_str and "Blind" in action_str: # 并不一定有这个 string
+                        pass
+                
+                temp_state.apply_action(action)
+                
+            # 回到 Spent 方法。
+            # 在 6人局默认配置中，通常是:
+            # P0=SB, P1=BB (如果 dealer 是 5)
+            # 或者 P1=SB, P2=BB...
+            
+            # 让我们通过 blind 金额来猜
+            # 假设盲注是 50 和 100
+            for p, amt in spents.items():
+                if amt == 50: sb_player = p
+                if amt == 100: bb_player = p
+                
+            if sb_player != -1:
+                # 确定了 SB，推导其他
+                # 6-max order: SB -> BB -> UTG -> MP -> CO -> BTN
+                # offset 0 = SB
+                pos_names = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
+                if num_players == 2: pos_names = ["SB", "BB"] # HU: Dealer is SB
+                
+                for i in range(num_players):
+                    # distance from SB
+                    dist = (i - sb_player + num_players) % num_players
+                    if dist < len(pos_names):
+                        positions[i] = pos_names[dist]
+                return positions
+
+    except Exception as e:
+        print(f"Error guessing positions: {e}")
         pass
+        
+    # Fallback: 尝试解析 Dealer
+    try:
+        state_str = strip_ansi(str(state))
+        dealer_match = re.search(r'Dealer:?\s*(\d+)', state_str)
+        if dealer_match:
+            dealer_idx = int(dealer_match.group(1))
+            # In 6-max: Dealer=BTN. Next is SB.
+            # 0=BTN, 1=SB, 2=BB...
+            pos_names_from_btn = ["BTN", "SB", "BB", "UTG", "MP", "CO"]
+            if num_players == 2: pos_names_from_btn = ["SB", "BB"] # HU: Dealer is SB/BTN, other is BB
+            
+            for i in range(num_players):
+                offset = (i - dealer_idx + num_players) % num_players
+                if offset < len(pos_names_from_btn):
+                    positions[i] = pos_names_from_btn[offset]
+            return positions
     except:
         pass
-        
-    # 定义标准位置名称 (6-max)
-    pos_names_6 = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
-    # pos_names_2 = ["SB", "BB"] # Heads up: SB is BTN
     
-    # 我们尝试解析 Dealer (d=...)
-    # universal_poker 的 state string 包含 "Dealer: 0" 吗？
-    # 如果有：
-    dealer_match = re.search(r'Dealer:?\s*(\d+)', state_str)
-    if dealer_match:
-        dealer_idx = int(dealer_match.group(1))
-        # Assign positions relative to dealer
-        # In 6-max: Dealer=BTN. Next is SB.
-        for i in range(num_players):
-            offset = (i - dealer_idx) % num_players
-            # offset 0 = BTN
-            # offset 1 = SB
-            # offset 2 = BB
-            # ...
-            if num_players == 6:
-                name_map = {0: "BTN", 1: "SB", 2: "BB", 3: "UTG", 4: "MP", 5: "CO"}
-                positions[i] = name_map.get(offset, "")
-            elif num_players == 2:
-                # HU: Dealer is SB, Other is BB
-                name_map = {0: "SB/BTN", 1: "BB"}
-                positions[i] = name_map.get(offset, "")
-            else:
-                if offset == 0: positions[i] = "BTN"
-                elif offset == 1: positions[i] = "SB"
-                elif offset == 2: positions[i] = "BB"
-                
+    # 最后兜底：基于之前的日志，P0=SB, P1=BB
+    # 假设这是固定的（OpenSpiel 默认配置通常固定 P0 开始）
+    if num_players == 6:
+        # Default assumption: P0 is SB
+        return ["SB", "BB", "UTG", "MP", "CO", "BTN"]
+    
     return positions
 
 def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
@@ -699,7 +782,7 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
     
     # 使用正则表达式解析状态字符串
     state_str = strip_ansi(str(state))
-    print(f"DEBUG State String:\n{state_str}\n-------------------")
+    # print(f"DEBUG State String:\n{state_str}\n-------------------")
     info_str = ""
     try:
         info_str = state.information_state_string(user_seat) 
@@ -770,7 +853,25 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         
         pos_name = positions[p]
         if pos_name:
-            pos_label = f"<span style='background:#ccc; color:white; border-radius:3px; padding:0 2px; font-size:0.7em; margin-left:5px;'>{pos_name}</span>"
+            # 增强位置显示样式
+            # 默认样式
+            pos_bg = "#8c8c8c" # 深灰
+            pos_color = "white"
+            
+            if "BTN" in pos_name:
+                pos_bg = "#ffec3d" # 亮黄
+                pos_color = "black" # 黑字
+            elif "SB" in pos_name:
+                pos_bg = "#69c0ff" # 浅蓝
+                pos_color = "white"
+            elif "BB" in pos_name:
+                pos_bg = "#1890ff" # 深蓝
+                pos_color = "white"
+            elif "UTG" in pos_name:
+                pos_bg = "#d9d9d9" # 浅灰
+                pos_color = "black"
+                
+            pos_label = f"<span style='background:{pos_bg}; color:{pos_color}; border-radius:4px; padding:2px 6px; font-size:0.8em; font-weight:bold; margin-left:6px; box-shadow: 0 1px 2px rgba(0,0,0,0.1);'>{pos_name}</span>"
         else:
             pos_label = ""
         

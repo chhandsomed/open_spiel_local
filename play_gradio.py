@@ -153,7 +153,7 @@ def strip_ansi(text):
 # 1. 配置与模型加载
 # ==========================================
 
-MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_17900"
+MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_19200"
 DEVICE = "cpu"
 
 def load_model(model_dir, num_players=None, device='cpu'):
@@ -555,6 +555,10 @@ def run_game_step(history, user_action=None, user_seat=0):
     if user_action is not None:
         if state.current_player() == user_seat:
             act_str = state.action_to_string(user_seat, user_action)
+            # 移除 "Player X" 前缀和 "move="
+            act_str = re.sub(r'Player \d+', '', act_str).strip()
+            act_str = act_str.replace("move=", "").strip()
+            
             p_name = get_player_name_log(user_seat)
             logs.append(f"{p_name}: {act_str}")
             
@@ -635,7 +639,32 @@ def run_game_step(history, user_action=None, user_seat=0):
                 prev_board_count = total_board_count
                 pending_deal_cards = []
 
-            return history, state, logs, True, folded_players
+            # 在返回前计算当前每个动作的概率，以便在UI显示
+            action_probs = {}
+            try:
+                # 使用全局模型计算
+                # 这里有点 hack，因为 MODEL 是全局变量
+                # 但为了正确性，我们应该在这里算
+                if 'MODEL' in globals() and MODEL is not None:
+                    legal_actions = state.legal_actions()
+                    player = state.current_player()
+                    
+                    if hasattr(MODEL, 'action_probabilities'):
+                        probs_dict = MODEL.action_probabilities(state, player)
+                        action_probs = probs_dict
+                    else:
+                        # Standard Network
+                        info_state = torch.FloatTensor(state.information_state_tensor(player)).unsqueeze(0).to(DEVICE)
+                        with torch.no_grad():
+                            logits = MODEL(info_state)
+                            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                        
+                        for a in legal_actions:
+                            action_probs[a] = float(probs[a])
+            except Exception as ex:
+                print(f"Error calculating probs: {ex}")
+
+            return history, state, logs, True, folded_players, action_probs
             
         else:
             # AI 回合
@@ -655,6 +684,10 @@ def run_game_step(history, user_action=None, user_seat=0):
             
             action = get_ai_action(state, MODEL)
             act_str = state.action_to_string(current_player, action)
+            # 移除 "Player X" 前缀和 "move="
+            act_str = re.sub(r'Player \d+', '', act_str).strip()
+            act_str = act_str.replace("move=", "").strip()
+            
             p_name = get_player_name_log(current_player)
             logs.append(f"{p_name}: {act_str}")
             
@@ -677,7 +710,7 @@ def run_game_step(history, user_action=None, user_seat=0):
         
         logs.append(f"🎴 发牌 ({stage}): {cards_str}")
 
-    return history, state, logs, False, folded_players
+    return history, state, logs, False, folded_players, {}
 
 # ==========================================
 # 3. 界面渲染
@@ -867,6 +900,82 @@ def get_player_positions(state, num_players):
         return ["SB", "BB", "UTG", "MP", "CO", "BTN"]
     
     return positions
+
+# ==========================================
+# 3.5 辅助函数：动作选项格式化
+# ==========================================
+
+def get_action_choices_text(state, action_probs):
+    """生成带概率和ID的动作选项文本列表，并返回高亮CSS"""
+    legal_actions = state.legal_actions()
+    total_prob = sum(action_probs.values())
+    choices_display = []
+    
+    best_idx = -1
+    max_prob = -1
+    
+    for i, a in enumerate(legal_actions):
+        prob_val = action_probs.get(a, 0.0)
+        if prob_val > max_prob:
+            max_prob = prob_val
+            best_idx = i
+            
+        # 获取动作名称，去除可能的 "Player 0" 前缀和 "move=" 标记
+        act_str = state.action_to_string(0, a)
+        
+        # 使用正则进行更彻底的清理
+        act_str = re.sub(r'player\s*=?\s*\d+', '', act_str, flags=re.IGNORECASE)
+        act_str = re.sub(r'move\s*=?\s*', '', act_str, flags=re.IGNORECASE)
+        act_str = act_str.strip()
+        
+        # 翻译常用动作
+        if act_str == "Fold": act_str = "❌ 弃牌 (Fold)"
+        elif act_str == "Call": act_str = "📥 跟注 (Call)"
+        elif act_str == "Check": act_str = "👀 过牌 (Check)"
+        elif "HalfPot" in act_str: act_str = "🌓 半池 Raise (Half-Pot)"
+        elif "Raise" in act_str: act_str = f"💰 加注 (Raise) {act_str.replace('Raise', '').strip()}"
+        elif "Bet" in act_str: act_str = f"🌕 全池 Raise (Bet) {act_str.replace('Bet', '').strip()}"
+        elif act_str == "AllIn": act_str = "🚀 全压 (All-In)"
+        
+        prob_text = ""
+        if total_prob > 0:
+            prob_pct = (prob_val / total_prob) * 100
+            prob_text = f"   [🤖 推荐度: {prob_pct:.1f}%]"
+            
+        display_str = f"{act_str}{prob_text}   (ID: {a})"
+        choices_display.append(display_str)
+        
+    # 生成动态 CSS 高亮推荐选项
+    css_highlight = ""
+    if best_idx >= 0:
+        # nth-of-type is 1-based
+        # 改为紫色系高亮
+        # 为了兼容不同的 Gradio 版本结构，同时尝试带 .wrap 和不带 .wrap 的选择器
+        css_highlight = f"""
+        <style>
+        .custom-radio-group .wrap label:nth-of-type({best_idx+1}),
+        .custom-radio-group label:nth-of-type({best_idx+1}) {{
+            background-color: #f9f0ff !important;
+            background: #f9f0ff !important;
+            border: 2px solid #722ed1 !important;
+            box-shadow: 0 0 10px rgba(114, 46, 209, 0.4) !important;
+        }}
+        .custom-radio-group .wrap label:nth-of-type({best_idx+1}) span,
+        .custom-radio-group label:nth-of-type({best_idx+1}) span {{
+            color: #391085 !important;
+            font-weight: 700 !important;
+        }}
+        .custom-radio-group .wrap label:nth-of-type({best_idx+1})::after,
+        .custom-radio-group label:nth-of-type({best_idx+1})::after {{
+            content: " 👈 推荐";
+            color: #722ed1;
+            font-weight: bold;
+            margin-left: 10px;
+        }}
+        </style>
+        """
+        
+    return choices_display, css_highlight
 
 def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
     if state is None:
@@ -1104,7 +1213,7 @@ def start_new_game():
     load_game_with_config(TOURNAMENT_STATE["stacks"], TOURNAMENT_STATE["dealer_pos"])
     
     history = []
-    new_history, state, logs, is_user_turn, folded_players = run_game_step(history, user_action=None, user_seat=0)
+    new_history, state, logs, is_user_turn, folded_players, action_probs = run_game_step(history, user_action=None, user_seat=0)
     
     logs.insert(0, "🏁 新锦标赛开始 (Stacks: 2000)")
     log_text = "\n".join(logs)
@@ -1112,9 +1221,9 @@ def start_new_game():
     html, _ = format_state_html(state, user_seat=0, logs=logs, folded_players=folded_players)
     
     choices_display = []
+    style_update = ""
     if is_user_turn:
-        legal_actions = state.legal_actions()
-        choices_display = [f"{state.action_to_string(0, a)} (ID: {a})" for a in legal_actions]
+        choices_display, style_update = get_action_choices_text(state, action_probs)
         
     return (
         new_history, 
@@ -1122,13 +1231,14 @@ def start_new_game():
         log_text,
         gr.update(choices=choices_display, value=None, interactive=is_user_turn),
         gr.update(interactive=is_user_turn),
-        gr.update(visible=False) # Next hand button hidden
+        gr.update(visible=False), # Next hand button hidden
+        style_update # Style Injector
     )
 
 def continue_next_hand(history):
     """继续下一局：更新 Dealer，保留筹码"""
     if not history:
-        return start_new_game()
+        return     start_new_game()
         
     # Replay game to get returns
     state = GAME.new_initial_state()
@@ -1188,7 +1298,7 @@ def continue_next_hand(history):
     
     history = []
     print("DEBUG: Starting new hand...")
-    new_history, state, current_hand_logs, is_user_turn, folded_players = run_game_step(history, user_action=None, user_seat=0)
+    new_history, state, current_hand_logs, is_user_turn, folded_players, action_probs = run_game_step(history, user_action=None, user_seat=0)
     print("DEBUG: New hand started.")
     
     # Add rebuy logs
@@ -1201,9 +1311,9 @@ def continue_next_hand(history):
     html, _ = format_state_html(state, user_seat=0, logs=current_hand_logs, folded_players=folded_players)
     
     choices_display = []
+    style_update = ""
     if is_user_turn:
-        legal_actions = state.legal_actions()
-        choices_display = [f"{state.action_to_string(0, a)} (ID: {a})" for a in legal_actions]
+        choices_display, style_update = get_action_choices_text(state, action_probs)
         
     return (
         new_history, 
@@ -1211,20 +1321,21 @@ def continue_next_hand(history):
         log_text,
         gr.update(choices=choices_display, value=None, interactive=is_user_turn),
         gr.update(interactive=is_user_turn),
-        gr.update(visible=False)
+        gr.update(visible=False),
+        style_update # Style Injector
     )
 
 def on_submit_action(history, action_str, current_logs):
     if not action_str:
-        return history, None, current_logs, gr.update(), gr.update(), gr.update()
+        return history, None, current_logs, gr.update(), gr.update(), gr.update(), ""
         
     # Extract ID
     try:
         action_id = int(re.search(r'ID: (\d+)', action_str).group(1))
     except:
-        return history, None, current_logs + "\n❌ 动作解析错误", gr.update(), gr.update(), gr.update()
+        return history, None, current_logs + "\n❌ 动作解析错误", gr.update(), gr.update(), gr.update(), ""
         
-    new_history, state, new_logs, is_user_turn, folded_players = run_game_step(history, user_action=action_id, user_seat=0)
+    new_history, state, new_logs, is_user_turn, folded_players, action_probs = run_game_step(history, user_action=action_id, user_seat=0)
     
     if current_logs:
         full_log_text = current_logs + "\n" + "\n".join(new_logs)
@@ -1234,9 +1345,9 @@ def on_submit_action(history, action_str, current_logs):
     html, _ = format_state_html(state, user_seat=0, folded_players=folded_players)
     
     choices_display = []
+    style_update = ""
     if is_user_turn:
-        legal_actions = state.legal_actions()
-        choices_display = [f"{state.action_to_string(0, a)} (ID: {a})" for a in legal_actions]
+        choices_display, style_update = get_action_choices_text(state, action_probs)
     
     # Check if terminal
     next_hand_visible = False
@@ -1249,11 +1360,52 @@ def on_submit_action(history, action_str, current_logs):
         full_log_text,
         gr.update(choices=choices_display, value=None, interactive=is_user_turn),
         gr.update(interactive=is_user_turn),
-        gr.update(visible=next_hand_visible)
+        gr.update(visible=next_hand_visible),
+        style_update # Style Injector
     )
 
 # 构建界面
+css_style = """
+.custom-radio-group .wrap {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 12px !important;
+}
+.custom-radio-group .wrap label {
+    background: linear-gradient(145deg, #ffffff, #f0f2f5) !important;
+    border: 1px solid #e0e0e0 !important;
+    border-radius: 12px !important;
+    padding: 16px 20px !important;
+    cursor: pointer !important;
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+    font-weight: 600 !important;
+    font-size: 1.1em !important;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03) !important;
+    display: flex !important;
+    align-items: center !important;
+    color: #333 !important;
+}
+.custom-radio-group .wrap label:hover {
+    background: linear-gradient(145deg, #e6f7ff, #ffffff) !important;
+    border-color: #40a9ff !important;
+    transform: translateY(-2px) !important;
+    box-shadow: 0 10px 15px -3px rgba(24, 144, 255, 0.2), 0 4px 6px -2px rgba(24, 144, 255, 0.1) !important;
+}
+.custom-radio-group .wrap label.selected {
+    background: linear-gradient(135deg, #1890ff 0%, #096dd9 100%) !important;
+    color: white !important;
+    border-color: #096dd9 !important;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.2) !important;
+}
+"""
+
+
 with gr.Blocks(title="Texas Hold'em vs AI") as demo:
+    # 使用 gr.HTML 注入 CSS
+    gr.HTML(f"<style>{css_style}</style>")
+    # style_injector 必须是 visible=True (默认)，否则内部的 <style> 标签可能不会被渲染到 DOM 中
+    style_injector = gr.HTML()
+
     gr.Markdown("# 🃏 德州扑克人机对战 (6人局)")
     
     history_state = gr.State([])
@@ -1265,8 +1417,17 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
             
         with gr.Column(scale=1):
             gr.Markdown("### 🎮 操作区")
-            action_radio = gr.Radio(label="选择动作", choices=[], interactive=False)
-            submit_btn = gr.Button("✅ 确认动作", variant="primary", interactive=False)
+            
+            # 使用 Radio 的 input/change 事件自动触发 submit
+            action_radio = gr.Radio(
+                label="您的回合 (点击即执行)", 
+                choices=[], 
+                interactive=False,
+                elem_classes="custom-radio-group" # 需要配合 css 参数
+            )
+            
+            # 隐藏确认按钮
+            submit_btn = gr.Button("✅ 确认动作", variant="primary", interactive=False, visible=False)
             
             next_hand_btn = gr.Button("🔄 继续下一局 (轮转位置)", variant="primary", visible=False)
             new_game_btn = gr.Button("⚠️ 重置并开始新游戏", variant="secondary")
@@ -1277,25 +1438,30 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
             - 5 个 AI 对手 (DeepCFR)
             """)
 
+    # 绑定 Radio 点击事件直接提交
+    action_radio.input(
+        fn=on_submit_action,
+        inputs=[history_state, action_radio, game_log],
+        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn, style_injector]
+    )
+
     new_game_btn.click(
         fn=start_new_game,
         inputs=[],
-        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn]
+        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn, style_injector]
     )
     
     next_hand_btn.click(
         fn=continue_next_hand,
         inputs=[history_state],
-        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn]
+        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn, style_injector]
     )
-    
-    submit_btn.click(
-        fn=on_submit_action,
-        inputs=[history_state, action_radio, game_log],
-        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn]
-    )
+
+    # submit_btn.click (removed)
+
 
 if __name__ == "__main__":
     print(f"Starting Gradio...")
+    demo.queue(max_size=32)
     demo.launch(server_name="0.0.0.0", server_port=8827)
 

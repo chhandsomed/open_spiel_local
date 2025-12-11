@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import glob
+import math
 from collections import Counter
 
 # 添加当前目录到 path 以导入本地模块
@@ -1004,9 +1005,134 @@ def get_action_choices_text(state, action_probs):
         
     return choices_display, css_highlight
 
+def get_stacks_from_state(state):
+    """从状态字符串解析玩家筹码"""
+    try:
+        state_str = strip_ansi(str(state))
+        # Money: 1950 2000 ...
+        money_match = re.search(r'Money:\s*([\d\s]+)', state_str)
+        if money_match:
+            return [int(x) for x in money_match.group(1).split()]
+    except:
+        pass
+    return []
+
+def get_player_contributions(state):
+    """从 state.to_struct() 获取玩家投入 (player_contributions)"""
+    try:
+        state_struct = state.to_struct()
+        contributions = getattr(state_struct, 'player_contributions', [])
+        if contributions:
+            return list(contributions)
+    except:
+        pass
+    return []
+
+def get_last_actions_in_round(state):
+    """
+    Replay history to get the last action for each player in the current street.
+    Uses player_contributions to calculate accurate bet amounts.
+    """
+    last_actions = {}
+    temp_state = GAME.new_initial_state()
+    history = state.history()
+    
+    # Track previous contributions for each player
+    prev_contributions = get_player_contributions(temp_state)
+    if not prev_contributions:
+        prev_contributions = [0] * GAME.num_players()
+    
+    # Track board length to detect street changes
+    board_len = 0
+    
+    for action in history:
+        if temp_state.is_chance_node():
+            temp_state.apply_action(action)
+            
+            # Update contributions baseline
+            prev_contributions = get_player_contributions(temp_state)
+            if not prev_contributions:
+                prev_contributions = [0] * GAME.num_players()
+            
+            # Check board length
+            current_board, _ = get_cards_from_state(str(temp_state))
+            new_len = len(current_board)
+            if new_len > board_len:
+                # Street changed (Flop/Turn/River)
+                # Only keep Fold actions, clear others
+                folds = {p: a for p, a in last_actions.items() if "Fold" in a}
+                last_actions = folds
+                board_len = new_len
+        else:
+            player = temp_state.current_player()
+            action_str = temp_state.action_to_string(player, action)
+            
+            # Get contribution before action
+            prev_contrib = prev_contributions[player] if player < len(prev_contributions) else 0
+            
+            temp_state.apply_action(action)
+            
+            # Get contribution after action
+            curr_contributions = get_player_contributions(temp_state)
+            if not curr_contributions:
+                curr_contributions = [0] * GAME.num_players()
+            curr_contrib = curr_contributions[player] if player < len(curr_contributions) else 0
+            
+            # Calculate amount: how much more this player put in
+            diff = curr_contrib - prev_contrib
+            
+            # Update prev_contributions for next iteration
+            prev_contributions = curr_contributions
+            
+            # Clean action string
+            clean_act = re.sub(r'Player \d+', '', action_str).strip()
+            clean_act = clean_act.replace("move=", "").strip()
+            
+            # Format Logic - Match exact action names from universal_poker
+            # 
+            # 动作定义说明：
+            # - HalfPot: 加注到 0.5 * (当前底池 + 需要跟注的金额) + 当前最大投入
+            # - Bet: 加注到 1.0 * (当前底池 + 需要跟注的金额) + 当前最大投入 (全池下注)
+            # - AllIn: 全押所有筹码
+            # - Call: 跟注到当前最大投入
+            # - Check: 过牌（当前最大投入为0时）
+            # - Fold: 弃牌
+            #
+            # diff 是本次行动实际投入的金额（curr_contrib - prev_contrib）
+            
+            if "Fold" in clean_act:
+                display_act = "Fold"
+            elif "Check" in clean_act or (clean_act == "Call" and diff == 0):
+                display_act = "Check"
+            elif clean_act == "Call":
+                display_act = f"Call {diff}" if diff > 0 else "Check"
+            elif "HalfPot" in clean_act:
+                # HalfPot: 半池加注，显示实际投入金额
+                display_act = f"HalfPot {diff}" if diff > 0 else "HalfPot"
+            elif clean_act == "Bet":
+                # Bet: 全池加注，显示实际投入金额
+                display_act = f"Bet {diff}" if diff > 0 else "Bet"
+            elif "AllIn" in clean_act:
+                # AllIn: 全押，显示实际投入金额
+                display_act = f"All-In {diff}" if diff > 0 else "All-In"
+            else:
+                # Fallback: use original string with amount if diff > 0
+                if diff > 0:
+                    display_act = f"{clean_act} {diff}"
+                else:
+                    display_act = clean_act
+            
+            # Always update last action for this player
+            last_actions[player] = display_act
+            
+    return last_actions
+
 def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
     if state is None:
         return "<h3>点击 '开始新游戏'</h3>", ""
+    
+    # Get last actions for display
+    last_actions = get_last_actions_in_round(state)
     
     # 使用正则表达式解析状态字符串
     state_str = strip_ansi(str(state))
@@ -1020,10 +1146,19 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
     full_info = state_str + "\n" + info_str
 
     # 1. 解析底池 (Pot)
+    # 优先使用 state.to_struct().pot_size，更准确
     pot = 0
-    pot_match = re.search(r'Pot: (\d+)', full_info)
-    if pot_match:
-        pot = pot_match.group(1)
+    try:
+        state_struct = state.to_struct()
+        pot = getattr(state_struct, 'pot_size', 0)
+    except:
+        pass
+    
+    # Fallback: 从状态字符串解析
+    if pot == 0:
+        pot_match = re.search(r'Pot: (\d+)', full_info)
+        if pot_match:
+            pot = int(pot_match.group(1))
         
     # 2. 解析公共牌
     board_html = ""
@@ -1044,20 +1179,27 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
                 print(f"Error formatting card {c}: {e}")
                 board_html += f"[{c}?]"
     else:
-        board_html = "<span style='color: gray'>(Pre-flop)</span>"
+        board_html = "<span style='color: #8c8c8c; font-size: 0.9em;'>(Pre-flop)</span>"
 
+    # ============================
+    # 绘制圆形桌子 (Circular Layout)
+    # ============================
+    W, H = 800, 520
+    CX, CY = W/2, H/2
+    RX, RY = 320, 200 # Table Radius
+    
     html = f"""
-    <div style='font-family: Arial; padding: 20px; background-color: #f0f2f5; border-radius: 10px;'>
-        <div style='background: #e6f7ff; padding: 10px; border-radius: 8px; margin-bottom: 20px; text-align: center; border: 1px solid #91d5ff;'>
-            <h2 style='margin:0; color: #0050b3;'>💰 底池: {pot}</h2>
-        </div>
+    <div style='position: relative; width: {W}px; height: {H}px; margin: 0 auto; font-family: Arial; background-color: #35654d; border-radius: 200px; border: 15px solid #633e2b; box-shadow: inset 0 0 50px rgba(0,0,0,0.5), 0 10px 20px rgba(0,0,0,0.3);'>
         
-        <div style='text-align: center; margin-bottom: 30px;'>
-            <div style='font-weight: bold; margin-bottom: 10px;'>公共牌</div>
-            <div style='min-height: 50px;'>{board_html}</div>
+        <!-- Center Info: Board & Pot -->
+        <div style='position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; width: 300px;'>
+            <div style='color: #ffd700; font-size: 1.4em; font-weight: bold; margin-bottom: 10px; text-shadow: 0 2px 4px rgba(0,0,0,0.5);'>
+                💰 Pot: {pot}
+            </div>
+            <div style='background: rgba(0,0,0,0.2); padding: 10px; border-radius: 10px; min-height: 50px;'>
+                {board_html}
+            </div>
         </div>
-        
-        <div style='display: flex; flex-wrap: wrap; justify-content: center; gap: 15px;'>
     """
     
     num_players = CONFIG["num_players"] if CONFIG else 6
@@ -1079,25 +1221,34 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         is_active = (p == current_player)
         is_folded = (p in folded_players)
         
+        # Calculate Position (Circle)
+        # P0 at Bottom (90 deg)
+        # Clockwise: Angle increases. P0=90, P1=90+Step...
+        angle_deg = 90 + (p - user_seat) * (360 / num_players)
+        angle_rad = math.radians(angle_deg)
+        
+        px = CX + RX * math.cos(angle_rad)
+        py = CY + RY * math.sin(angle_rad)
+        
+        # Offset for div size
+        card_w, card_h = 140, 110
+        left = px - card_w/2
+        top = py - card_h/2
+        
         pos_name = positions[p]
         if pos_name:
             # 增强位置显示样式
-            # 默认样式
             pos_bg = "#8c8c8c" # 深灰
             pos_color = "white"
             
             if "BTN" in pos_name:
-                pos_bg = "#ffec3d" # 亮黄
-                pos_color = "black" # 黑字
+                pos_bg = "#ffec3d"; pos_color = "black"
             elif "SB" in pos_name:
-                pos_bg = "#69c0ff" # 浅蓝
-                pos_color = "white"
+                pos_bg = "#69c0ff"; pos_color = "white"
             elif "BB" in pos_name:
-                pos_bg = "#1890ff" # 深蓝
-                pos_color = "white"
+                pos_bg = "#1890ff"; pos_color = "white"
             elif "UTG" in pos_name:
-                pos_bg = "#d9d9d9" # 浅灰
-                pos_color = "black"
+                pos_bg = "#d9d9d9"; pos_color = "black"
                 
             pos_label = f"<span style='background:{pos_bg}; color:{pos_color}; border-radius:4px; padding:2px 6px; font-size:0.8em; font-weight:bold; margin-left:6px; box-shadow: 0 1px 2px rgba(0,0,0,0.1);'>{pos_name}</span>"
         else:
@@ -1118,7 +1269,7 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
             border_color = "#52c41a"
             border_width = "3px" if is_active else "2px"
             if is_folded:
-                bg_color = "#e6f7ff" # 玩家弃牌后颜色
+                bg_color = "#e6f7ff"
             
         name = f"👤 您{pos_label}" if is_user else f"🤖 AI {p}{pos_label}"
         if is_folded:
@@ -1128,12 +1279,9 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         hand_html = ""
         _, p_cards_list = get_cards_from_state(state_str, p)
         
-        # 保存手牌用于结算 (无论是否弃牌，只要有牌都显示)
         if p_cards_list:
-            # 评估牌型
             hole_cards = p_cards_list
             _, rank_name, _ = evaluate_hand(hole_cards, board_list)
-            # 保存 p_cards_list 供后面使用，转为字符串仅用于显示
             p_cards_str = "".join(p_cards_list)
             
             display_rank = rank_name
@@ -1148,7 +1296,6 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         if is_user:
             show_cards = True
         elif state.is_terminal():
-             # 游戏结束时，所有玩家都显示牌（包括弃牌的，为了复盘）
             show_cards = True
         else:
             show_cards = False 
@@ -1157,7 +1304,7 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
             cards = p_cards_list
             for c in cards:
                 hand_html += format_card_html(c)
-        elif not show_cards and p_cards_list: # 有牌但不显示
+        elif not show_cards and p_cards_list: 
              if is_folded:
                  hand_html = "<span style='color:gray; font-size: 0.8em;'>(已弃牌)</span>"
              else:
@@ -1167,15 +1314,41 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
 
         stack_val = stacks[p] if p < len(stacks) else "?"
         
+        # Last Action Bubble
+        action_html = ""
+        if p in last_actions:
+            act_text = last_actions[p]
+            
+            # Coloring based on action type
+            act_bg = "#333" # Default black
+            if "Fold" in act_text: act_bg = "#595959" # Grey
+            elif "Raise" in act_text or "Bet" in act_text or "All-In" in act_text: act_bg = "#d32f2f" # Red
+            elif "Call" in act_text: act_bg = "#1976d2" # Blue
+            elif "Check" in act_text: act_bg = "#388e3c" # Green
+            elif "Blind" in act_text: act_bg = "#f57c00" # Orange
+            
+            action_html = f"""
+            <div style='position: absolute; top: -35px; left: 50%; transform: translateX(-50%); 
+                        background: {act_bg}; color: white; padding: 4px 10px; border-radius: 15px; 
+                        font-size: 0.85em; white-space: nowrap; z-index: 10; box-shadow: 0 2px 5px rgba(0,0,0,0.3);'>
+                {act_text}
+                <div style='position: absolute; bottom: -5px; left: 50%; transform: translateX(-50%); 
+                            border-width: 5px 5px 0; border-style: solid; border-color: {act_bg} transparent transparent transparent;'></div>
+            </div>
+            """
+        
         html += f"""
-        <div style='background: {bg_color}; border: {border_width} solid {border_color}; padding: 10px; border-radius: 8px; width: 140px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); opacity: {opacity};'>
+        <div style='position: absolute; left: {left}px; top: {top}px; width: {card_w}px; height: {card_h}px;
+                    background: {bg_color}; border: {border_width} solid {border_color}; 
+                    border-radius: 8px; text-align: center; padding: 5px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); opacity: {opacity}; display: flex; flex-direction: column; justify-content: center; align-items: center;'>
+            {action_html}
             <div style='font-weight: bold; margin-bottom: 5px; font-size: 0.9em;'>{name}</div>
             <div style='margin: 5px 0; min-height: 35px; display: flex; justify-content: center; align-items: center;'>{hand_html}</div>
             <div style='font-size: 0.8em; color: #595959;'>Stack: {stack_val}</div>
         </div>
         """
 
-    html += "</div>" # Flex container end
+    html += "</div>" # Table end
 
     if state.is_terminal():
         returns = state.returns()
@@ -1220,7 +1393,6 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         </div>
         """
         
-    html += "</div>" # Main container end
     return html, "\n".join(logs)
 
 # ==========================================
@@ -1490,5 +1662,5 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
 if __name__ == "__main__":
     print(f"Starting Gradio...")
     demo.queue(max_size=32)
-    demo.launch(server_name="0.0.0.0", server_port=8827)
+    demo.launch(server_name="0.0.0.0", server_port=8823)
 

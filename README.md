@@ -189,8 +189,8 @@ nohup python deep_cfr_parallel.py \
 ```bash
 nohup python deep_cfr_parallel.py \
     --resume models/deepcfr_stable_run \
-    --memory_capacity 1000000  \
-    --num_iterations 20000 \
+    --memory_capacity 2000000  \
+    --num_iterations 30000 \
     --num_workers 16 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
@@ -198,7 +198,7 @@ nohup python deep_cfr_parallel.py \
     --eval_interval 100 \
     --eval_with_games \
     --num_test_games 100 \
-    --skip_nashconv > train_parallel_resume.log 2>&1 &
+    --skip_nashconv > train_parallel_resume_v8.log 2>&1 &
 ```
 
 **参数建议**:

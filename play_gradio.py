@@ -153,7 +153,7 @@ def strip_ansi(text):
 # 1. 配置与模型加载
 # ==========================================
 
-MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_19200"
+MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_24300"
 DEVICE = "cpu"
 
 def load_model(model_dir, num_players=None, device='cpu'):
@@ -568,7 +568,8 @@ def run_game_step(history, user_action=None, user_seat=0):
             state.apply_action(user_action)
             history.append(user_action)
         else:
-            logs.append("⚠️ 错误: 不是您的回合")
+            curr_p = state.current_player()
+            logs.append(f"⚠️ 错误: 不是您的回合 (当前轮到: P{curr_p}, 您是: P{user_seat})")
 
     # 3. 自动运行直到用户回合或结束
     # 我们使用暂存列表来收集同一个阶段发出的牌（例如 Flop 的 3 张）
@@ -786,11 +787,37 @@ def format_card_html(card_str):
     return f"<span style='color:{color}; font-size: 1.5em; background: white; padding: 2px 5px; border: 1px solid #ccc; border-radius: 4px; margin: 2px;'>{display_rank}{suit}</span>"
 
 def get_player_positions(state, num_players):
-    """推断玩家位置 (BTN, SB, BB, etc.)"""
+    """推断玩家位置 (BTN, SB, BB, etc.) - 基于全局 Tournament State"""
     positions = [""] * num_players
     
-    # 尝试 1: 解析 Spent 信息来确定 SB/BB
-    # Spent: [P0: 50  P1: 100  P2: 0 ... ]
+    # 优先使用全局锦标赛状态中的 Dealer 位置
+    if "TOURNAMENT_STATE" in globals() and TOURNAMENT_STATE.get("dealer_pos") is not None:
+        dealer_pos = TOURNAMENT_STATE["dealer_pos"]
+        
+        # 定义位置名称顺序 (相对于 Dealer/BTN)
+        # 6-max: BTN -> SB -> BB -> UTG -> MP -> CO
+        pos_names_from_btn = ["BTN", "SB", "BB", "UTG", "MP", "CO"]
+        if num_players == 2: 
+            pos_names_from_btn = ["SB", "BB"] # HU: Dealer is SB
+            # HU 特殊处理: Dealer=SB, Other=BB
+            # Dealer pos is SB.
+            # pos 0 (dealer) -> SB
+            # pos 1 -> BB
+            positions[dealer_pos] = "SB"
+            positions[(dealer_pos + 1) % num_players] = "BB"
+            return positions
+
+        for i in range(num_players):
+            # 计算相对于 Dealer 的偏移量
+            # i = dealer_pos -> offset 0 (BTN)
+            # i = dealer_pos + 1 -> offset 1 (SB)
+            offset = (i - dealer_pos + num_players) % num_players
+            if offset < len(pos_names_from_btn):
+                positions[i] = pos_names_from_btn[offset]
+        return positions
+
+    # Fallback: 尝试解析 Spent 信息 (旧逻辑，作为后备)
+    # ...
     try:
         state_str = strip_ansi(str(state))
         

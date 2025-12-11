@@ -1032,6 +1032,7 @@ def get_last_actions_in_round(state):
     """
     Replay history to get the last action for each player in the current street.
     Uses player_contributions to calculate accurate bet amounts.
+    Returns: (last_actions_dict, actual_pot)
     """
     last_actions = {}
     temp_state = GAME.new_initial_state()
@@ -1042,17 +1043,38 @@ def get_last_actions_in_round(state):
     if not prev_contributions:
         prev_contributions = [0] * GAME.num_players()
     
+    # Track actual contributions (using increments, not OpenSpiel's "bet to" amounts)
+    # Start with initial contributions (should only contain blinds at game start)
+    # Then we'll only track increments from actions
+    # This ensures we capture blinds but don't include OpenSpiel's "bet to" values
+    actual_contributions = list(prev_contributions) if prev_contributions else [0] * GAME.num_players()
+    
+    # Debug: print initial state
+    print(f"DEBUG initial prev_contributions: {prev_contributions}, actual_contributions: {actual_contributions}")
+    
     # Track board length to detect street changes
     board_len = 0
     
     for action in history:
         if temp_state.is_chance_node():
+            # Get contributions before chance action
+            prev_before_chance = get_player_contributions(temp_state)
+            if not prev_before_chance:
+                prev_before_chance = [0] * GAME.num_players()
+            
             temp_state.apply_action(action)
             
-            # Update contributions baseline
+            # Update contributions baseline after chance action
             prev_contributions = get_player_contributions(temp_state)
             if not prev_contributions:
                 prev_contributions = [0] * GAME.num_players()
+            
+            # Sync actual_contributions: only add increments from chance nodes
+            # This captures blinds that are set during chance nodes
+            for p in range(min(len(prev_contributions), len(actual_contributions), len(prev_before_chance))):
+                chance_diff = prev_contributions[p] - prev_before_chance[p]
+                if chance_diff > 0:
+                    actual_contributions[p] += chance_diff
             
             # Check board length
             current_board, _ = get_cards_from_state(str(temp_state))
@@ -1062,6 +1084,7 @@ def get_last_actions_in_round(state):
                 # Only keep Fold actions, clear others
                 folds = {p: a for p, a in last_actions.items() if "Fold" in a}
                 last_actions = folds
+                # Contributions accumulate across streets, so don't reset
                 board_len = new_len
         else:
             player = temp_state.current_player()
@@ -1069,6 +1092,10 @@ def get_last_actions_in_round(state):
             
             # Get contribution before action
             prev_contrib = prev_contributions[player] if player < len(prev_contributions) else 0
+            
+            # Calculate pot before action using actual_contributions (real increments)
+            # This gives us the correct pot for HalfPot/Bet calculations
+            pot_before = sum(actual_contributions) if actual_contributions else 0
             
             temp_state.apply_action(action)
             
@@ -1081,24 +1108,44 @@ def get_last_actions_in_round(state):
             # Calculate amount: how much more this player put in
             diff = curr_contrib - prev_contrib
             
-            # Update prev_contributions for next iteration
-            prev_contributions = curr_contributions
-            
-            # Clean action string
+            # Clean action string first to determine action type
             clean_act = re.sub(r'Player \d+', '', action_str).strip()
             clean_act = clean_act.replace("move=", "").strip()
+            
+            # Calculate the actual increment for this action
+            # For HalfPot and Bet, we use our calculated increments, not OpenSpiel's "bet to" diff
+            actual_increment = diff  # Default to OpenSpiel's diff
+            
+            if "HalfPot" in clean_act:
+                # HalfPot: use calculated half-pot increment, not OpenSpiel's "bet to" diff
+                half_pot_raise = pot_before // 2  # 半池增量
+                if half_pot_raise > 0:
+                    actual_increment = half_pot_raise
+            elif clean_act == "Bet":
+                # Bet: use calculated full-pot increment, not OpenSpiel's "bet to" diff
+                pot_bet_raise = pot_before  # 全池增量
+                if pot_bet_raise > 0:
+                    actual_increment = pot_bet_raise
+            
+            # Update actual contributions using the calculated increment
+            # This gives us the "true" contribution, not OpenSpiel's "bet to" amount
+            if player < len(actual_contributions):
+                actual_contributions[player] += actual_increment
+            
+            # Update prev_contributions for next iteration
+            prev_contributions = curr_contributions
             
             # Format Logic - Match exact action names from universal_poker
             # 
             # 动作定义说明：
-            # - HalfPot: 加注到 0.5 * (当前底池 + 需要跟注的金额) + 当前最大投入
-            # - Bet: 加注到 1.0 * (当前底池 + 需要跟注的金额) + 当前最大投入 (全池下注)
+            # - HalfPot: OpenSpiel 计算为"加注到"的金额，但显示时我们计算"真正的半池增量"
+            # - Bet: 全池加注，显示实际投入金额
             # - AllIn: 全押所有筹码
             # - Call: 跟注到当前最大投入
             # - Check: 过牌（当前最大投入为0时）
             # - Fold: 弃牌
             #
-            # diff 是本次行动实际投入的金额（curr_contrib - prev_contrib）
+            # actual_increment 是本次行动实际投入的金额
             
             if "Fold" in clean_act:
                 display_act = "Fold"
@@ -1107,11 +1154,17 @@ def get_last_actions_in_round(state):
             elif clean_act == "Call":
                 display_act = f"Call {diff}" if diff > 0 else "Check"
             elif "HalfPot" in clean_act:
-                # HalfPot: 半池加注，显示实际投入金额
-                display_act = f"HalfPot {diff}" if diff > 0 else "HalfPot"
+                # HalfPot: 显示计算的半池增量
+                if actual_increment > 0:
+                    display_act = f"HalfPot {actual_increment}"
+                else:
+                    display_act = "HalfPot"
             elif clean_act == "Bet":
-                # Bet: 全池加注，显示实际投入金额
-                display_act = f"Bet {diff}" if diff > 0 else "Bet"
+                # Bet: 显示计算的全池增量
+                if actual_increment > 0:
+                    display_act = f"Bet {actual_increment}"
+                else:
+                    display_act = "Bet"
             elif "AllIn" in clean_act:
                 # AllIn: 全押，显示实际投入金额
                 display_act = f"All-In {diff}" if diff > 0 else "All-In"
@@ -1124,15 +1177,21 @@ def get_last_actions_in_round(state):
             
             # Always update last action for this player
             last_actions[player] = display_act
-            
-    return last_actions
+    
+    # Calculate actual pot from actual contributions
+    actual_pot = sum(actual_contributions)
+    
+    # Debug: print actual contributions
+    print(f"DEBUG actual_contributions: {actual_contributions}, actual_pot: {actual_pot}")
+    
+    return last_actions, actual_pot
 
 def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
     if state is None:
         return "<h3>点击 '开始新游戏'</h3>", "", ""
     
-    # Get last actions for display
-    last_actions = get_last_actions_in_round(state)
+    # Get last actions for display and actual pot
+    last_actions, actual_pot = get_last_actions_in_round(state)
     
     # 使用正则表达式解析状态字符串
     state_str = strip_ansi(str(state))
@@ -1146,13 +1205,18 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
     full_info = state_str + "\n" + info_str
 
     # 1. 解析底池 (Pot)
-    # 优先使用 state.to_struct().pot_size，更准确
-    pot = 0
-    try:
-        state_struct = state.to_struct()
-        pot = getattr(state_struct, 'pot_size', 0)
-    except:
-        pass
+    # 使用重放历史计算的实际底池（基于增量，而不是 OpenSpiel 的"加注到"金额）
+    pot = actual_pot
+    
+    # Fallback: 如果重放历史失败，使用 player_contributions 总和
+    if pot == 0:
+        try:
+            contributions = get_player_contributions(state)
+            if contributions:
+                pot = sum(contributions)
+        except Exception as e:
+            print(f"Error calculating pot from contributions: {e}")
+            pass
     
     # Fallback: 从状态字符串解析
     if pot == 0:

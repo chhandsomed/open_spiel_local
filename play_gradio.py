@@ -154,7 +154,7 @@ def strip_ansi(text):
 # 1. 配置与模型加载
 # ==========================================
 
-MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_24300"
+MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_26000"
 DEVICE = "cpu"
 
 def load_model(model_dir, num_players=None, device='cpu'):
@@ -1129,7 +1129,7 @@ def get_last_actions_in_round(state):
 
 def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
     if state is None:
-        return "<h3>点击 '开始新游戏'</h3>", ""
+        return "<h3>点击 '开始新游戏'</h3>", "", ""
     
     # Get last actions for display
     last_actions = get_last_actions_in_round(state)
@@ -1184,15 +1184,16 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
     # ============================
     # 绘制圆形桌子 (Circular Layout)
     # ============================
-    W, H = 800, 520
+    W, H = 900, 550  # 减小桌子尺寸，避免与日志区重叠
     CX, CY = W/2, H/2
-    RX, RY = 320, 200 # Table Radius
+    # 调整半径，确保玩家在桌子边缘内，留出足够空间
+    RX, RY = 320, 200  # 相应减小半径
     
     html = f"""
-    <div style='position: relative; width: {W}px; height: {H}px; margin: 0 auto; font-family: Arial; background-color: #35654d; border-radius: 200px; border: 15px solid #633e2b; box-shadow: inset 0 0 50px rgba(0,0,0,0.5), 0 10px 20px rgba(0,0,0,0.3);'>
+    <div style='position: relative; width: {W}px; height: {H}px; max-width: 100%; margin: 0 auto; font-family: Arial; background-color: #35654d; border-radius: 200px; border: 15px solid #633e2b; box-shadow: inset 0 0 50px rgba(0,0,0,0.5), 0 10px 20px rgba(0,0,0,0.3); overflow: visible;'>
         
         <!-- Center Info: Board & Pot -->
-        <div style='position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; width: 300px;'>
+        <div style='position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; width: 300px; z-index: 1;'>
             <div style='color: #ffd700; font-size: 1.4em; font-weight: bold; margin-bottom: 10px; text-shadow: 0 2px 4px rgba(0,0,0,0.5);'>
                 💰 Pot: {pot}
             </div>
@@ -1227,13 +1228,29 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         angle_deg = 90 + (p - user_seat) * (360 / num_players)
         angle_rad = math.radians(angle_deg)
         
-        px = CX + RX * math.cos(angle_rad)
-        py = CY + RY * math.sin(angle_rad)
+        # 计算玩家在椭圆上的位置
+        # 使用稍大的半径，让玩家分布更宽松，但仍保持在桌子边缘内
+        player_radius_x = RX - 50  # 增大半径，让玩家更靠近桌子边缘
+        player_radius_y = RY - 40
         
-        # Offset for div size
+        px = CX + player_radius_x * math.cos(angle_rad)
+        py = CY + player_radius_y * math.sin(angle_rad)
+        
+        # 玩家卡片尺寸（适中大小，避免重叠）
         card_w, card_h = 140, 110
         left = px - card_w/2
         top = py - card_h/2
+        
+        # 确保玩家卡片在桌子范围内（留出边距，但不要太紧）
+        margin = 10  # 减小边距，让玩家更靠近桌子边缘
+        if left < margin:
+            left = margin
+        elif left + card_w > W - margin:
+            left = W - card_w - margin
+        if top < margin:
+            top = margin
+        elif top + card_h > H - margin:
+            top = H - card_h - margin
         
         pos_name = positions[p]
         if pos_name:
@@ -1349,7 +1366,9 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         """
 
     html += "</div>" # Table end
-
+    
+    # 结算详情单独返回（只在游戏结束时显示）
+    settlement_html = ""
     if state.is_terminal():
         returns = state.returns()
         user_ret = returns[user_seat]
@@ -1382,8 +1401,8 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
             
         result_table += "</table>"
         
-        html += f"""
-        <div style='margin-top: 30px; padding: 15px; background: {result_color}; border: 1px solid {result_border}; border-radius: 8px; text-align: center;'>
+        settlement_html = f"""
+        <div style='padding: 15px; background: {result_color}; border: 1px solid {result_border}; border-radius: 8px; text-align: center;'>
             <h3 style='margin:0 0 10px 0;'>{msg}</h3>
             <div>您的收益: <span style='font-weight:bold; font-size: 1.2em;'>{user_ret}</span></div>
             <div style='margin-top: 15px; text-align: left;'>
@@ -1393,7 +1412,7 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         </div>
         """
         
-    return html, "\n".join(logs)
+    return html, "\n".join(logs), settlement_html
 
 # ==========================================
 # 4. Gradio Callbacks
@@ -1401,7 +1420,7 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
 
 def start_new_game():
     if GAME is None:
-        return [], None, "<h1>❌ 模型加载失败</h1>", "Check console logs", gr.update(choices=[], value=None, interactive=False), gr.update(interactive=False), gr.update(visible=False)
+        return [], None, "<h1>❌ 模型加载失败</h1>", "", gr.update(choices=[], value=None, interactive=False), gr.update(interactive=False), gr.update(visible=False), ""
     
     # 重置锦标赛状态
     num_players = CONFIG['num_players']
@@ -1417,7 +1436,7 @@ def start_new_game():
     logs.insert(0, "🏁 新锦标赛开始 (Stacks: 2000)")
     log_text = "\n".join(logs)
     
-    html, _ = format_state_html(state, user_seat=0, logs=logs, folded_players=folded_players)
+    html, _, settlement_html = format_state_html(state, user_seat=0, logs=logs, folded_players=folded_players)
     
     choices_display = []
     style_update = ""
@@ -1428,6 +1447,7 @@ def start_new_game():
         new_history, 
         html,
         log_text,
+        settlement_html,
         gr.update(choices=choices_display, value=None, interactive=is_user_turn),
         gr.update(interactive=is_user_turn),
         gr.update(visible=False), # Next hand button hidden
@@ -1507,7 +1527,7 @@ def continue_next_hand(history):
     current_hand_logs.insert(0, f"🔄 下一局 (Dealer: P{TOURNAMENT_STATE['dealer_pos']})")
     log_text = "\n".join(current_hand_logs)
     
-    html, _ = format_state_html(state, user_seat=0, logs=current_hand_logs, folded_players=folded_players)
+    html, _, settlement_html = format_state_html(state, user_seat=0, logs=current_hand_logs, folded_players=folded_players)
     
     choices_display = []
     style_update = ""
@@ -1518,6 +1538,7 @@ def continue_next_hand(history):
         new_history, 
         html,
         log_text,
+        settlement_html,
         gr.update(choices=choices_display, value=None, interactive=is_user_turn),
         gr.update(interactive=is_user_turn),
         gr.update(visible=False),
@@ -1541,7 +1562,7 @@ def on_submit_action(history, action_str, current_logs):
     else:
         full_log_text = "\n".join(new_logs)
         
-    html, _ = format_state_html(state, user_seat=0, folded_players=folded_players)
+    html, _, settlement_html = format_state_html(state, user_seat=0, folded_players=folded_players)
     
     choices_display = []
     style_update = ""
@@ -1557,6 +1578,7 @@ def on_submit_action(history, action_str, current_logs):
         new_history,
         html,
         full_log_text,
+        settlement_html,
         gr.update(choices=choices_display, value=None, interactive=is_user_turn),
         gr.update(interactive=is_user_turn),
         gr.update(visible=next_hand_visible),
@@ -1609,12 +1631,14 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
     
     history_state = gr.State([])
     
+    # 新布局：桌子在上方，操作区在下方，结算和日志在右边
     with gr.Row():
-        with gr.Column(scale=2):
+        # 左侧：桌子 + 操作区
+        with gr.Column(scale=5, min_width=600):
+            # 桌子显示区域（添加容器限制宽度）
             board_display = gr.HTML(label="游戏桌面", value="<h3>请点击'开始新游戏'</h3>")
-            game_log = gr.Textbox(label="游戏日志", lines=15, max_lines=20)
             
-        with gr.Column(scale=1):
+            # 操作区在桌子下方
             gr.Markdown("### 🎮 操作区")
             
             # 使用 Radio 的 input/change 事件自动触发 submit
@@ -1628,8 +1652,19 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
             # 隐藏确认按钮
             submit_btn = gr.Button("✅ 确认动作", variant="primary", interactive=False, visible=False)
             
-            next_hand_btn = gr.Button("🔄 继续下一局 (轮转位置)", variant="primary", visible=False)
-            new_game_btn = gr.Button("⚠️ 重置并开始新游戏", variant="secondary")
+            with gr.Row():
+                next_hand_btn = gr.Button("🔄 继续下一局 (轮转位置)", variant="primary", visible=False)
+                new_game_btn = gr.Button("⚠️ 重置并开始新游戏", variant="secondary")
+            
+        # 右侧：结算和日志
+        with gr.Column(scale=3, min_width=400):
+            gr.Markdown("### 📊 游戏信息")
+            
+            # 结算详情（游戏结束时显示）
+            settlement_display = gr.HTML(label="结算详情", value="", visible=True)
+            
+            # 游戏日志
+            game_log = gr.Textbox(label="游戏日志", lines=20, max_lines=30)
             
             gr.Markdown("""
             ### ℹ️ 说明
@@ -1641,19 +1676,19 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
     action_radio.input(
         fn=on_submit_action,
         inputs=[history_state, action_radio, game_log],
-        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn, style_injector]
+        outputs=[history_state, board_display, game_log, settlement_display, action_radio, submit_btn, next_hand_btn, style_injector]
     )
 
     new_game_btn.click(
         fn=start_new_game,
         inputs=[],
-        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn, style_injector]
+        outputs=[history_state, board_display, game_log, settlement_display, action_radio, submit_btn, next_hand_btn, style_injector]
     )
     
     next_hand_btn.click(
         fn=continue_next_hand,
         inputs=[history_state],
-        outputs=[history_state, board_display, game_log, action_radio, submit_btn, next_hand_btn, style_injector]
+        outputs=[history_state, board_display, game_log, settlement_display, action_radio, submit_btn, next_hand_btn, style_injector]
     )
 
     # submit_btn.click (removed)
@@ -1662,5 +1697,5 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
 if __name__ == "__main__":
     print(f"Starting Gradio...")
     demo.queue(max_size=32)
-    demo.launch(server_name="0.0.0.0", server_port=8823)
+    demo.launch(server_name="0.0.0.0", server_port=8827)
 

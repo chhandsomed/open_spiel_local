@@ -26,6 +26,13 @@ import torch.multiprocessing as mp
 from multiprocessing import Process, Queue, Event, Value, Manager
 from collections import namedtuple
 import queue
+import resource
+
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
 import pyspiel
 from open_spiel.python.pytorch import deep_cfr
@@ -113,7 +120,8 @@ def worker_process(
     stop_event,
     iteration_counter,
     num_traversals_per_batch,
-    device='cpu'
+    device='cpu',
+    max_memory_gb=None  # Worker 内存限制
 ):
     """Worker 进程：并行遍历游戏树
     
@@ -141,9 +149,29 @@ def worker_process(
     except:
         pass
     
+    # 设置内存限制（如果指定）
+    if max_memory_gb:
+        try:
+            max_bytes = int(max_memory_gb * 1024 * 1024 * 1024)
+            # 设置虚拟内存限制（RLIMIT_AS）
+            resource.setrlimit(resource.RLIMIT_AS, (max_bytes, max_bytes))
+            print(f"[Worker {worker_id}] 已设置内存限制: {max_memory_gb}GB")
+        except (ValueError, OSError) as e:
+            print(f"[Worker {worker_id}] ⚠️ 无法设置内存限制: {e}")
+    
     # 设置异常处理
     try:
-        print(f"[Worker {worker_id}] 启动，设备: {device}")
+        # 获取当前进程的内存使用情况
+        if HAS_PSUTIL:
+            try:
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                mem_mb = mem_info.rss / 1024 / 1024
+                print(f"[Worker {worker_id}] 启动，设备: {device}，初始内存: {mem_mb:.1f}MB")
+            except:
+                print(f"[Worker {worker_id}] 启动，设备: {device}")
+        else:
+            print(f"[Worker {worker_id}] 启动，设备: {device}")
         
         # 创建游戏
         game = pyspiel.load_game(game_string)
@@ -362,6 +390,8 @@ class ParallelDeepCFRSolver:
         device='cuda',
         gpu_ids=None,  # 多 GPU 支持
         sync_interval=1,  # 每多少次迭代同步一次网络参数
+        max_memory_gb=None,  # 最大内存限制（GB），None 表示不限制
+        queue_maxsize=50000,  # 队列最大大小（降低以减少内存占用）
     ):
         self.game = game
         self.num_workers = num_workers
@@ -373,6 +403,12 @@ class ParallelDeepCFRSolver:
         self.batch_size_strategy = batch_size_strategy
         self.memory_capacity = memory_capacity
         self.sync_interval = sync_interval
+        self.max_memory_gb = max_memory_gb
+        self.queue_maxsize = queue_maxsize
+        
+        # 内存监控
+        self._last_memory_check = 0
+        self._memory_check_interval = 60  # 每60秒检查一次内存
         
         # 多 GPU 设置
         self.gpu_ids = gpu_ids
@@ -516,9 +552,9 @@ class ParallelDeepCFRSolver:
         self._stop_event = Event()
         self._iteration_counter = Value('i', 1)
         
-        # 创建队列
-        self._advantage_queues = [Queue(maxsize=100000) for _ in range(self.num_players)]
-        self._strategy_queue = Queue(maxsize=100000)
+        # 创建队列（降低 maxsize 以减少内存占用）
+        self._advantage_queues = [Queue(maxsize=self.queue_maxsize) for _ in range(self.num_players)]
+        self._strategy_queue = Queue(maxsize=self.queue_maxsize)
         self._network_params_queues = [Queue(maxsize=10) for _ in range(self.num_workers)]
         
         # 计算每个 Worker 的遍历次数
@@ -545,6 +581,7 @@ class ParallelDeepCFRSolver:
                     self._iteration_counter,
                     traversals_per_worker,
                     'cpu',  # Worker 在 CPU 上运行
+                    self.max_memory_gb,  # Worker 内存限制
                 ),
                 daemon=True  # 设置为守护进程，主进程退出时自动杀死
             )
@@ -557,6 +594,55 @@ class ParallelDeepCFRSolver:
                 time.sleep(1)
         
         print(f"\n  ✓ 已启动 {self.num_workers} 个 Worker 进程")
+        
+        # 显示内存使用情况
+        if HAS_PSUTIL:
+            try:
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                mem_mb = mem_info.rss / 1024 / 1024
+                print(f"  主进程内存使用: {mem_mb:.1f}MB")
+                
+                # 估算总内存需求
+                # 实际内存占用包括：
+                # 1. 样本数据本身：info_state (numpy数组，可能几百到几千个float32) + iteration + advantage/strategy
+                # 2. Python 对象开销：namedtuple、list、numpy数组对象等
+                # 3. 队列积压：如果 Worker 产生速度 > 消费速度
+                # 4. Worker 进程：每个 Worker 的网络副本、游戏状态等
+                # 
+                # 保守估算：每个样本约 5-10KB（包括 Python 对象开销）
+                # 对于6人局，memory_capacity=1,000,000：
+                #   - 优势样本：6 × 1,000,000 × 5KB = 30GB
+                #   - 策略样本：1 × 1,000,000 × 5KB = 5GB
+                #   - 总计：约 35GB（不包括队列和 Worker）
+                sample_size_kb = 5  # 保守估算，实际可能更大
+                estimated_memory_gb = (
+                    self.memory_capacity * self.num_players * sample_size_kb +  # 优势样本
+                    self.memory_capacity * sample_size_kb +  # 策略样本
+                    self.queue_maxsize * (self.num_players + 1) * sample_size_kb +  # 队列积压（最坏情况）
+                    self.num_workers * 500  # Worker 进程开销（每个 Worker 约 500MB）
+                ) / 1024 / 1024
+                print(f"  估算总内存需求: {estimated_memory_gb:.2f}GB")
+                print(f"    - 优势样本缓冲区: {self.memory_capacity * self.num_players * sample_size_kb / 1024 / 1024:.2f}GB")
+                print(f"    - 策略样本缓冲区: {self.memory_capacity * sample_size_kb / 1024 / 1024:.2f}GB")
+                print(f"    - 队列积压（最坏情况）: {self.queue_maxsize * (self.num_players + 1) * sample_size_kb / 1024 / 1024:.2f}GB")
+                print(f"    - Worker 进程: {self.num_workers * 500 / 1024 / 1024:.2f}GB")
+                
+                # 获取系统总内存
+                try:
+                    total_mem = psutil.virtual_memory().total / 1024 / 1024 / 1024
+                    available_mem = psutil.virtual_memory().available / 1024 / 1024 / 1024
+                    print(f"  系统内存: {total_mem:.1f}GB 总计, {available_mem:.1f}GB 可用")
+                    
+                    if estimated_memory_mb / 1024 > available_mem * 0.8:
+                        print(f"  ⚠️ 警告: 估算内存需求 ({estimated_memory_mb/1024:.1f}GB) 接近可用内存 ({available_mem:.1f}GB)")
+                        print(f"  建议: 减少 --memory_capacity 或 --num_workers")
+                except:
+                    pass
+            except Exception as e:
+                print(f"  ⚠️ 获取内存信息失败: {e}")
+        else:
+            print(f"  ⚠️ 无法获取内存信息（psutil 未安装，建议安装: pip install psutil）")
     
     def _stop_workers(self):
         """停止 Worker 进程"""
@@ -608,19 +694,149 @@ class ParallelDeepCFRSolver:
             except queue.Full:
                 pass
     
+    def _check_and_cleanup_memory(self, force=False):
+        """检查内存使用情况，必要时清理旧样本
+        
+        注意：清理样本只是缓解措施，根本解决方案是：
+        1. 减少 memory_capacity（推荐）
+        2. 减少 num_workers
+        3. 减少 queue_maxsize
+        
+        Args:
+            force: 强制清理，即使内存使用不高
+        """
+        if not HAS_PSUTIL or not self.max_memory_gb:
+            return
+        
+        current_time = time.time()
+        # 每60秒检查一次，避免频繁检查
+        if not force and current_time - self._last_memory_check < self._memory_check_interval:
+            return
+        
+        self._last_memory_check = current_time
+        
+        try:
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            mem_gb = mem_info.rss / 1024 / 1024 / 1024
+            
+            # 主动清理策略：
+            # 1. 如果内存使用超过限制的90%，清理旧样本
+            # 2. 如果缓冲区接近满（95%），也主动清理（即使内存不高）
+            should_cleanup = False
+            cleanup_reason = ""
+            
+            if mem_gb > self.max_memory_gb * 0.9 or force:
+                should_cleanup = True
+                cleanup_reason = f"内存使用过高 ({mem_gb:.2f}GB / {self.max_memory_gb}GB)"
+            else:
+                # 检查缓冲区是否接近满
+                for player in range(self.num_players):
+                    if len(self._advantage_memories[player]) >= self.memory_capacity * 0.95:
+                        should_cleanup = True
+                        cleanup_reason = f"缓冲区接近满（玩家 {player}: {len(self._advantage_memories[player]):,}/{self.memory_capacity:,}）"
+                        break
+                
+                if len(self._strategy_memories) >= self.memory_capacity * 0.95:
+                    should_cleanup = True
+                    cleanup_reason = f"策略缓冲区接近满 ({len(self._strategy_memories):,}/{self.memory_capacity:,})"
+            
+            if should_cleanup:
+                print(f"\n  ⚠️ {cleanup_reason}，清理旧样本...")
+                if mem_gb > self.max_memory_gb * 0.9:
+                    print(f"  ⚠️ 注意：清理样本只是缓解措施，建议减少 --memory_capacity 或 --num_workers")
+                
+                # 清理策略：保留最新的 90% 样本（基于 iteration），删除最旧的 10%
+                # 只清理少量样本，避免影响训练质量
+                for player in range(self.num_players):
+                    buffer = self._advantage_memories[player]
+                    if len(buffer) > self.memory_capacity * 0.9:
+                        # 获取所有样本并按 iteration 排序
+                        all_samples = list(buffer._data)
+                        # 按 iteration 降序排序（最新的在前）
+                        all_samples.sort(key=lambda x: x.iteration, reverse=True)
+                        # 保留最新的 90%（只删除最旧的 10%）
+                        keep_count = int(self.memory_capacity * 0.9)
+                        samples_to_keep = all_samples[:keep_count]
+                        # 清空并重新添加保留的样本
+                        buffer.clear()
+                        for sample in samples_to_keep:
+                            buffer.add(sample)
+                        print(f"      玩家 {player} 优势样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
+                
+                # 清理策略样本
+                if len(self._strategy_memories) > self.memory_capacity * 0.9:
+                    all_samples = list(self._strategy_memories._data)
+                    # 按 iteration 降序排序（最新的在前）
+                    all_samples.sort(key=lambda x: x.iteration, reverse=True)
+                    # 保留最新的 90%（只删除最旧的 10%）
+                    keep_count = int(self.memory_capacity * 0.9)
+                    samples_to_keep = all_samples[:keep_count]
+                    # 清空并重新添加保留的样本
+                    self._strategy_memories.clear()
+                    for sample in samples_to_keep:
+                        self._strategy_memories.add(sample)
+                    print(f"      策略样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
+                
+                # 清理队列中的积压样本（如果队列接近满）
+                # 这是更重要的清理，因为队列积压会占用大量内存
+                # 主动清理：即使内存不高，如果队列积压严重也要清理
+                for player, q in enumerate(self._advantage_queues):
+                    queue_size = q.qsize()
+                    if queue_size > self.queue_maxsize * 0.7:  # 降低阈值，更主动清理
+                        # 丢弃队列中最旧的一半样本
+                        to_discard = queue_size // 2
+                        for _ in range(to_discard):
+                            try:
+                                q.get_nowait()
+                            except queue.Empty:
+                                break
+                        print(f"      玩家 {player} 队列清理: {queue_size} -> {q.qsize()} (丢弃了 {to_discard} 个积压样本)")
+                
+                strategy_queue_size = self._strategy_queue.qsize()
+                if strategy_queue_size > self.queue_maxsize * 0.7:  # 降低阈值，更主动清理
+                    to_discard = strategy_queue_size // 2
+                    for _ in range(to_discard):
+                        try:
+                            self._strategy_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    print(f"      策略队列清理: {strategy_queue_size} -> {self._strategy_queue.qsize()} (丢弃了 {to_discard} 个积压样本)")
+                
+                # 强制 Python 垃圾回收
+                import gc
+                gc.collect()
+                
+                # 检查清理后的内存
+                new_mem_info = process.memory_info()
+                new_mem_gb = new_mem_info.rss / 1024 / 1024 / 1024
+                print(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB (释放了 {mem_gb - new_mem_gb:.2f}GB)")
+                print(f"  💡 建议：如果频繁出现内存清理，请减少 --memory_capacity 或 --num_workers")
+        except Exception as e:
+            print(f"  ⚠️ 内存清理失败: {e}")
+    
     def _collect_samples(self, timeout=0.1):
         """从队列收集样本"""
-        # 检查 Worker 状态 (保持不变)
+        # 检查并清理内存（如果需要）
+        self._check_and_cleanup_memory()
+        
+        # 检查 Worker 状态（增强版：检查退出码）
         dead_workers = []
         for i, p in enumerate(self._workers):
             if not p.is_alive():
-                dead_workers.append(i)
+                exit_code = p.exitcode
+                dead_workers.append((i, exit_code))
         
         if dead_workers:
-            raise RuntimeError(f"检测到 Worker {dead_workers} 已死亡！训练无法继续。")
+            worker_info = ", ".join([f"Worker {wid} (退出码: {ec})" for wid, ec in dead_workers])
+            error_msg = f"检测到 Worker 已死亡: {worker_info}。训练无法继续。"
+            # 如果退出码不为0，可能是OOM或其他严重错误
+            for _, exit_code in dead_workers:
+                if exit_code != 0:
+                    error_msg += f"\n  可能的错误原因: 退出码 {exit_code} 通常表示进程被系统杀死（如OOM）"
+            raise RuntimeError(error_msg)
 
-        # --- 修改开始 ---
-        # 收集优势样本
+        # 收集优势样本（带主动内存保护）
         for player in range(self.num_players):
             collected_count = 0
             max_collect = 10000 
@@ -629,16 +845,28 @@ class ParallelDeepCFRSolver:
                     batch = self._advantage_queues[player].get_nowait()
                     # 检查是单个样本还是批次
                     if isinstance(batch, list):
-                        for sample in batch:
-                            self._advantage_memories[player].add(sample)
-                        collected_count += len(batch)
+                        # 如果缓冲区接近满，只添加部分样本（防止溢出）
+                        buffer = self._advantage_memories[player]
+                        if len(buffer) >= self.memory_capacity * 0.95:
+                            # 缓冲区接近满，只添加 50% 的样本
+                            samples_to_add = batch[:len(batch)//2]
+                            for sample in samples_to_add:
+                                buffer.add(sample)
+                            collected_count += len(samples_to_add)
+                        else:
+                            for sample in batch:
+                                buffer.add(sample)
+                            collected_count += len(batch)
                     else:
-                        self._advantage_memories[player].add(batch)
-                        collected_count += 1
+                        # 单个样本：如果缓冲区接近满，跳过
+                        buffer = self._advantage_memories[player]
+                        if len(buffer) < self.memory_capacity * 0.95:
+                            buffer.add(batch)
+                            collected_count += 1
                 except queue.Empty:
                     break
         
-        # 收集策略样本
+        # 收集策略样本（带主动内存保护）
         collected_count = 0
         max_collect = 10000
         while collected_count < max_collect:
@@ -646,12 +874,22 @@ class ParallelDeepCFRSolver:
                 batch = self._strategy_queue.get_nowait()
                 # 检查是单个样本还是批次
                 if isinstance(batch, list):
-                    for sample in batch:
-                        self._strategy_memories.add(sample)
-                    collected_count += len(batch)
+                    # 如果缓冲区接近满，只添加部分样本（防止溢出）
+                    if len(self._strategy_memories) >= self.memory_capacity * 0.95:
+                        # 缓冲区接近满，只添加 50% 的样本
+                        samples_to_add = batch[:len(batch)//2]
+                        for sample in samples_to_add:
+                            self._strategy_memories.add(sample)
+                        collected_count += len(samples_to_add)
+                    else:
+                        for sample in batch:
+                            self._strategy_memories.add(sample)
+                        collected_count += len(batch)
                 else:
-                    self._strategy_memories.add(batch)
-                    collected_count += 1
+                    # 单个样本：如果缓冲区接近满，跳过
+                    if len(self._strategy_memories) < self.memory_capacity * 0.95:
+                        self._strategy_memories.add(batch)
+                        collected_count += 1
             except queue.Empty:
                 break
     
@@ -787,6 +1025,8 @@ class ParallelDeepCFRSolver:
                 
                 # 设置一个超时保护（例如 10 分钟），防止 Worker 全部挂死导致主进程死循环
                 collection_start_time = time.time()
+                last_sample_count = current_total_samples
+                no_progress_count = 0  # 连续无进展次数
                 
                 while True:
                     self._collect_samples()
@@ -795,12 +1035,67 @@ class ParallelDeepCFRSolver:
                     # 检查是否达标
                     if new_current_samples >= target_total_samples:
                         break
-                        
+                    
+                    # 检查是否有进展
+                    if new_current_samples > last_sample_count:
+                        last_sample_count = new_current_samples
+                        no_progress_count = 0
+                    else:
+                        no_progress_count += 1
+                    
                     # 检查超时 (10分钟)
-                    if time.time() - collection_start_time > 600:
+                    elapsed_time = time.time() - collection_start_time
+                    if elapsed_time > 600:
+                        collected = new_current_samples - current_total_samples
                         if verbose:
-                            print(f"\n  ⚠️ 警告: 样本收集超时 (已收集 {new_current_samples - current_total_samples}/{self.num_traversals})")
+                            print(f"\n  ⚠️ 警告: 样本收集超时 (已收集 {collected}/{self.num_traversals})")
+                            # 诊断信息
+                            print(f"    诊断信息:")
+                            print(f"      - 耗时: {elapsed_time:.1f}秒")
+                            print(f"      - 当前优势样本总数: {new_current_samples:,}")
+                            print(f"      - 策略样本总数: {len(self._strategy_memories):,}")
+                            
+                            # 检查 Worker 状态
+                            alive_workers = sum(1 for p in self._workers if p.is_alive())
+                            print(f"      - 存活的 Worker: {alive_workers}/{self.num_workers}")
+                            
+                            # 检查队列状态
+                            queue_sizes = [q.qsize() for q in self._advantage_queues]
+                            total_queue_size = sum(queue_sizes)
+                            print(f"      - 队列中待处理样本: {total_queue_size:,}")
+                            
+                            # 检查内存使用情况
+                            if HAS_PSUTIL:
+                                try:
+                                    process = psutil.Process()
+                                    mem_info = process.memory_info()
+                                    mem_mb = mem_info.rss / 1024 / 1024
+                                    mem_percent = process.memory_percent()
+                                    print(f"      - 主进程内存使用: {mem_mb:.1f}MB ({mem_percent:.1f}%)")
+                                    
+                                    # 检查系统内存
+                                    sys_mem = psutil.virtual_memory()
+                                    print(f"      - 系统内存: {sys_mem.percent:.1f}% 已使用 ({sys_mem.used/1024/1024/1024:.1f}GB / {sys_mem.total/1024/1024/1024:.1f}GB)")
+                                    
+                                    if sys_mem.percent > 90:
+                                        print(f"      ⚠️ 系统内存使用率过高 ({sys_mem.percent:.1f}%)，可能导致 OOM")
+                                except:
+                                    pass
+                            
+                            # 如果 Worker 全部死亡，抛出异常
+                            if alive_workers == 0:
+                                raise RuntimeError("所有 Worker 进程已死亡，无法继续训练。")
+                            
+                            # 如果队列为空且 Worker 存活，可能是 Worker 陷入死锁或内存不足
+                            if total_queue_size == 0 and alive_workers > 0:
+                                print(f"      ⚠️ 队列为空但 Worker 存活，可能陷入死锁或内存不足")
+                                print(f"      建议: 检查系统日志 (dmesg | grep -i oom) 查看是否有 OOM 杀死进程")
                         break
+                    
+                    # 如果连续多次无进展，提前警告
+                    if no_progress_count >= 20 and verbose:  # 10秒无进展（20次 × 0.5秒）
+                        print(f"\n  ⚠️ 警告: 连续 {no_progress_count * 0.5:.1f}秒无样本收集进展")
+                        no_progress_count = 0  # 重置计数器，避免重复打印
                     
                     # 稍微睡一下，避免 CPU 空转，同时也给 Worker 提交数据的机会
                     time.sleep(0.5)
@@ -1123,7 +1418,12 @@ def main():
     parser.add_argument("--advantage_layers", type=int, nargs="+", default=[128, 128])
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=2048)
-    parser.add_argument("--memory_capacity", type=int, default=1000000)
+    parser.add_argument("--memory_capacity", type=int, default=1000000,
+                        help="经验回放缓冲区容量（默认: 1000000）")
+    parser.add_argument("--max_memory_gb", type=float, default=None,
+                        help="最大内存限制（GB），超过此限制会自动清理旧样本（默认: 不限制）")
+    parser.add_argument("--queue_maxsize", type=int, default=50000,
+                        help="队列最大大小，降低可减少内存占用（默认: 50000）")
     parser.add_argument("--betting_abstraction", type=str, default="fcpa")
     parser.add_argument("--save_prefix", type=str, default="deepcfr_parallel")
     parser.add_argument("--save_dir", type=str, default="models")
@@ -1261,7 +1561,14 @@ def main():
         memory_capacity=args.memory_capacity,
         device=device,
         gpu_ids=gpu_ids,
+        max_memory_gb=args.max_memory_gb,
+        queue_maxsize=args.queue_maxsize,
     )
+    
+    # 显示内存配置
+    if args.max_memory_gb:
+        print(f"  内存限制: {args.max_memory_gb}GB")
+    print(f"  队列大小: {args.queue_maxsize}")
     
     # 立即保存配置（方便在训练过程中查看或恢复）
     if not args.resume:
@@ -1277,6 +1584,8 @@ def main():
             'learning_rate': args.learning_rate,
             'batch_size': args.batch_size,
             'memory_capacity': args.memory_capacity,
+            'max_memory_gb': args.max_memory_gb,
+            'queue_maxsize': args.queue_maxsize,
             'betting_abstraction': args.betting_abstraction,
             'device': device,
             'gpu_ids': gpu_ids,
@@ -1333,6 +1642,8 @@ def main():
         'learning_rate': args.learning_rate,
         'batch_size': args.batch_size,
         'memory_capacity': args.memory_capacity,
+        'max_memory_gb': args.max_memory_gb,
+        'queue_maxsize': args.queue_maxsize,
         'betting_abstraction': args.betting_abstraction,
         'device': device,
         'gpu_ids': gpu_ids,

@@ -176,6 +176,85 @@ nohup python deep_cfr_parallel.py \
     --save_prefix test_parallel
 ```
 
+#### 自定义盲注和筹码配置示例
+```bash
+# 5人场，自定义盲注和筹码
+nohup python deep_cfr_parallel.py \
+    --num_players 5 \
+    --blinds "100 200 0 0 0" \
+    --stack_size 50000 \
+    --num_iterations 20000 \
+    --num_traversals 1600 \
+    --num_workers 16 \
+    --batch_size 4096 \
+    --use_gpu \
+    --gpu_ids 0 1 2 3 \
+    --eval_interval 50 \
+    --checkpoint_interval 100 \
+    --eval_with_games \
+    --num_test_games 100 \
+    --skip_nashconv \
+    --learning_rate 0.001 \
+    --policy_layers 256 256 256 \
+    --advantage_layers 256 256 256 \
+    --memory_capacity 2000000 \
+    --betting_abstraction fchpa \
+    --save_prefix deepcfr_parallel_5p_custom \
+    > train_parallel_5p.log 2>&1 &
+
+#### 续训脚本（从 checkpoint 恢复训练）
+```bash
+# 从之前的训练目录恢复训练
+# 会自动加载最新的 checkpoint 和配置（玩家数、网络结构、盲注、筹码等）
+# 可以覆盖训练超参数（如 batch_size, learning_rate, num_iterations）
+nohup python deep_cfr_parallel.py \
+    --resume models/deepcfr_parallel_5p_custom \
+    --num_iterations 20000 \
+    --num_workers 16 \
+    --batch_size 4096 \
+    --use_gpu \
+    --gpu_ids 0 1 2 3 \
+    --eval_interval 50 \
+    --checkpoint_interval 100 \
+    --eval_with_games \
+    --num_test_games 100 \
+    --skip_nashconv \
+    --learning_rate 0.001 \
+    --memory_capacity 2000000 \
+    > train_parallel_5p_resume.log 2>&1 &
+```
+
+**续训说明**:
+- `--resume` 会自动从 `config.json` 加载：玩家数、网络结构、遍历次数、盲注、筹码、下注抽象等
+- 可以覆盖的训练超参数：`--num_iterations`, `--batch_size`, `--learning_rate`, `--memory_capacity` 等
+- 会自动找到最新的 checkpoint 并从中继续训练
+- 建议使用不同的日志文件（如 `train_parallel_5p_resume.log`）以便区分
+
+# 2人场高额桌配置
+nohup python deep_cfr_parallel.py \
+    --num_players 2 \
+    --blinds "200 100" \
+    --stack_size 10000 \
+   --num_iterations 2000 \
+    --num_traversals 500 \
+    --num_workers 16 \
+    --batch_size 4096 \
+    --use_gpu \
+    --gpu_ids 0 1 2 3 \
+    --eval_interval 50 \
+    --checkpoint_interval 100 \
+    --eval_with_games \
+    --num_test_games 100 \
+    --skip_nashconv \
+    --learning_rate 0.001 \
+    --policy_layers 256 256 256 \
+    --advantage_layers 256 256 256 \
+    --memory_capacity 2000000 \
+    --betting_abstraction fchpa \
+    --save_prefix deepcfr_parallel_2p_high_stakes \
+    > train_parallel_2p.log 2>&1 &
+```
+
 **多进程并行说明**:
 - 多个 Worker 进程并行遍历游戏树（CPU 密集型）
 - 主进程在 GPU 上训练神经网络，支持多 GPU DataParallel
@@ -205,8 +284,17 @@ nohup python deep_cfr_parallel.py \
 - `--num_workers`: 建议设为 CPU 核心数的一半到全部（如 8-16）
 - `--batch_size`: 多 GPU 时建议 4096+，充分利用显存
 - `--gpu_ids`: 指定多张 GPU，如 `0 1 2 3` 使用 4 张卡
-- `--resume`: 指定要恢复的模型目录，自动加载最新 checkpoint 和关键参数（玩家数、网络结构、遍历次数等）
+- `--blinds`: 如果不指定，会根据玩家数量自动生成：
+  - 2人场：`"100 50"` (BB=100, SB=50)
+  - 多人场：`"50 100 0 0 0 0"` (SB=50, BB=100, 其他=0)
+- `--stack_size`: 如果不指定，默认每个玩家 2000 筹码
+- `--resume`: 指定要恢复的模型目录，自动加载最新 checkpoint 和关键参数（玩家数、网络结构、遍历次数、盲注、筹码等）
 - `--num_test_games`: 评估时的测试对局数量。6人局建议 50-100，如果对局失败率较高可适当增加
+
+**盲注和筹码配置说明**:
+- `--blinds` 和 `--stack_size` 参数会在训练时保存到 `config.json` 中
+- 恢复训练时，如果命令行未指定这些参数，会自动从 `config.json` 加载
+- 如果命令行显式指定了这些参数，会优先使用命令行参数（允许覆盖配置）
 
 ### 关键参数说明
 
@@ -229,6 +317,7 @@ nohup python deep_cfr_parallel.py \
 
 | 参数 | 默认值 | 推荐值 | 说明 |
 | :--- | :--- | :--- | :--- |
+| `--num_players` | `2` | **`6`** | 玩家数量。支持 2-10 人。 |
 | `--num_workers` | `4` | **`16`** | Worker 进程数量。建议设为 CPU 核心数。 |
 | `--num_traversals` | `100` | **`500`** | 每次迭代遍历次数。多 Worker 时可设更大值。 |
 | `--batch_size` | `2048` | **`4096`** | 训练批量大小。多 GPU 时越大利用率越高。 |
@@ -236,6 +325,8 @@ nohup python deep_cfr_parallel.py \
 | `--advantage_layers` | `128 128` | **`256 256 256`** | 优势网络结构。多 GPU 可用更大网络。 |
 | `--memory_capacity` | `1e6` | **`2e6`** | 经验回放缓冲区大小。 |
 | `--learning_rate` | `1e-3` | **`1e-3`** | 学习率。 |
+| `--blinds` | `None` | - | 盲注配置。格式：`"小盲 大盲"` (2人场) 或 `"50 100 0 0 0 0"` (多人场完整配置)。不指定时根据玩家数量自动生成。 |
+| `--stack_size` | `None` | **`2000`** | 每个玩家的初始筹码。不指定时默认 2000。 |
 | `--use_gpu` | `False` | **`True`** | 使用 GPU 训练网络。 |
 | `--gpu_ids` | `None` | **`0 1 2 3`** | 指定多张 GPU，启用 DataParallel 并行训练。 |
 | `--eval_interval` | `10` | **`100`** | 评估间隔。每 N 次迭代评估一次策略质量。 |
@@ -243,7 +334,7 @@ nohup python deep_cfr_parallel.py \
 | `--num_test_games` | `50` | **`50-100`** | 评估时的测试对局数量。6人局可能因复杂度导致部分对局失败，可适当增加此值。 |
 | `--checkpoint_interval` | `0` | **`50`** | Checkpoint 保存间隔。 |
 | `--skip_nashconv` | `False` | **`True`** | 跳过 NashConv 计算。6人局强烈建议开启。 |
-| `--resume` | `None` | - | 从指定目录恢复训练。自动从 config.json 加载关键参数（玩家数、网络结构、遍历次数等）。 |
+| `--resume` | `None` | - | 从指定目录恢复训练。自动从 config.json 加载关键参数（玩家数、网络结构、遍历次数、盲注、筹码等）。 |
 
 **性能对比** (6人德扑, 5次迭代, 50次遍历):
 

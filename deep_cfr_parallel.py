@@ -697,93 +697,113 @@ class ParallelDeepCFRSolver:
     def _check_and_cleanup_memory(self, force=False):
         """检查内存使用情况，必要时清理旧样本
         
-        注意：清理样本只是缓解措施，根本解决方案是：
-        1. 减少 memory_capacity（推荐）
-        2. 减少 num_workers
-        3. 减少 queue_maxsize
+        关键修复：
+        1. 当缓冲区达到90%时就主动清理（而不是等到100%）
+        2. 清理后保留95%的样本（而不是90%），减少对训练质量的影响
+        3. 清理逻辑优化，避免频繁清理
         
         Args:
             force: 强制清理，即使内存使用不高
         """
-        if not HAS_PSUTIL or not self.max_memory_gb:
-            return
-        
         current_time = time.time()
-        # 每60秒检查一次，避免频繁检查
+        
+        # 每60秒检查一次内存，避免频繁检查
         if not force and current_time - self._last_memory_check < self._memory_check_interval:
             return
         
         self._last_memory_check = current_time
         
-        try:
-            process = psutil.Process()
-            mem_info = process.memory_info()
-            mem_gb = mem_info.rss / 1024 / 1024 / 1024
+        # 获取内存信息（如果有 psutil）
+        mem_gb = None
+        if HAS_PSUTIL:
+            try:
+                process = psutil.Process()
+                mem_info = process.memory_info()
+                mem_gb = mem_info.rss / 1024 / 1024 / 1024
+            except:
+                pass
+        
+        # 清理策略：
+        # 1. 当缓冲区达到90%时主动清理ReservoirBuffer（关键修复）
+        # 2. 清理队列中的积压样本（队列积压会占用大量内存）
+        # 3. 如果内存使用超过限制，清理队列并提示用户减少配置
+        
+        # 关键修复：检查缓冲区是否接近满（90%阈值）
+        buffer_near_full = False
+        for player in range(self.num_players):
+            if len(self._advantage_memories[player]) >= self.memory_capacity * 0.9:
+                buffer_near_full = True
+                break
+        if len(self._strategy_memories) >= self.memory_capacity * 0.9:
+            buffer_near_full = True
+        
+        should_cleanup = False
+        cleanup_reason = ""
+        
+        # 检查队列是否积压
+        queue_backlog = False
+        for q in self._advantage_queues:
+            if q.qsize() > self.queue_maxsize * 0.7:
+                queue_backlog = True
+                break
+        if self._strategy_queue.qsize() > self.queue_maxsize * 0.7:
+            queue_backlog = True
+        
+        if buffer_near_full:
+            should_cleanup = True
+            total_advantage = sum(len(m) for m in self._advantage_memories)
+            max_advantage = max(len(m) for m in self._advantage_memories)
+            cleanup_reason = f"缓冲区接近满（优势样本: {total_advantage:,}, 最大单玩家: {max_advantage:,}, 策略样本: {len(self._strategy_memories):,}）"
+        elif queue_backlog:
+            should_cleanup = True
+            total_advantage_queue = sum(q.qsize() for q in self._advantage_queues)
+            cleanup_reason = f"队列积压严重（优势队列: {total_advantage_queue:,}, 策略队列: {self._strategy_queue.qsize():,}）"
+        elif mem_gb and self.max_memory_gb and mem_gb > self.max_memory_gb * 0.9:
+            should_cleanup = True
+            cleanup_reason = f"内存使用过高 ({mem_gb:.2f}GB / {self.max_memory_gb}GB)"
+        elif force:
+            should_cleanup = True
+            cleanup_reason = "强制清理"
+        
+        if should_cleanup:
+            print(f"\n  ⚠️ {cleanup_reason}，清理旧样本...")
+            if mem_gb and self.max_memory_gb and mem_gb > self.max_memory_gb * 0.9:
+                print(f"  ⚠️ 注意：建议减少 --memory_capacity 或 --num_workers")
             
-            # 主动清理策略：
-            # 1. 如果内存使用超过限制的90%，清理旧样本
-            # 2. 如果缓冲区接近满（95%），也主动清理（即使内存不高）
-            should_cleanup = False
-            cleanup_reason = ""
-            
-            if mem_gb > self.max_memory_gb * 0.9 or force:
-                should_cleanup = True
-                cleanup_reason = f"内存使用过高 ({mem_gb:.2f}GB / {self.max_memory_gb}GB)"
-            else:
-                # 检查缓冲区是否接近满
-                for player in range(self.num_players):
-                    if len(self._advantage_memories[player]) >= self.memory_capacity * 0.95:
-                        should_cleanup = True
-                        cleanup_reason = f"缓冲区接近满（玩家 {player}: {len(self._advantage_memories[player]):,}/{self.memory_capacity:,}）"
-                        break
-                
-                if len(self._strategy_memories) >= self.memory_capacity * 0.95:
-                    should_cleanup = True
-                    cleanup_reason = f"策略缓冲区接近满 ({len(self._strategy_memories):,}/{self.memory_capacity:,})"
-            
-            if should_cleanup:
-                print(f"\n  ⚠️ {cleanup_reason}，清理旧样本...")
-                if mem_gb > self.max_memory_gb * 0.9:
-                    print(f"  ⚠️ 注意：清理样本只是缓解措施，建议减少 --memory_capacity 或 --num_workers")
-                
-                # 清理策略：保留最新的 90% 样本（基于 iteration），删除最旧的 10%
-                # 只清理少量样本，避免影响训练质量
-                for player in range(self.num_players):
-                    buffer = self._advantage_memories[player]
-                    if len(buffer) > self.memory_capacity * 0.9:
-                        # 获取所有样本并按 iteration 排序
-                        all_samples = list(buffer._data)
-                        # 按 iteration 降序排序（最新的在前）
+            try:
+                # 关键修复：清理ReservoirBuffer（当缓冲区接近满时）
+                if buffer_near_full:
+                    # 清理策略：保留最新的95%样本（基于iteration），删除最旧的5%
+                    for player in range(self.num_players):
+                        buffer = self._advantage_memories[player]
+                        if len(buffer) >= self.memory_capacity * 0.9:
+                            all_samples = list(buffer._data)
+                            # 按iteration降序排序（最新的在前）
+                            all_samples.sort(key=lambda x: x.iteration, reverse=True)
+                            # 保留最新的95%
+                            keep_count = int(self.memory_capacity * 0.95)
+                            samples_to_keep = all_samples[:keep_count]
+                            # 清空并重新添加保留的样本
+                            buffer.clear()
+                            for sample in samples_to_keep:
+                                buffer.add(sample)
+                            print(f"      玩家 {player} 优势样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
+                    
+                    # 清理策略样本
+                    if len(self._strategy_memories) >= self.memory_capacity * 0.9:
+                        all_samples = list(self._strategy_memories._data)
                         all_samples.sort(key=lambda x: x.iteration, reverse=True)
-                        # 保留最新的 90%（只删除最旧的 10%）
-                        keep_count = int(self.memory_capacity * 0.9)
+                        keep_count = int(self.memory_capacity * 0.95)
                         samples_to_keep = all_samples[:keep_count]
-                        # 清空并重新添加保留的样本
-                        buffer.clear()
+                        self._strategy_memories.clear()
                         for sample in samples_to_keep:
-                            buffer.add(sample)
-                        print(f"      玩家 {player} 优势样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
+                            self._strategy_memories.add(sample)
+                        print(f"      策略样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
                 
-                # 清理策略样本
-                if len(self._strategy_memories) > self.memory_capacity * 0.9:
-                    all_samples = list(self._strategy_memories._data)
-                    # 按 iteration 降序排序（最新的在前）
-                    all_samples.sort(key=lambda x: x.iteration, reverse=True)
-                    # 保留最新的 90%（只删除最旧的 10%）
-                    keep_count = int(self.memory_capacity * 0.9)
-                    samples_to_keep = all_samples[:keep_count]
-                    # 清空并重新添加保留的样本
-                    self._strategy_memories.clear()
-                    for sample in samples_to_keep:
-                        self._strategy_memories.add(sample)
-                    print(f"      策略样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
-                
-                # 清理队列中的积压样本（如果队列接近满）
-                # 这是更重要的清理，因为队列积压会占用大量内存
-                # 主动清理：即使内存不高，如果队列积压严重也要清理
+                # 清理队列中的积压样本（队列积压会占用大量内存）
                 for player, q in enumerate(self._advantage_queues):
                     queue_size = q.qsize()
-                    if queue_size > self.queue_maxsize * 0.7:  # 降低阈值，更主动清理
+                    if queue_size > self.queue_maxsize * 0.7:
                         # 丢弃队列中最旧的一半样本
                         to_discard = queue_size // 2
                         for _ in range(to_discard):
@@ -794,7 +814,7 @@ class ParallelDeepCFRSolver:
                         print(f"      玩家 {player} 队列清理: {queue_size} -> {q.qsize()} (丢弃了 {to_discard} 个积压样本)")
                 
                 strategy_queue_size = self._strategy_queue.qsize()
-                if strategy_queue_size > self.queue_maxsize * 0.7:  # 降低阈值，更主动清理
+                if strategy_queue_size > self.queue_maxsize * 0.7:
                     to_discard = strategy_queue_size // 2
                     for _ in range(to_discard):
                         try:
@@ -808,16 +828,36 @@ class ParallelDeepCFRSolver:
                 gc.collect()
                 
                 # 检查清理后的内存
-                new_mem_info = process.memory_info()
-                new_mem_gb = new_mem_info.rss / 1024 / 1024 / 1024
-                print(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB (释放了 {mem_gb - new_mem_gb:.2f}GB)")
-                print(f"  💡 建议：如果频繁出现内存清理，请减少 --memory_capacity 或 --num_workers")
-        except Exception as e:
-            print(f"  ⚠️ 内存清理失败: {e}")
+                if HAS_PSUTIL:
+                    try:
+                        process = psutil.Process()
+                        new_mem_info = process.memory_info()
+                        new_mem_gb = new_mem_info.rss / 1024 / 1024 / 1024
+                        if mem_gb:
+                            print(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB (释放了 {mem_gb - new_mem_gb:.2f}GB)")
+                        else:
+                            print(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB")
+                    except:
+                        pass
+                
+                # 强制Python垃圾回收，释放内存
+                import gc
+                gc.collect()
+            except Exception as e:
+                print(f"  ⚠️ 内存清理失败: {e}")
+                import traceback
+                traceback.print_exc()
     
     def _collect_samples(self, timeout=0.1):
-        """从队列收集样本"""
+        """从队列收集样本
+        
+        关键修复：
+        1. 在添加样本之前先检查并清理缓冲区（如果接近满）
+        2. 清理逻辑在缓冲区达到90%时主动触发，清理后保留95%的样本
+        3. 这样可以避免ReservoirBuffer.add()在缓冲区满时变得极慢
+        """
         # 检查并清理内存（如果需要）
+        # 关键修复：在添加样本之前先清理，避免缓冲区满导致添加速度极慢
         self._check_and_cleanup_memory()
         
         # 检查 Worker 状态（增强版：检查退出码）
@@ -836,7 +876,9 @@ class ParallelDeepCFRSolver:
                     error_msg += f"\n  可能的错误原因: 退出码 {exit_code} 通常表示进程被系统杀死（如OOM）"
             raise RuntimeError(error_msg)
 
-        # 收集优势样本（带主动内存保护）
+        # 收集优势样本
+        # 关键修复：清理后直接添加所有样本
+        # 因为清理逻辑已经在缓冲区接近满时（90%）主动清理，所以这里可以安全地添加所有样本
         for player in range(self.num_players):
             collected_count = 0
             max_collect = 10000 
@@ -845,28 +887,17 @@ class ParallelDeepCFRSolver:
                     batch = self._advantage_queues[player].get_nowait()
                     # 检查是单个样本还是批次
                     if isinstance(batch, list):
-                        # 如果缓冲区接近满，只添加部分样本（防止溢出）
-                        buffer = self._advantage_memories[player]
-                        if len(buffer) >= self.memory_capacity * 0.95:
-                            # 缓冲区接近满，只添加 50% 的样本
-                            samples_to_add = batch[:len(batch)//2]
-                            for sample in samples_to_add:
-                                buffer.add(sample)
-                            collected_count += len(samples_to_add)
-                        else:
-                            for sample in batch:
-                                buffer.add(sample)
-                            collected_count += len(batch)
+                        for sample in batch:
+                            self._advantage_memories[player].add(sample)
+                        collected_count += len(batch)
                     else:
-                        # 单个样本：如果缓冲区接近满，跳过
-                        buffer = self._advantage_memories[player]
-                        if len(buffer) < self.memory_capacity * 0.95:
-                            buffer.add(batch)
-                            collected_count += 1
+                        self._advantage_memories[player].add(batch)
+                        collected_count += 1
                 except queue.Empty:
                     break
         
-        # 收集策略样本（带主动内存保护）
+        # 收集策略样本
+        # 关键修复：清理后直接添加所有样本
         collected_count = 0
         max_collect = 10000
         while collected_count < max_collect:
@@ -874,22 +905,12 @@ class ParallelDeepCFRSolver:
                 batch = self._strategy_queue.get_nowait()
                 # 检查是单个样本还是批次
                 if isinstance(batch, list):
-                    # 如果缓冲区接近满，只添加部分样本（防止溢出）
-                    if len(self._strategy_memories) >= self.memory_capacity * 0.95:
-                        # 缓冲区接近满，只添加 50% 的样本
-                        samples_to_add = batch[:len(batch)//2]
-                        for sample in samples_to_add:
-                            self._strategy_memories.add(sample)
-                        collected_count += len(samples_to_add)
-                    else:
-                        for sample in batch:
-                            self._strategy_memories.add(sample)
-                        collected_count += len(batch)
+                    for sample in batch:
+                        self._strategy_memories.add(sample)
+                    collected_count += len(batch)
                 else:
-                    # 单个样本：如果缓冲区接近满，跳过
-                    if len(self._strategy_memories) < self.memory_capacity * 0.95:
-                        self._strategy_memories.add(batch)
-                        collected_count += 1
+                    self._strategy_memories.add(batch)
+                    collected_count += 1
             except queue.Empty:
                 break
     
@@ -1442,6 +1463,10 @@ def main():
                         help="评估时运行测试对局")
     parser.add_argument("--num_test_games", type=int, default=50,
                         help="评估时的测试对局数量（默认: 50）")
+    parser.add_argument("--blinds", type=str, default=None,
+                        help="盲注配置，格式：'小盲 大盲' 或 '50 100 0 0 0 0'（多人场完整配置）。如果不指定，将根据玩家数量自动生成")
+    parser.add_argument("--stack_size", type=int, default=None,
+                        help="每个玩家的初始筹码（默认: 2000）。如果不指定，将使用默认值2000")
     
     args = parser.parse_args()
     
@@ -1478,6 +1503,10 @@ def main():
                 args.save_prefix = resume_config['save_prefix']
             if 'num_traversals' in resume_config:
                 args.num_traversals = resume_config['num_traversals']
+            if 'blinds' in resume_config and args.blinds is None:
+                args.blinds = resume_config['blinds']
+            if 'stack_size' in resume_config and args.stack_size is None:
+                args.stack_size = resume_config['stack_size']
                 
             print(f"  自动加载配置: {args.num_players}人局, 策略层{args.policy_layers}, 优势层{args.advantage_layers}")
             print(f"  save_prefix: {args.save_prefix}")
@@ -1486,15 +1515,31 @@ def main():
 
     # 创建游戏
     num_players = args.num_players
+    
+    # 处理盲注配置
+    if args.blinds is not None:
+        # 如果用户指定了盲注，直接使用
+        blinds_str = args.blinds
+        print(f"  使用指定的盲注配置: {blinds_str}")
+    else:
+        # 否则根据玩家数量自动生成
+        if num_players == 2:
+            blinds_str = "100 50"
+        else:
+            blinds_list = ["50", "100"] + ["0"] * (num_players - 2)
+            blinds_str = " ".join(blinds_list)
+        print(f"  使用默认盲注配置: {blinds_str}")
+    
+    # 处理筹码配置
+    stack_size = args.stack_size if args.stack_size is not None else 2000
+    stacks_str = " ".join([str(stack_size)] * num_players)
+    print(f"  每个玩家初始筹码: {stack_size}")
+    
+    # 处理行动顺序配置
     if num_players == 2:
-        blinds_str = "100 50"
         first_player_str = "2 1 1 1"
     else:
-        blinds_list = ["50", "100"] + ["0"] * (num_players - 2)
-        blinds_str = " ".join(blinds_list)
         first_player_str = " ".join(["3"] + ["1"] * 3)
-    
-    stacks_str = " ".join(["2000"] * num_players)
     
     game_string = (
         f"universal_poker("
@@ -1587,6 +1632,8 @@ def main():
             'max_memory_gb': args.max_memory_gb,
             'queue_maxsize': args.queue_maxsize,
             'betting_abstraction': args.betting_abstraction,
+            'blinds': blinds_str,
+            'stack_size': stack_size,
             'device': device,
             'gpu_ids': gpu_ids,
             'game_string': game_string,

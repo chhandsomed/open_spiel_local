@@ -199,6 +199,17 @@ def card_index_to_string(card_idx: int) -> str:
 # 2. 状态构建函数
 # ==========================================
 
+def get_player_contributions(state):
+    """从 state.to_struct() 获取玩家投入 (player_contributions)"""
+    try:
+        state_struct = state.to_struct()
+        contributions = getattr(state_struct, 'player_contributions', [])
+        if contributions:
+            return list(contributions)
+    except:
+        pass
+    return []
+
 def create_game_with_config(
     num_players: int,
     blinds: list,  # 盲注列表，如 [50, 100, 0, 0, 0, 0]
@@ -404,6 +415,8 @@ def build_state_from_cards(
         state.apply_action(random.choice(legal_actions))
     
     # 验证action_sizings（如果提供）
+    # 注意：前端可能传入增量格式的action_sizings，而OpenSpiel存储的是"bet to"格式
+    # 我们尝试兼容两种格式：如果直接比较不匹配，尝试将增量格式转换为"bet to"格式再比较
     if action_sizings is not None:
         try:
             # 从信息状态tensor中提取OpenSpiel计算的action_sizings
@@ -421,43 +434,86 @@ def build_state_from_cards(
             openspiel_all_sizings = info_state[action_sizings_start:action_sizings_start + max_game_length]
             
             # 从state.history()中找出玩家动作的位置（排除chance节点）
-            # 重建一个临时状态来识别哪些是玩家动作
+            # 重建一个临时状态来识别哪些是玩家动作，并计算每个动作前的贡献
             temp_state = game.new_initial_state()
             player_action_indices = []  # 记录玩家动作在完整历史中的索引
+            player_contributions_before = []  # 记录每个动作前的玩家贡献（用于转换增量格式）
             
             for action in state.history():
                 if temp_state.is_chance_node():
                     # 跳过chance节点（发牌动作）
                     temp_state.apply_action(action)
                 else:
-                    # 这是玩家动作，记录索引
+                    # 这是玩家动作，记录索引和动作前的贡献
+                    current_player = temp_state.current_player()
+                    contributions = get_player_contributions(temp_state)
+                    if not contributions:
+                        contributions = [0] * num_players
+                    prev_contribution = contributions[current_player] if current_player < len(contributions) else 0
+                    
                     player_action_indices.append(len(temp_state.history()))
+                    player_contributions_before.append(prev_contribution)
                     temp_state.apply_action(action)
             
-            # 提取玩家动作对应的OpenSpiel action_sizings
+            # 提取玩家动作对应的OpenSpiel action_sizings（"bet to"格式）
             openspiel_player_sizings = [openspiel_all_sizings[i] for i in player_action_indices[:len(action_history)]]
             
-            # 比较传入的action_sizings和OpenSpiel计算的（允许小的浮点误差）
-            mismatches = []
+            # 首先尝试直接比较（如果前端传的是"bet to"格式）
+            direct_mismatches = []
             for i, (provided, calculated) in enumerate(zip(action_sizings, openspiel_player_sizings)):
-                if abs(provided - calculated) > 1.0:  # 允许1的误差（因为可能有舍入）
-                    mismatches.append({
-                        'index': i,
-                        'provided': provided,
-                        'calculated': float(calculated),
-                        'diff': abs(provided - calculated)
-                    })
+                if abs(provided - calculated) > 1.0:  # 允许1的误差
+                    direct_mismatches.append(i)
             
-            if mismatches:
-                # 记录警告（但不阻止推理）
+            # 如果直接比较不匹配，尝试将增量格式转换为"bet to"格式
+            if direct_mismatches and len(player_contributions_before) == len(action_sizings):
+                # 假设传入的是增量格式，转换为"bet to"格式
+                converted_sizings = []
+                for i, (increment, prev_contrib) in enumerate(zip(action_sizings, player_contributions_before)):
+                    if i < len(action_history):
+                        action_id = action_history[i]
+                        if action_id == 0:  # Fold
+                            converted_sizings.append(0.0)
+                        elif action_id == 1:  # Call/Check
+                            converted_sizings.append(0.0)
+                        else:
+                            # Raise/Bet/All-in: "bet to" = 之前的贡献 + 增量
+                            bet_to = prev_contrib + increment
+                            converted_sizings.append(bet_to)
+                    else:
+                        converted_sizings.append(increment)
+                
+                # 使用转换后的格式比较
+                converted_mismatches = []
+                for i, (converted, calculated) in enumerate(zip(converted_sizings, openspiel_player_sizings)):
+                    if abs(converted - calculated) > 1.0:
+                        converted_mismatches.append({
+                            'index': i,
+                            'provided_increment': action_sizings[i],
+                            'converted_bet_to': converted,
+                            'calculated': float(calculated),
+                            'diff': abs(converted - calculated)
+                        })
+                
+                if converted_mismatches:
+                    # 转换后仍不匹配，记录警告
+                    print(f"⚠️ 警告: action_sizings 不匹配（已尝试增量格式转换）！")
+                    print(f"  传入的action_sizings（增量格式）: {action_sizings[:min(10, len(action_sizings))]}...")
+                    print(f"  转换后的bet_to格式: {[float(x) for x in converted_sizings[:min(10, len(converted_sizings))]]}...")
+                    print(f"  OpenSpiel计算的: {[float(x) for x in openspiel_player_sizings[:min(10, len(openspiel_player_sizings))]]}...")
+                    print(f"  不匹配的位置: {[m['index'] for m in converted_mismatches[:5]]}")
+                    for m in converted_mismatches[:3]:
+                        print(f"    位置 {m['index']}: 增量={m['provided_increment']}, 转换后={m['converted_bet_to']:.1f}, 计算={m['calculated']:.1f}, 差异={m['diff']:.1f}")
+                else:
+                    # 转换后匹配，说明前端传的是增量格式，这是正常的
+                    print(f"✅ action_sizings验证通过（增量格式已转换为bet_to格式）")
+            elif direct_mismatches:
+                # 直接比较不匹配，且无法转换（缺少贡献信息），记录警告
                 print(f"⚠️ 警告: action_sizings 不匹配！")
                 print(f"  传入的action_sizings: {action_sizings[:min(10, len(action_sizings))]}...")
                 print(f"  OpenSpiel计算的: {[float(x) for x in openspiel_player_sizings[:min(10, len(openspiel_player_sizings))]]}...")
-                print(f"  不匹配的位置: {[m['index'] for m in mismatches[:5]]}")
-                for m in mismatches[:3]:  # 只显示前3个不匹配
-                    print(f"    位置 {m['index']}: 传入={m['provided']}, 计算={m['calculated']:.1f}, 差异={m['diff']:.1f}")
+                print(f"  不匹配的位置: {direct_mismatches[:5]}")
             else:
-                # 验证通过，可以记录日志（可选）
+                # 直接比较匹配，说明前端传的是"bet to"格式
                 pass
         except Exception as e:
             # 如果验证失败，记录错误但不阻止推理
@@ -850,13 +906,33 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             print(f"   实际动作(前10个): {actual_actions[:10]}", flush=True)
             
             print(f"\n🔍 Solver模型，准备进行位置编码映射: player={player}, dealer_pos={dealer_pos}, num_players={num_players}", flush=True)
-            info_state = map_position_encoding(
-                info_state.squeeze(0),  # 去掉batch维度
-                player,
-                dealer_pos,
-                training_dealer_pos=5,  # 训练时dealer_pos=5
-                num_players=num_players
-            )
+            
+            # ⚠️ 关键修复：禁用位置编码映射！
+            # 
+            # 问题分析：
+            # OpenSpiel的information_state_tensor(player)返回的是：
+            # - 位置编码：values[player] = 1 - "我是player"
+            # - 手牌：HoleCards(player) - 该player的手牌
+            #
+            # 如果我们映射位置编码（比如从Player 0映射到Player 2），但手牌编码保持不变：
+            # - 位置编码：[0,0,1,0,0,0] - "我是Player 2"
+            # - 手牌编码：Player 0的手牌（Th, Ts）
+            # 这是不一致的！模型看到的是"我是Player 2，但我的手牌是Player 0的手牌"
+            #
+            # 正确的做法：
+            # 不应该进行位置编码映射，因为：
+            # 1. OpenSpiel的information_state_tensor已经正确地返回了该player的手牌
+            # 2. 位置编码只是表示"我是player"，不应该改变
+            # 3. 如果模型训练时使用了特定的dealer_pos，那可能是因为训练数据中dealer_pos固定
+            # 4. 但推理时，我们应该相信OpenSpiel的信息状态是正确的
+            # 5. 模型应该能够处理不同dealer位置的情况，因为位置编码表示的是player ID，而不是位置角色
+            #
+            # 如果模型确实需要位置角色信息，应该在训练时使用相对位置特征，而不是绝对位置编码
+            
+            print(f"⚠️ 警告: 已禁用位置编码映射，直接使用OpenSpiel的信息状态", flush=True)
+            print(f"   原因: 位置编码映射会导致位置和手牌不一致，影响模型推理", flush=True)
+            print(f"   位置编码表示'我是player'，不应该改变", flush=True)
+            print(f"   手牌编码是相对于实际player的，不应该映射", flush=True)
             
             with torch.no_grad():
                 logits = model._policy_network(info_state)

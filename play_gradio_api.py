@@ -547,54 +547,85 @@ def extract_state_info_for_api(state, player_id):
         board_cards = [card_string_to_user_index(c) for c in board_cards_str]
     
     # 提取历史动作和下注金额（只包含玩家动作，不包含发牌动作）
+    # 关键修复：直接从OpenSpiel的information_state_tensor中提取action_sizings，
+    # 确保与OpenSpiel的计算方式完全一致（使用"bet to"金额，而不是增量）
     history = state.history()
     action_history = []
     action_sizings = []  # 每次动作的下注金额
-    temp_state = GAME.new_initial_state()
     
-    for action in history:
-        if temp_state.is_chance_node():
-            # 跳过发牌动作（发牌动作的下注金额为0）
-            temp_state.apply_action(action)
-        else:
-            # 记录玩家动作
-            action_id = int(action)
-            action_history.append(action_id)
-            
-            # 获取应用动作前的贡献，用于计算下注金额
-            prev_contributions = get_player_contributions(temp_state)
-            if not prev_contributions:
-                prev_contributions = [0] * GAME.num_players()
-            
-            current_player = temp_state.current_player()
-            prev_contribution = prev_contributions[current_player] if current_player < len(prev_contributions) else 0
-            
-            # 应用动作
-            temp_state.apply_action(action)
-            
-            # 获取应用动作后的贡献
-            new_contributions = get_player_contributions(temp_state)
-            if not new_contributions:
-                new_contributions = [0] * GAME.num_players()
-            
-            new_contribution = new_contributions[current_player] if current_player < len(new_contributions) else 0
-            
-            # 计算下注金额 = 新贡献 - 旧贡献
-            # 注意：OpenSpiel的action_sizings对于Call动作（action_id=1）应该是0
-            # 因为call只是跟注，不增加下注金额（action_sizings存储的是实际下注金额，不是"bet to"金额）
-            if action_id == 1:  # Call/Check
-                bet_amount = 0
-            elif action_id == 0:  # Fold
-                bet_amount = 0
+    # 从information_state_tensor中提取action_sizings（确保与OpenSpiel一致）
+    try:
+        info_state = state.information_state_tensor(player_id)
+        num_players = GAME.num_players()
+        max_game_length = GAME.max_game_length()
+        
+        # 计算action_sizings在tensor中的位置
+        # 格式：玩家位置(6) + 手牌(52) + 公共牌(52) + 动作序列(2*max_game_length) + action_sizings(max_game_length)
+        header_size = num_players + 52 + 52
+        action_seq_size = max_game_length * 2
+        action_sizings_start = header_size + action_seq_size
+        
+        # 提取OpenSpiel计算的所有action_sizings
+        openspiel_all_sizings = info_state[action_sizings_start:action_sizings_start + max_game_length]
+        
+        # 重建临时状态，找出玩家动作在完整历史中的索引
+        temp_state = GAME.new_initial_state()
+        player_action_indices = []  # 记录玩家动作在完整历史中的索引
+        
+        for action in history:
+            if temp_state.is_chance_node():
+                # 跳过chance节点（发牌动作）
+                temp_state.apply_action(action)
             else:
-                # Raise/Bet/All-in: 计算实际下注金额
-                bet_amount = max(0, new_contribution - prev_contribution)
-            
-            # 调试信息
-            if len(action_sizings) < 5:  # 只打印前5个动作
-                print(f"DEBUG action_sizings计算: action_id={action_id}, prev_contribution={prev_contribution}, new_contribution={new_contribution}, bet_amount={bet_amount}")
-            
-            action_sizings.append(bet_amount)
+                # 这是玩家动作，记录索引
+                action_id = int(action)
+                action_history.append(action_id)
+                player_action_indices.append(len(temp_state.history()))
+                temp_state.apply_action(action)
+        
+        # 提取玩家动作对应的OpenSpiel action_sizings
+        for idx in player_action_indices[:len(action_history)]:
+            if idx < len(openspiel_all_sizings):
+                action_sizings.append(float(openspiel_all_sizings[idx]))
+            else:
+                action_sizings.append(0.0)
+        
+        # 调试信息
+        if len(action_sizings) <= 5:
+            print(f"DEBUG action_sizings提取: 从information_state_tensor提取了{len(action_sizings)}个值")
+            for i, (action_id, sizing) in enumerate(zip(action_history[:5], action_sizings[:5])):
+                print(f"  action[{i}]: id={action_id}, sizing={sizing}")
+    
+    except Exception as e:
+        print(f"⚠️ 警告: 无法从information_state_tensor提取action_sizings: {e}")
+        import traceback
+        traceback.print_exc()
+        # Fallback: 使用旧的计算方法（增量方式，可能不准确）
+        # 重新初始化，因为try块可能已经部分填充了action_history
+        action_history = []
+        action_sizings = []
+        temp_state = GAME.new_initial_state()
+        for action in history:
+            if temp_state.is_chance_node():
+                temp_state.apply_action(action)
+            else:
+                action_id = int(action)
+                action_history.append(action_id)
+                prev_contributions = get_player_contributions(temp_state)
+                if not prev_contributions:
+                    prev_contributions = [0] * GAME.num_players()
+                current_player = temp_state.current_player()
+                prev_contribution = prev_contributions[current_player] if current_player < len(prev_contributions) else 0
+                temp_state.apply_action(action)
+                new_contributions = get_player_contributions(temp_state)
+                if not new_contributions:
+                    new_contributions = [0] * GAME.num_players()
+                new_contribution = new_contributions[current_player] if current_player < len(new_contributions) else 0
+                if action_id == 1 or action_id == 0:
+                    bet_amount = 0
+                else:
+                    bet_amount = max(0, new_contribution - prev_contribution)
+                action_sizings.append(bet_amount)
     
     # 提取盲注和筹码（直接从state字符串解析，不计算）
     try:

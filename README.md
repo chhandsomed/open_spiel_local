@@ -10,9 +10,10 @@
 4. [训练](#3-训练-training)
 5. [推理与自对弈](#4-推理与自对弈-inference--self-play)
 6. [模型对比评测](#5-模型对比评测-head-to-head-evaluation)
-7. [交互式对战](#6-交互式对战-interactive-play)
-8. [训练日志分析](#7-训练日志分析-log-analysis)
-9. [文件结构](#8-文件结构)
+7. [API 接口服务](#6-api-接口服务-api-server)
+8. [交互式对战](#7-交互式对战-interactive-play)
+9. [训练日志分析](#8-训练日志分析-log-analysis)
+10. [文件结构](#9-文件结构)
 
 ---
 
@@ -427,7 +428,132 @@ python evaluate_all_checkpoints.py \
 
 ---
 
-## 6. 交互式对战 (Interactive Play)
+## 6. API 接口服务 (API Server)
+
+使用 `api_server.py` 提供 RESTful API 接口，供前后端调用获取推荐动作。
+
+### 安装 API 依赖
+
+```bash
+pip install -r requirements_api.txt
+```
+
+### 启动 API 服务器
+
+```bash
+# 使用 CPU
+python api_server.py --model_dir models/deepcfr_parallel_6p --host 0.0.0.0 --port 5000 --device cpu
+
+# 使用 GPU（如果可用）
+python api_server.py --model_dir models/deepcfr_parallel_6p --host 0.0.0.0 --port 5000 --device cuda
+```
+
+### API 端点
+
+1. **健康检查**: `GET /api/v1/health`
+2. **获取推荐动作**: `POST /api/v1/recommend_action`
+3. **获取动作映射表**: `GET /api/v1/action_mapping`
+
+### 请求格式
+
+```json
+{
+  "player_id": 0,
+  "hole_cards": [0, 12],
+  "board_cards": [13, 26, 39],
+  "action_history": [1, 1, 1, 1],
+  "action_sizings": [0, 0, 0, 0],
+  "blinds": [50, 100, 0, 0, 0, 0],
+  "stacks": [2000, 2000, 2000, 2000, 2000, 2000],
+  "dealer_pos": 5
+}
+```
+
+**关键字段说明**：
+- `player_id` (必需): 当前需要推理的玩家ID（0-5）
+  - **这是OpenSpiel内部的固定座位索引，不会因为Dealer轮转而改变**
+  - Player 0 永远是座位0，Player 1 永远是座位1，以此类推
+  - 但Player 0在不同局中可能扮演不同角色（Dealer/SB/BB/UTG等），这取决于`dealer_pos`
+- `hole_cards` (必需): 当前玩家手牌，支持两种格式：
+  - **数字格式（推荐）**：`[0, 12]` - 0-51的整数，数字已包含花色信息
+    - 花色顺序：方块(Diamond)[0-12] -> 梅花(Clubs)[13-25] -> 红桃(Hearts)[26-38] -> 黑桃(Spade)[39-51]
+  - **传统格式（兼容）**：`["As", "Kh"]` - Rank + Suit 字符串
+- `board_cards` (必需): 公共牌，格式同上
+- `action_history` (必需): 历史动作列表（**只包含玩家动作，不包含发牌动作**）
+- `action_sizings` (可选): 每次动作的下注金额，与`action_history`一一对应
+- `blinds` (可选): 盲注列表，如 `[50, 100, 0, 0, 0, 0]`
+  - 如果传了，必须与`stacks`和`dealer_pos`一起传
+- `stacks` (可选): 当前剩余筹码列表（不是初始筹码）
+  - 如果传了，必须与`blinds`和`dealer_pos`一起传
+- `dealer_pos` (必需，如果传了blinds和stacks): Dealer位置（0-5）
+  - 用于确定当前局中每个座位的角色（Dealer/SB/BB/UTG等）
+  - 如果不传且提供了blinds/stacks，API会返回错误
+
+### 响应格式
+
+```json
+{
+  "success": true,
+  "data": {
+    "recommended_action": 1,
+    "action_probabilities": {"0": 0.05, "1": 0.75, "2": 0.15, "3": 0.05},
+    "legal_actions": [0, 1, 2, 3],
+    "current_player": 0
+  },
+  "error": null
+}
+```
+
+### 测试 API
+
+```bash
+python test_api.py --url http://localhost:5000/api/v1
+```
+
+**详细文档**: 请参考 [API_USAGE.md](API_USAGE.md)
+
+**关键说明**:
+- `action_history` **只包含玩家动作，不包含发牌动作**（系统会自动处理发牌）
+- 动作必须按游戏进行的时间顺序排列
+- 支持数字格式（0-51）和传统格式（"As", "Kh"）的卡牌输入
+- `action_sizings` 可选，如果不传则系统会根据动作ID自动计算下注金额
+- `stacks` 传入的是**当前剩余筹码**，不是初始筹码
+- `dealer_pos` 必需（如果传了blinds和stacks），用于正确计算firstPlayer
+- `player_id` 是固定的座位索引（0-5），不会因为Dealer轮转而改变
+
+---
+
+## 7. 交互式对战 (Interactive Play)
+
+### 7.1 基于API的Gradio界面
+
+使用 `play_gradio_api.py` 提供基于API服务器的Web界面，所有位置的AI动作都通过API服务器获取：
+
+```bash
+# 1. 先启动API服务器（在另一个终端）
+python api_server.py --model_dir models/deepcfr_stable_run --host 0.0.0.0 --port 8819 --device cpu
+
+# 2. 启动Gradio界面
+python play_gradio_api.py
+```
+
+**特性**：
+- 所有6个位置的AI动作都通过API服务器获取
+- 支持动态盲注和筹码配置
+- 实时显示每个位置的API请求和响应（包括Dealer位置）
+- 支持模型动态切换（通过API服务器的reload_model端点）
+- 自动传递位置信息（`dealer_pos`）给API服务器
+
+**配置**：
+- API服务器地址：默认 `http://localhost:8819/api/v1`（可在代码中修改 `API_BASE_URL`）
+- Gradio端口：默认 `8823`（可在 `demo.launch()` 中修改）
+
+**位置信息说明**：
+- `player_id`：OpenSpiel内部的固定座位索引（0-5），不会因为Dealer轮转而改变
+- `dealer_pos`：每局游戏的Dealer位置，用于确定每个座位的角色（Dealer/SB/BB/UTG等）
+- 位置信息会自动从`TOURNAMENT_STATE`获取并传递给API服务器
+
+### 7.2 传统交互式对战
 
 使用 `play_interactive.py` 亲自与训练好的模型对战。
 
@@ -458,7 +584,7 @@ python play_interactive.py \
 
 ---
 
-## 7. 训练日志分析 (Log Analysis)
+## 8. 训练日志分析 (Log Analysis)
 
 使用 `analyze_training.py` 分析训练过程中的指标变化，或对比两次训练的效果。
 
@@ -481,7 +607,7 @@ python analyze_training.py \
 
 ---
 
-## 10. 文件结构
+## 9. 文件结构
 
 ```
 .
@@ -491,6 +617,9 @@ python analyze_training.py \
 ├── evaluate_models_head_to_head.py # 模型对战评测脚本 (支持 checkpoint)
 ├── evaluate_all_checkpoints.py  # 批量评估所有 checkpoint，找出最佳模型
 ├── play_interactive.py          # 人机交互对战脚本 (支持 checkpoint)
+├── api_server.py                # API 服务器 (提供 RESTful 接口)
+├── test_api.py                  # API 测试脚本
+├── API_USAGE.md                 # API 使用文档
 ├── analyze_training.py          # 训练日志分析与对比脚本
 ├── deep_cfr_simple_feature.py   # 策略网络特征提取模块 (支持多 GPU)
 ├── deep_cfr_with_feature_transform.py # 复杂特征转换模块 (支持多 GPU)
@@ -506,7 +635,7 @@ python analyze_training.py \
 │       └── *_history.json       # 训练日志
 └── train_texas_holdem_mccfr.py  # MCCFR 训练脚本
 
-## 11. 附录：DeepCFR 网络结构说明
+## 10. 附录：DeepCFR 网络结构说明
 
 DeepCFR 包含两种类型的神经网络，它们作用不同：
 

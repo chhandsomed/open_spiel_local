@@ -1,0 +1,25 @@
+Traceback (most recent call last):
+  File "/home/ch/work/texas_hold/open_spiel_local/api_server.py", line 22, in <module>
+    from open_spiel.python.games import pokerkit_wrapper  # noqa: F401
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ch/work/texas_hold/open_spiel_local/open_spiel/python/games/__init__.py", line 41, in <module>
+    from open_spiel.python.games import pokerkit_wrapper
+  File "/home/ch/work/texas_hold/open_spiel_local/open_spiel/python/games/pokerkit_wrapper.py", line 41, in <module>
+    import pokerkit
+  File "/home/ch/anaconda_env/envs/open_spiel/lib/python3.11/site-packages/pokerkit/__init__.py", line 121, in <module>
+    from pokerkit.analysis import (
+  File "/home/ch/anaconda_env/envs/open_spiel/lib/python3.11/site-packages/pokerkit/analysis.py", line 26, in <module>
+    from pokerkit.hands import Hand
+  File "/home/ch/anaconda_env/envs/open_spiel/lib/python3.11/site-packages/pokerkit/hands.py", line 408, in <module>
+    class RegularLowHand(CombinationHand):
+  File "/home/ch/anaconda_env/envs/open_spiel/lib/python3.11/site-packages/pokerkit/hands.py", line 430, in RegularLowHand
+    lookup = RegularLookup()
+             ^^^^^^^^^^^^^^^
+  File "<string>", line 4, in __init__
+  File "/home/ch/anaconda_env/envs/open_spiel/lib/python3.11/site-packages/pokerkit/lookups.py", line 159, in __post_init__
+    self.__reset_ranks()
+  File "/home/ch/anaconda_env/envs/open_spiel/lib/python3.11/site-packages/pokerkit/lookups.py", line 175, in __reset_ranks
+    self.__entries[key] = replace(
+                          ^^^^^^^^
+  File "/home/ch/anaconda_env/envs/open_spiel/lib/python3.11/dataclasses.py", line -1, in replace
+KeyboardInterrupt

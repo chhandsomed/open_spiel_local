@@ -9,18 +9,14 @@ import re
 import sys
 import glob
 import math
+import requests
 from collections import Counter
 
 # 添加当前目录到 path 以导入本地模块
 sys.path.append(os.getcwd())
 
-# 尝试导入模型类
-from deep_cfr_simple_feature import DeepCFRSimpleFeature, SimpleFeatureMLP
-try:
-    from deep_cfr_with_feature_transform import DeepCFRWithFeatureTransform
-except ImportError:
-    pass
-from open_spiel.python.pytorch.deep_cfr import MLP
+# API服务器配置
+API_BASE_URL = "http://localhost:8819/api/v1"
 
 # ==========================================
 # 0. 牌型评估工具 (简化版)
@@ -154,7 +150,8 @@ def strip_ansi(text):
 # 1. 配置与模型加载
 # ==========================================
 
-MODEL_DIR = "models/deepcfr_stable_run/checkpoints/iter_31000"
+# API模式：不需要加载模型
+MODEL_DIR = None
 DEVICE = "cpu"
 
 def load_model(model_dir, num_players=None, device='cpu'):
@@ -347,8 +344,8 @@ def load_game_with_config(stacks=None, dealer_pos=5):
     global GAME, CONFIG
     
     if CONFIG is None:
-        # 尝试先加载默认模型配置
-        _, _, CONFIG = load_model(MODEL_DIR, device=DEVICE)
+        # API模式：使用默认配置
+        CONFIG = {'num_players': 6, 'betting_abstraction': 'fchpa'}
         
     num_players = CONFIG.get('num_players', 6)
     
@@ -414,12 +411,16 @@ def load_game_with_config(stacks=None, dealer_pos=5):
     return GAME
 
 
-# 全局加载
+# 全局加载（API模式：只需要游戏配置，不需要模型）
 try:
-    GAME, MODEL, CONFIG = load_model(MODEL_DIR, device=DEVICE)
-    print("Global model loaded.")
+    # 创建一个临时游戏来获取配置
+    temp_game = pyspiel.load_game("universal_poker(numPlayers=6,numRounds=4,blind=50 100 0 0 0 0,stack=2000 2000 2000 2000 2000 2000,numHoleCards=2,numBoardCards=0 3 1 1,firstPlayer=3 1 1 1,numSuits=4,numRanks=13,bettingAbstraction=fchpa)")
+    GAME = temp_game
+    CONFIG = {'num_players': 6, 'betting_abstraction': 'fchpa'}
+    MODEL = None  # API模式不需要模型
+    print("Game loaded for API mode.")
 except Exception as e:
-    print(f"Error loading global model: {e}")
+    print(f"Error loading game: {e}")
     GAME, MODEL, CONFIG = None, None, None
 
 
@@ -427,48 +428,348 @@ except Exception as e:
 # 2. 游戏逻辑
 # ==========================================
 
+def convert_openspiel_to_user_card(openspiel_index):
+    """将OpenSpiel的card index转换为用户格式（0-51）
+    
+    OpenSpiel格式：Diamonds(0-12), Spades(13-25), Hearts(26-38), Clubs(39-51)
+    用户格式：Diamonds(0-12), Clubs(13-25), Hearts(26-38), Spades(39-51)
+    
+    Args:
+        openspiel_index: OpenSpiel的card index (0-51)
+    
+    Returns:
+        用户格式的card index (0-51)
+    """
+    if openspiel_index < 0 or openspiel_index > 51:
+        raise ValueError(f"Invalid OpenSpiel card index: {openspiel_index}")
+    
+    if 0 <= openspiel_index <= 12:
+        # Diamonds：不变
+        return openspiel_index  # 0-12
+    elif 13 <= openspiel_index <= 25:
+        # OpenSpiel Spades -> 用户 Spades (39-51)
+        rank = openspiel_index - 13
+        return 39 + rank  # 39-51
+    elif 26 <= openspiel_index <= 38:
+        # Hearts：不变
+        return openspiel_index  # 26-38
+    elif 39 <= openspiel_index <= 51:
+        # OpenSpiel Clubs -> 用户 Clubs (13-25)
+        rank = openspiel_index - 39
+        return 13 + rank  # 13-25
+    else:
+        raise ValueError(f"Invalid OpenSpiel card index: {openspiel_index}")
+
+
+def card_string_to_user_index(card_str):
+    """将卡牌字符串转换为用户格式的card index (0-51)
+    
+    支持传统格式如 "As", "Kh", "2d", "Tc"
+    转换为用户格式：Diamonds(0-12), Clubs(13-25), Hearts(26-38), Spades(39-51)
+    """
+    if len(card_str) < 2:
+        raise ValueError(f"Invalid card string: {card_str}")
+    
+    rank_char = card_str[0].upper()
+    suit_char = card_str[1].lower()
+    
+    # 转换rank: 2~JQKA 对应 0~12
+    rank_names = {
+        '2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5,
+        '8': 6, '9': 7, 'T': 8, 'X': 8,  # T和X都表示10
+        'J': 9, 'Q': 10, 'K': 11, 'A': 12
+    }
+    
+    if rank_char not in rank_names:
+        raise ValueError(f"Invalid rank: {rank_char}")
+    
+    rank = rank_names[rank_char]
+    
+    # 用户格式的花色顺序：Diamonds(0-12), Clubs(13-25), Hearts(26-38), Spades(39-51)
+    suit_map = {
+        'd': 0,  # Diamonds
+        'c': 1,  # Clubs
+        'h': 2,  # Hearts
+        's': 3   # Spades
+    }
+    
+    if suit_char not in suit_map:
+        raise ValueError(f"Invalid suit: {suit_char}")
+    
+    suit = suit_map[suit_char]
+    
+    return suit * 13 + rank
+
+
+def extract_state_info_for_api(state, player_id):
+    """从state中提取API调用所需的信息（转换为用户格式：0-51数字）"""
+    # 提取当前玩家的手牌（从state_struct获取，更准确）
+    state_str = strip_ansi(str(state))
+    hole_cards = []
+    
+    try:
+        state_struct = state.to_struct()
+        player_hands = getattr(state_struct, 'player_hands', [])
+        if player_id < len(player_hands):
+            # player_hands是字符串格式，如 "AsKh"，需要转换为用户格式
+            hand_str = player_hands[player_id]
+            if hand_str:
+                # 每2个字符一张牌，转换为用户格式
+                for i in range(0, len(hand_str), 2):
+                    card_str = hand_str[i:i+2]
+                    # 转换为用户格式的数字
+                    user_idx = card_string_to_user_index(card_str)
+                    hole_cards.append(user_idx)
+    except Exception as e:
+        print(f"Warning: Failed to extract hole cards from state_struct: {e}")
+        # Fallback: 从state_str解析
+        _, hole_cards_str = get_cards_from_state(state_str, player_id)
+        # 将字符串格式转换为用户格式的数字
+        hole_cards = [card_string_to_user_index(c) for c in hole_cards_str]
+    
+    # 提取公共牌
+    board_cards = []
+    try:
+        state_struct = state.to_struct()
+        board_cards_str = getattr(state_struct, 'board_cards', '')
+        if board_cards_str:
+            # board_cards是字符串格式，如 "2d3c4h"，需要转换为用户格式
+            for i in range(0, len(board_cards_str), 2):
+                card_str = board_cards_str[i:i+2]
+                # 转换为用户格式的数字
+                user_idx = card_string_to_user_index(card_str)
+                board_cards.append(user_idx)
+    except Exception as e:
+        print(f"Warning: Failed to extract board cards from state_struct: {e}")
+        # Fallback: 从state_str解析
+        board_cards_str, _ = get_cards_from_state(state_str)
+        # 将字符串格式转换为用户格式的数字
+        board_cards = [card_string_to_user_index(c) for c in board_cards_str]
+    
+    # 提取历史动作和下注金额（只包含玩家动作，不包含发牌动作）
+    history = state.history()
+    action_history = []
+    action_sizings = []  # 每次动作的下注金额
+    temp_state = GAME.new_initial_state()
+    
+    for action in history:
+        if temp_state.is_chance_node():
+            # 跳过发牌动作（发牌动作的下注金额为0）
+            temp_state.apply_action(action)
+        else:
+            # 记录玩家动作
+            action_id = int(action)
+            action_history.append(action_id)
+            
+            # 获取应用动作前的贡献，用于计算下注金额
+            prev_contributions = get_player_contributions(temp_state)
+            if not prev_contributions:
+                prev_contributions = [0] * GAME.num_players()
+            
+            current_player = temp_state.current_player()
+            prev_contribution = prev_contributions[current_player] if current_player < len(prev_contributions) else 0
+            
+            # 应用动作
+            temp_state.apply_action(action)
+            
+            # 获取应用动作后的贡献
+            new_contributions = get_player_contributions(temp_state)
+            if not new_contributions:
+                new_contributions = [0] * GAME.num_players()
+            
+            new_contribution = new_contributions[current_player] if current_player < len(new_contributions) else 0
+            
+            # 计算下注金额 = 新贡献 - 旧贡献
+            # 注意：OpenSpiel的action_sizings对于Call动作（action_id=1）应该是0
+            # 因为call只是跟注，不增加下注金额（action_sizings存储的是实际下注金额，不是"bet to"金额）
+            if action_id == 1:  # Call/Check
+                bet_amount = 0
+            elif action_id == 0:  # Fold
+                bet_amount = 0
+            else:
+                # Raise/Bet/All-in: 计算实际下注金额
+                bet_amount = max(0, new_contribution - prev_contribution)
+            
+            # 调试信息
+            if len(action_sizings) < 5:  # 只打印前5个动作
+                print(f"DEBUG action_sizings计算: action_id={action_id}, prev_contribution={prev_contribution}, new_contribution={new_contribution}, bet_amount={bet_amount}")
+            
+            action_sizings.append(bet_amount)
+    
+    # 提取盲注和筹码（直接从state字符串解析，不计算）
+    try:
+        state_struct = state.to_struct()
+        blinds = list(getattr(state_struct, 'blinds', [50, 100, 0, 0, 0, 0]))
+        
+        # 直接从state字符串解析Money字段（这是当前剩余筹码）
+        # Money: 1950 2000 1900 ...
+        money_match = re.search(r'Money:\s*([\d\s]+)', state_str)
+        if money_match:
+            stacks = [int(x) for x in money_match.group(1).strip().split()]
+        else:
+            # Fallback: 使用starting_stacks
+            starting_stacks = list(getattr(state_struct, 'starting_stacks', [2000] * GAME.num_players()))
+            stacks = list(starting_stacks)
+        
+        # 确保长度正确
+        num_players = GAME.num_players()
+        if len(blinds) != num_players:
+            blinds = [50, 100] + [0] * (num_players - 2)
+        if len(stacks) != num_players:
+            stacks = [2000] * num_players
+    except Exception as e:
+        print(f"Error extracting blinds/stacks: {e}")
+        import traceback
+        traceback.print_exc()
+        num_players = GAME.num_players()
+        blinds = [50, 100] + [0] * (num_players - 2)
+        stacks = [2000] * num_players
+    
+    # 从TOURNAMENT_STATE获取Dealer位置（不再推断）
+    dealer_pos = TOURNAMENT_STATE.get('dealer_pos', 5)  # 默认值5
+    
+    return {
+        'hole_cards': hole_cards,
+        'board_cards': board_cards,
+        'action_history': action_history,
+        'action_sizings': action_sizings,  # 每次动作的下注金额
+        'blinds': blinds,
+        'stacks': stacks,
+        'dealer_pos': dealer_pos  # Dealer位置（从TOURNAMENT_STATE获取）
+    }
+
+def get_ai_action_from_api(state, player_id):
+    """通过API获取AI动作"""
+    try:
+        # 提取状态信息
+        state_info = extract_state_info_for_api(state, player_id)
+        
+        # 调用API
+        request_data = {
+            "player_id": player_id,  # OpenSpiel内部的固定座位索引（0-5）
+            "hole_cards": state_info['hole_cards'],
+            "board_cards": state_info['board_cards'],
+            "action_history": state_info['action_history'],
+            "action_sizings": state_info['action_sizings'],  # 每次动作的下注金额
+            "blinds": state_info['blinds'],
+            "stacks": state_info['stacks'],
+            "dealer_pos": state_info.get('dealer_pos'),  # Dealer位置（用于正确计算firstPlayer）
+            "seed": None  # 不需要固定种子
+        }
+        
+        # 打印请求信息
+        print(f"\n{'='*70}")
+        print(f"📍 Player {player_id} API请求:")
+        print(f"{'='*70}")
+        print(f"  手牌: {request_data['hole_cards']}")
+        print(f"  公共牌: {request_data['board_cards']}")
+        print(f"  历史动作: {request_data['action_history']}")
+        print(f"  动作下注金额: {request_data['action_sizings']}")
+        print(f"  盲注: {request_data['blinds']}")
+        print(f"  筹码: {request_data['stacks']}")
+        print(f"  Dealer位置: {request_data['dealer_pos']}")
+        print(f"  请求URL: {API_BASE_URL}/recommend_action")
+        
+        response = requests.post(
+            f"{API_BASE_URL}/recommend_action",
+            json=request_data,
+            timeout=5
+        )
+        
+        # 打印响应信息
+        print(f"\n📥 Player {player_id} API响应:")
+        print(f"  状态码: {response.status_code}")
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('success'):
+                recommended_action = result['data']['recommended_action']
+                action_probs = result['data']['action_probabilities']
+                legal_actions = result['data']['legal_actions']
+                
+                print(f"  推荐动作: {recommended_action}")
+                print(f"  动作概率分布:")
+                for action_id, prob in sorted(action_probs.items(), key=lambda x: int(x[0])):
+                    action_name = {
+                        '0': 'Fold',
+                        '1': 'Call/Check',
+                        '2': 'Pot',
+                        '3': 'All-in',
+                        '4': 'Half-Pot'
+                    }.get(action_id, f'Action_{action_id}')
+                    print(f"    {action_id} ({action_name}): {prob:.4f}")
+                print(f"  合法动作: {legal_actions}")
+                
+                # 验证API返回的legal_actions是否与当前状态的legal_actions一致
+                current_legal_actions = state.legal_actions()
+                api_legal_actions_set = set(legal_actions)
+                current_legal_actions_set = set(current_legal_actions)
+                
+                if api_legal_actions_set != current_legal_actions_set:
+                    print(f"  ⚠️ 警告: API返回的合法动作 {legal_actions} 与当前状态的合法动作 {current_legal_actions} 不一致")
+                    print(f"  使用当前状态的合法动作: {current_legal_actions}")
+                    # 使用当前状态的合法动作
+                    legal_actions = current_legal_actions
+                
+                # 验证推荐动作是否合法
+                if recommended_action not in legal_actions:
+                    print(f"  ⚠️ 警告: API返回的推荐动作 {recommended_action} 不在合法动作列表中，使用第一个合法动作")
+                    action = legal_actions[0] if legal_actions else recommended_action
+                else:
+                    # 根据概率分布采样（而不是直接使用推荐动作，增加随机性）
+                    probs = [action_probs.get(str(a), 0.0) for a in legal_actions]
+                    
+                    if sum(probs) > 0:
+                        probs = np.array(probs) / sum(probs)
+                        action = np.random.choice(legal_actions, p=probs)
+                    else:
+                        action = recommended_action
+                
+                # 最终验证动作是否合法
+                if action not in current_legal_actions:
+                    print(f"  ⚠️ 警告: 选择的动作 {action} 不在当前状态的合法动作列表中，使用第一个合法动作")
+                    action = current_legal_actions[0] if current_legal_actions else recommended_action
+                
+                print(f"  最终选择动作: {action}")
+                print(f"{'='*70}\n")
+                
+                return action
+            else:
+                print(f"  ❌ API错误: {result.get('error')}")
+                print(f"{'='*70}\n")
+        else:
+            print(f"  ❌ HTTP错误: {response.status_code}")
+            try:
+                error_text = response.text
+                print(f"  错误详情: {error_text[:200]}")
+            except:
+                pass
+            print(f"{'='*70}\n")
+    except Exception as e:
+        print(f"\n❌ Player {player_id} API调用异常:")
+        print(f"  错误: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"{'='*70}\n")
+    
+    # Fallback: 随机选择合法动作
+    legal_actions = state.legal_actions()
+    if legal_actions:
+        fallback_action = np.random.choice(legal_actions)
+        print(f"⚠️ Player {player_id} 使用Fallback动作: {fallback_action}\n")
+        return fallback_action
+    return None
+
 def get_ai_action(state, model):
-    """获取 AI 动作"""
+    """获取 AI 动作（API模式：通过API调用）"""
     player = state.current_player()
     legal_actions = state.legal_actions()
     
     if not legal_actions:
         return None
     
-    # Check if model is a solver with action_probabilities
-    if hasattr(model, 'action_probabilities'):
-        probs_dict = model.action_probabilities(state, player)
-        actions = list(probs_dict.keys())
-        probs = list(probs_dict.values())
-        if sum(probs) > 0:
-            probs = np.array(probs) / sum(probs)
-            # Sample or greedy? Let's do weighted sample for variety, or greedy for strength
-            # Using argmax for "best" move
-            # best_idx = np.argmax(probs)
-            # action = actions[best_idx]
-            
-            # Using random sample based on probs
-            action = np.random.choice(actions, p=probs)
-        else:
-            action = np.random.choice(actions)
-        return action
-    
-    # Standard Network
-    info_state = torch.FloatTensor(state.information_state_tensor(player)).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        logits = model(info_state)
-        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-    
-    legal_probs = np.zeros_like(probs)
-    legal_probs[legal_actions] = probs[legal_actions]
-    
-    if legal_probs.sum() > 0:
-        legal_probs /= legal_probs.sum()
-        action = np.random.choice(len(legal_probs), p=legal_probs)
-    else:
-        action = np.random.choice(legal_actions)
-        
-    return action
+    # API模式：通过API获取动作
+    return get_ai_action_from_api(state, player)
 
 def get_cards_from_state(state_str, player_idx=None):
     """从状态字符串中提取公共牌和手牌"""
@@ -641,30 +942,78 @@ def run_game_step(history, user_action=None, user_seat=0):
                 prev_board_count = total_board_count
                 pending_deal_cards = []
 
-            # 在返回前计算当前每个动作的概率，以便在UI显示
+            # 在返回前计算当前每个动作的概率，以便在UI显示（API模式）
             action_probs = {}
             try:
-                # 使用全局模型计算
-                # 这里有点 hack，因为 MODEL 是全局变量
-                # 但为了正确性，我们应该在这里算
-                if 'MODEL' in globals() and MODEL is not None:
-                    legal_actions = state.legal_actions()
-                    player = state.current_player()
-                    
-                    if hasattr(MODEL, 'action_probabilities'):
-                        probs_dict = MODEL.action_probabilities(state, player)
-                        action_probs = probs_dict
-                    else:
-                        # Standard Network
-                        info_state = torch.FloatTensor(state.information_state_tensor(player)).unsqueeze(0).to(DEVICE)
-                        with torch.no_grad():
-                            logits = MODEL(info_state)
-                            probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                legal_actions = state.legal_actions()
+                player = state.current_player()
+                
+                # 通过API获取状态概率（用户回合）
+                state_info = extract_state_info_for_api(state, player)
+                request_data = {
+                    "player_id": player,  # OpenSpiel内部的固定座位索引（0-5）
+                    "hole_cards": state_info['hole_cards'],
+                    "board_cards": state_info['board_cards'],
+                    "action_history": state_info['action_history'],
+                    "action_sizings": state_info['action_sizings'],  # 每次动作的下注金额
+                    "blinds": state_info['blinds'],
+                    "stacks": state_info['stacks'],
+                    "dealer_pos": state_info.get('dealer_pos')  # Dealer位置（用于正确计算firstPlayer）
+                }
+                
+                # 打印用户回合的请求
+                print(f"\n{'='*70}")
+                print(f"👤 User (Player {player}) API请求 - 获取动作概率:")
+                print(f"{'='*70}")
+                print(f"  手牌: {request_data['hole_cards']}")
+                print(f"  公共牌: {request_data['board_cards']}")
+                print(f"  历史动作: {request_data['action_history']}")
+                print(f"  动作下注金额: {request_data['action_sizings']}")
+                print(f"  盲注: {request_data['blinds']}")
+                print(f"  筹码: {request_data['stacks']}")
+                print(f"  Dealer位置: {request_data['dealer_pos']}")
+                
+                response = requests.post(
+                    f"{API_BASE_URL}/recommend_action",
+                    json=request_data,
+                    timeout=5
+                )
+                
+                print(f"\n📥 User (Player {player}) API响应:")
+                print(f"  状态码: {response.status_code}")
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get('success'):
+                        api_probs = result['data']['action_probabilities']
+                        recommended_action = result['data']['recommended_action']
+                        
+                        print(f"  推荐动作: {recommended_action}")
+                        print(f"  动作概率分布:")
+                        for action_id, prob in sorted(api_probs.items(), key=lambda x: int(x[0])):
+                            action_name = {
+                                '0': 'Fold',
+                                '1': 'Call/Check',
+                                '2': 'Pot',
+                                '3': 'All-in',
+                                '4': 'Half-Pot'
+                            }.get(action_id, f'Action_{action_id}')
+                            print(f"    {action_id} ({action_name}): {prob:.4f}")
                         
                         for a in legal_actions:
-                            action_probs[a] = float(probs[a])
+                            action_probs[a] = api_probs.get(str(a), 0.0)
+                        print(f"{'='*70}\n")
+                    else:
+                        print(f"  ❌ API错误: {result.get('error')}")
+                        print(f"{'='*70}\n")
+                else:
+                    print(f"  ❌ HTTP错误: {response.status_code}")
+                    print(f"{'='*70}\n")
             except Exception as ex:
-                print(f"Error calculating probs: {ex}")
+                print(f"❌ Error calculating probs from API: {ex}")
+                import traceback
+                traceback.print_exc()
+                print(f"{'='*70}\n")
 
             return history, state, logs, True, folded_players, action_probs
             
@@ -684,7 +1033,17 @@ def run_game_step(history, user_action=None, user_seat=0):
                 prev_board_count = total_board_count
                 pending_deal_cards = []
             
-            action = get_ai_action(state, MODEL)
+            action = get_ai_action(state, None)  # API模式：不需要model参数
+            
+            # 验证动作是否合法
+            legal_actions = state.legal_actions()
+            if action not in legal_actions:
+                print(f"⚠️ 错误: 动作 {action} 不在合法动作列表中: {legal_actions}")
+                print(f"  当前玩家: {current_player}, 当前状态: {str(state)[:200]}")
+                # 使用第一个合法动作作为fallback
+                action = legal_actions[0] if legal_actions else action
+                print(f"  使用fallback动作: {action}")
+            
             act_str = state.action_to_string(current_player, action)
             # 移除 "Player X" 前缀和 "move="
             act_str = re.sub(r'Player \d+', '', act_str).strip()
@@ -695,9 +1054,29 @@ def run_game_step(history, user_action=None, user_seat=0):
             
             if "Fold" in act_str:
                 folded_players.add(current_player)
-                
-            state.apply_action(action)
-            history.append(action)
+            
+            try:
+                state.apply_action(action)
+                history.append(action)
+            except Exception as e:
+                print(f"❌ 应用动作失败: action={action}, legal_actions={legal_actions}")
+                print(f"  错误: {e}")
+                print(f"  当前状态: {str(state)[:500]}")
+                import traceback
+                traceback.print_exc()
+                # 尝试使用第一个合法动作
+                if legal_actions:
+                    fallback_action = legal_actions[0]
+                    print(f"  尝试使用fallback动作: {fallback_action}")
+                    try:
+                        state.apply_action(fallback_action)
+                        history.append(fallback_action)
+                        logs.append(f"⚠️ {p_name}: 使用fallback动作 {fallback_action}")
+                    except Exception as e2:
+                        print(f"❌ Fallback动作也失败: {e2}")
+                        raise
+                else:
+                    raise
 
     # 游戏结束
     # 处理剩余的 pending cards
@@ -1484,7 +1863,7 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
 
 def start_new_game():
     if GAME is None:
-        return [], None, "<h1>❌ 模型加载失败</h1>", "", gr.update(choices=[], value=None, interactive=False), gr.update(interactive=False), gr.update(visible=False), ""
+        return [], None, "<h1>❌ 游戏加载失败或API服务器未连接</h1>", "", gr.update(choices=[], value=None, interactive=False), gr.update(interactive=False), gr.update(visible=False), ""
     
     # 重置锦标赛状态
     num_players = CONFIG['num_players']
@@ -1691,7 +2070,8 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
     # style_injector 必须是 visible=True (默认)，否则内部的 <style> 标签可能不会被渲染到 DOM 中
     style_injector = gr.HTML()
 
-    gr.Markdown("# 🃏 德州扑克人机对战 (6人局)")
+    gr.Markdown("# 🃏 德州扑克人机对战 (6人局) - API模式")
+    gr.Markdown(f"**API服务器**: {API_BASE_URL}")
     
     history_state = gr.State([])
     
@@ -1730,10 +2110,11 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
             # 游戏日志
             game_log = gr.Textbox(label="游戏日志", lines=20, max_lines=30)
             
-            gr.Markdown("""
+            gr.Markdown(f"""
             ### ℹ️ 说明
             - 您是 **Player 0**
-            - 5 个 AI 对手 (DeepCFR)
+            - 5 个 AI 对手（通过API服务器推理）
+            - API服务器: {API_BASE_URL}
             """)
 
     # 绑定 Radio 点击事件直接提交
@@ -1761,5 +2142,5 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
 if __name__ == "__main__":
     print(f"Starting Gradio...")
     demo.queue(max_size=32)
-    demo.launch(server_name="0.0.0.0", server_port=8827)
+    demo.launch(server_name="0.0.0.0", server_port=8823)
 

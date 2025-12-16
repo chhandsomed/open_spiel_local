@@ -504,22 +504,69 @@ python api_server.py --model_dir models/deepcfr_parallel_6p --host 0.0.0.0 --por
 }
 ```
 
-### 测试 API
+### 动作映射
 
-```bash
-python test_api.py --url http://localhost:5000/api/v1
+**fchpa抽象**（5个动作）：
+- `0`: Fold（弃牌）
+- `1`: Call/Check（跟注/过牌）
+- `2`: Pot（加注到当前底池大小）
+- `3`: All-in（全押）
+- `4`: Half-Pot（加注到当前底池的一半）
+
+### 使用示例
+
+**Python调用示例**：
+```python
+import requests
+
+url = "http://localhost:5000/api/v1/recommend_action"
+data = {
+    "player_id": 0,
+    "hole_cards": ["As", "Kh"],  # 或使用数字格式 [51, 38]
+    "board_cards": ["2d", "3c", "4h"],  # 或使用数字格式 [0, 13, 26]
+    "action_history": [1, 1, 2],
+    "action_sizings": [0, 0, 100],
+    "blinds": [50, 100, 0, 0, 0, 0],
+    "stacks": [2000, 2000, 2000, 2000, 2000, 2000],
+    "dealer_pos": 5
+}
+
+response = requests.post(url, json=data)
+result = response.json()
 ```
 
-**详细文档**: 请参考 [API_USAGE.md](API_USAGE.md)
+### 并发请求
 
-**关键说明**:
+**重要**：为了确保并发安全，**建议总是传递`blinds`和`stacks`参数**。这样每次请求都会创建新的游戏实例，完全隔离。
+
+**测试并发**：
+```bash
+python test_concurrent_api.py
+```
+
+### 工作流程
+
+API的工作流程：
+1. **创建游戏实例**：根据`blinds`、`stacks`、`dealer_pos`创建游戏
+2. **发牌**：根据`hole_cards`和`board_cards`的数量自动发牌
+3. **应用历史动作**：按照`action_history`顺序应用，重建到当前状态
+4. **动作推荐**：基于重建的状态进行AI推理
+
+**详细工作流程**：请参考 [API_WORKFLOW_SUMMARY.md](API_WORKFLOW_SUMMARY.md)
+
+### 关键说明
+
 - `action_history` **只包含玩家动作，不包含发牌动作**（系统会自动处理发牌）
 - 动作必须按游戏进行的时间顺序排列
 - 支持数字格式（0-51）和传统格式（"As", "Kh"）的卡牌输入
 - `action_sizings` 可选，如果不传则系统会根据动作ID自动计算下注金额
 - `stacks` 传入的是**当前剩余筹码**，不是初始筹码
-- `dealer_pos` 必需（如果传了blinds和stacks），用于正确计算firstPlayer
+- `dealer_pos` 必需（如果传了blinds和stacks），用于正确计算firstPlayer和行动顺序
 - `player_id` 是固定的座位索引（0-5），不会因为Dealer轮转而改变
+- **位置角色计算**：`(player_id - dealer_pos) % num_players` 确定角色（BTN/SB/BB/UTG/MP/CO）
+- **位置编码映射**：
+  - Solver模型：位置编码映射已禁用，`dealer_pos`参数会被忽略
+  - Standard Network：如果提供`dealer_pos`，会进行位置编码映射以匹配训练配置
 
 ---
 

@@ -333,9 +333,9 @@ def load_model(model_dir, num_players=None, device='cpu'):
 
 # 全局变量来管理锦标赛状态
 TOURNAMENT_STATE = {
-    "stacks": None,  # [2000, 2000, ...]
-    "dealer_pos": 5, # 默认 Dealer=5 (P0=SB)
-    "blinds": [50, 100],
+    "stacks": None,  # [50000, 50000, ...] for 5p, [2000, 2000, ...] for 6p
+    "dealer_pos": 4, # 默认 Dealer=4 (5人场: P0=SB, P1=BB, P2=UTG, P3=MP, P4=BTN)
+    "blinds": [100, 200],  # 5人场盲注
     "game_config": None
 }
 
@@ -344,14 +344,19 @@ def load_game_with_config(stacks=None, dealer_pos=5):
     global GAME, CONFIG
     
     if CONFIG is None:
-        # API模式：使用默认配置
-        CONFIG = {'num_players': 6, 'betting_abstraction': 'fchpa'}
+        # API模式：使用默认配置（5人场）
+        CONFIG = {'num_players': 5, 'betting_abstraction': 'fchpa'}
         
-    num_players = CONFIG.get('num_players', 6)
+    num_players = CONFIG.get('num_players', 5)
     
-    # 默认筹码
+    # 默认筹码（根据玩家数量）
     if stacks is None:
-        stacks = [2000] * num_players
+        if num_players == 5:
+            stacks = [50000] * 5
+        elif num_players == 6:
+            stacks = [2000] * 6
+        else:
+            stacks = [2000] * num_players
         
     # 构造 blind 字符串
     blinds = [0] * num_players
@@ -376,8 +381,13 @@ def load_game_with_config(stacks=None, dealer_pos=5):
         bb_pos = (dealer_pos + 2) % num_players
         utg_pos = (dealer_pos + 3) % num_players
         
-        blinds[sb_pos] = 50
-        blinds[bb_pos] = 100
+        # 根据玩家数量设置盲注
+        if num_players == 5:
+            blinds[sb_pos] = 100
+            blinds[bb_pos] = 200
+        else:
+            blinds[sb_pos] = 50
+            blinds[bb_pos] = 100
         
         # Preflop: UTG starts. Postflop: SB starts.
         first_players = [utg_pos + 1] + [sb_pos + 1] * 3
@@ -413,12 +423,13 @@ def load_game_with_config(stacks=None, dealer_pos=5):
 
 # 全局加载（API模式：只需要游戏配置，不需要模型）
 try:
-    # 创建一个临时游戏来获取配置
-    temp_game = pyspiel.load_game("universal_poker(numPlayers=6,numRounds=4,blind=50 100 0 0 0 0,stack=2000 2000 2000 2000 2000 2000,numHoleCards=2,numBoardCards=0 3 1 1,firstPlayer=3 1 1 1,numSuits=4,numRanks=13,bettingAbstraction=fchpa)")
+    # 创建一个临时游戏来获取配置（5人场）
+    # dealer_pos=4 (BTN), UTG=Player 2, firstPlayer=3 (1-based indexing)
+    temp_game = pyspiel.load_game("universal_poker(numPlayers=5,numRounds=4,blind=100 200 0 0 0,stack=50000 50000 50000 50000 50000,numHoleCards=2,numBoardCards=0 3 1 1,firstPlayer=3 1 1 1,numSuits=4,numRanks=13,bettingAbstraction=fchpa)")
     GAME = temp_game
-    CONFIG = {'num_players': 6, 'betting_abstraction': 'fchpa'}
+    CONFIG = {'num_players': 5, 'betting_abstraction': 'fchpa'}
     MODEL = None  # API模式不需要模型
-    print("Game loaded for API mode.")
+    print("Game loaded for API mode (5 players).")
 except Exception as e:
     print(f"Error loading game: {e}")
     GAME, MODEL, CONFIG = None, None, None
@@ -630,7 +641,20 @@ def extract_state_info_for_api(state, player_id):
     # 提取盲注和筹码（直接从state字符串解析，不计算）
     try:
         state_struct = state.to_struct()
-        blinds = list(getattr(state_struct, 'blinds', [50, 100, 0, 0, 0, 0]))
+        num_players = GAME.num_players()
+        
+        # 根据玩家数量设置默认盲注和筹码
+        if num_players == 5:
+            default_blinds = [100, 200, 0, 0, 0]
+            default_stacks = [50000] * 5
+        elif num_players == 6:
+            default_blinds = [50, 100, 0, 0, 0, 0]
+            default_stacks = [2000] * 6
+        else:
+            default_blinds = [50, 100] + [0] * (num_players - 2)
+            default_stacks = [2000] * num_players
+        
+        blinds = list(getattr(state_struct, 'blinds', default_blinds))
         
         # 直接从state字符串解析Money字段（这是当前剩余筹码）
         # Money: 1950 2000 1900 ...
@@ -639,25 +663,41 @@ def extract_state_info_for_api(state, player_id):
             stacks = [int(x) for x in money_match.group(1).strip().split()]
         else:
             # Fallback: 使用starting_stacks
-            starting_stacks = list(getattr(state_struct, 'starting_stacks', [2000] * GAME.num_players()))
+            starting_stacks = list(getattr(state_struct, 'starting_stacks', default_stacks))
             stacks = list(starting_stacks)
         
         # 确保长度正确
-        num_players = GAME.num_players()
         if len(blinds) != num_players:
-            blinds = [50, 100] + [0] * (num_players - 2)
+            if num_players == 5:
+                blinds = [100, 200, 0, 0, 0]
+            elif num_players == 6:
+                blinds = [50, 100, 0, 0, 0, 0]
+            else:
+                blinds = [50, 100] + [0] * (num_players - 2)
         if len(stacks) != num_players:
-            stacks = [2000] * num_players
+            if num_players == 5:
+                stacks = [50000] * 5
+            elif num_players == 6:
+                stacks = [2000] * 6
+            else:
+                stacks = [2000] * num_players
     except Exception as e:
         print(f"Error extracting blinds/stacks: {e}")
         import traceback
         traceback.print_exc()
         num_players = GAME.num_players()
-        blinds = [50, 100] + [0] * (num_players - 2)
-        stacks = [2000] * num_players
+        if num_players == 5:
+            blinds = [100, 200, 0, 0, 0]
+            stacks = [50000] * 5
+        elif num_players == 6:
+            blinds = [50, 100, 0, 0, 0, 0]
+            stacks = [2000] * 6
+        else:
+            blinds = [50, 100] + [0] * (num_players - 2)
+            stacks = [2000] * num_players
     
     # 从TOURNAMENT_STATE获取Dealer位置（不再推断）
-    dealer_pos = TOURNAMENT_STATE.get('dealer_pos', 5)  # 默认值5
+    dealer_pos = TOURNAMENT_STATE.get('dealer_pos', 4)  # 默认值4 (5人场)
     
     return {
         'hole_cards': hole_cards,
@@ -744,15 +784,21 @@ def get_ai_action_from_api(state, player_id):
                 
                 # 验证推荐动作是否合法
                 if recommended_action not in legal_actions:
-                    print(f"  ⚠️ 警告: API返回的推荐动作 {recommended_action} 不在合法动作列表中，使用第一个合法动作")
-                    action = legal_actions[0] if legal_actions else recommended_action
-                else:
-                    # 根据概率分布采样（而不是直接使用推荐动作，增加随机性）
+                    print(f"  ⚠️ 警告: API返回的推荐动作 {recommended_action} 不在合法动作列表中，使用概率最高的合法动作")
+                    # 如果推荐动作不合法，从合法动作中选择概率最高的
                     probs = [action_probs.get(str(a), 0.0) for a in legal_actions]
-                    
                     if sum(probs) > 0:
-                        probs = np.array(probs) / sum(probs)
-                        action = np.random.choice(legal_actions, p=probs)
+                        best_idx = np.argmax(probs)
+                        action = legal_actions[best_idx]
+                    else:
+                        action = legal_actions[0] if legal_actions else recommended_action
+                else:
+                    # 使用 argmax 策略：从合法动作中选择概率最高的动作
+                    # 确保使用 action_probs 中的概率值来选择，而不是直接使用 recommended_action
+                    probs = [action_probs.get(str(a), 0.0) for a in legal_actions]
+                    if sum(probs) > 0:
+                        best_idx = np.argmax(probs)
+                        action = legal_actions[best_idx]
                     else:
                         action = recommended_action
                 
@@ -783,11 +829,11 @@ def get_ai_action_from_api(state, player_id):
         traceback.print_exc()
         print(f"{'='*70}\n")
     
-    # Fallback: 随机选择合法动作
+    # Fallback: 使用 argmax 策略（选择第一个合法动作）
     legal_actions = state.legal_actions()
     if legal_actions:
-        fallback_action = np.random.choice(legal_actions)
-        print(f"⚠️ Player {player_id} 使用Fallback动作: {fallback_action}\n")
+        fallback_action = legal_actions[0]  # argmax: 选择第一个合法动作
+        print(f"⚠️ Player {player_id} 使用Fallback动作 (argmax): {fallback_action}\n")
         return fallback_action
     return None
 
@@ -1207,7 +1253,7 @@ def get_player_positions(state, num_players):
         
         # 定义位置名称顺序 (相对于 Dealer/BTN)
         # 6-max: BTN -> SB -> BB -> UTG -> MP -> CO
-        pos_names_from_btn = ["BTN", "SB", "BB", "UTG", "MP", "CO"]
+        # 5-max: BTN -> SB -> BB -> UTG -> MP
         if num_players == 2: 
             pos_names_from_btn = ["SB", "BB"] # HU: Dealer is SB
             # HU 特殊处理: Dealer=SB, Other=BB
@@ -1217,6 +1263,13 @@ def get_player_positions(state, num_players):
             positions[dealer_pos] = "SB"
             positions[(dealer_pos + 1) % num_players] = "BB"
             return positions
+        elif num_players == 5:
+            pos_names_from_btn = ["BTN", "SB", "BB", "UTG", "MP"]  # 5人场
+        elif num_players == 6:
+            pos_names_from_btn = ["BTN", "SB", "BB", "UTG", "MP", "CO"]  # 6人场
+        else:
+            # 通用处理：BTN -> SB -> BB -> UTG -> ...
+            pos_names_from_btn = ["BTN", "SB", "BB"] + [f"UTG+{i}" for i in range(num_players - 3)]
 
         for i in range(num_players):
             # 计算相对于 Dealer 的偏移量
@@ -1284,21 +1337,31 @@ def get_player_positions(state, num_players):
                 temp_state.apply_action(action)
                 
             # 回到 Spent 方法。
+            # 在 5人局默认配置中，通常是:
+            # P0=SB, P1=BB (如果 dealer 是 4)
             # 在 6人局默认配置中，通常是:
             # P0=SB, P1=BB (如果 dealer 是 5)
             # 或者 P1=SB, P2=BB...
             
             # 让我们通过 blind 金额来猜
-            # 假设盲注是 50 和 100
+            # 5人场盲注: 100 和 200
+            # 6人场盲注: 50 和 100
             for p, amt in spents.items():
-                if amt == 50: sb_player = p
-                if amt == 100: bb_player = p
+                if amt == 100: sb_player = p  # 5人场SB或6人场BB
+                if amt == 200: bb_player = p  # 5人场BB
+                if amt == 50: sb_player = p   # 6人场SB
                 
             if sb_player != -1:
                 # 确定了 SB，推导其他
+                # 5-max order: SB -> BB -> UTG -> MP -> BTN
                 # 6-max order: SB -> BB -> UTG -> MP -> CO -> BTN
                 # offset 0 = SB
-                pos_names = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
+                if num_players == 5:
+                    pos_names = ["SB", "BB", "UTG", "MP", "BTN"]
+                elif num_players == 6:
+                    pos_names = ["SB", "BB", "UTG", "MP", "CO", "BTN"]
+                else:
+                    pos_names = ["SB", "BB"] + [f"UTG+{i}" for i in range(num_players - 2)]
                 if num_players == 2: pos_names = ["SB", "BB"] # HU: Dealer is SB
                 
                 for i in range(num_players):
@@ -1677,7 +1740,7 @@ def format_state_html(state, user_seat=0, logs=[], folded_players=set()):
         </div>
     """
     
-    num_players = CONFIG["num_players"] if CONFIG else 6
+    num_players = CONFIG["num_players"] if CONFIG else 5
     current_player = state.current_player() if not state.is_terminal() else -1
     
     # 解析筹码
@@ -1898,8 +1961,12 @@ def start_new_game():
     
     # 重置锦标赛状态
     num_players = CONFIG['num_players']
-    TOURNAMENT_STATE["stacks"] = [2000] * num_players
-    TOURNAMENT_STATE["dealer_pos"] = 5 # P0=SB
+    if num_players == 5:
+        TOURNAMENT_STATE["stacks"] = [50000] * 5
+        TOURNAMENT_STATE["dealer_pos"] = 4  # 5人场: P0=SB, P1=BB, P2=UTG, P3=MP, P4=BTN
+    else:
+        TOURNAMENT_STATE["stacks"] = [2000] * num_players
+        TOURNAMENT_STATE["dealer_pos"] = 5  # 6人场: P0=SB, P1=BB, P2=UTG, P3=MP, P4=CO, P5=BTN
     
     # 重新加载游戏
     load_game_with_config(TOURNAMENT_STATE["stacks"], TOURNAMENT_STATE["dealer_pos"])
@@ -1907,7 +1974,8 @@ def start_new_game():
     history = []
     new_history, state, logs, is_user_turn, folded_players, action_probs = run_game_step(history, user_action=None, user_seat=0)
     
-    logs.insert(0, "🏁 新锦标赛开始 (Stacks: 2000)")
+    stack_str = f"{TOURNAMENT_STATE['stacks'][0]}" if TOURNAMENT_STATE['stacks'] else "2000"
+    logs.insert(0, f"🏁 新锦标赛开始 (Stacks: {stack_str})")
     log_text = "\n".join(logs)
     
     html, _, settlement_html = format_state_html(state, user_seat=0, logs=logs, folded_players=folded_players)
@@ -2101,7 +2169,8 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
     # style_injector 必须是 visible=True (默认)，否则内部的 <style> 标签可能不会被渲染到 DOM 中
     style_injector = gr.HTML()
 
-    gr.Markdown("# 🃏 德州扑克人机对战 (6人局) - API模式")
+    num_players_display = CONFIG.get('num_players', 5) if CONFIG else 5
+    gr.Markdown(f"# 🃏 德州扑克人机对战 ({num_players_display}人局) - API模式")
     gr.Markdown(f"**API服务器**: {API_BASE_URL}")
     
     history_state = gr.State([])
@@ -2141,10 +2210,12 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
             # 游戏日志
             game_log = gr.Textbox(label="游戏日志", lines=20, max_lines=30)
             
+            num_players_display = CONFIG.get('num_players', 5) if CONFIG else 5
+            num_ai_opponents = num_players_display - 1
             gr.Markdown(f"""
             ### ℹ️ 说明
             - 您是 **Player 0**
-            - 5 个 AI 对手（通过API服务器推理）
+            - {num_ai_opponents} 个 AI 对手（通过API服务器推理）
             - API服务器: {API_BASE_URL}
             """)
 

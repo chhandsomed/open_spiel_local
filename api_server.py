@@ -337,22 +337,30 @@ def build_state_from_cards(
     # 处理chance节点：发所有玩家的手牌
     # 发牌顺序：P0手牌1, P0手牌2, P1手牌1, P1手牌2, ..., P5手牌1, P5手牌2
     hole_card_idx = 0
+    debug_info = []  # 记录调试信息
     while state.is_chance_node() and hole_card_idx < len(all_hole_cards):
         legal_actions = state.legal_actions()
         if not legal_actions:
             break
         
         target_card = all_hole_cards[hole_card_idx]
+        expected_player = hole_card_idx // num_hole_cards
+        expected_card_idx = hole_card_idx % num_hole_cards
         
         # 找到对应的action（card index）
         if target_card in legal_actions:
             state.apply_action(target_card)
+            debug_info.append((hole_card_idx, expected_player, expected_card_idx, target_card, True))
             hole_card_idx += 1
         else:
             # 如果指定的牌不在legal_actions中（不应该发生），随机选择
             action = random.choice(legal_actions)
             state.apply_action(action)
+            debug_info.append((hole_card_idx, expected_player, expected_card_idx, target_card, False, action))
             hole_card_idx += 1
+        
+        # 注意：不在发牌过程中验证，因为此时 to_struct() 可能返回中间状态
+        # 验证将在所有chance节点处理完后进行
     
     # 处理chance节点：发公共牌
     # 根据当前轮次决定发多少张公共牌
@@ -381,6 +389,32 @@ def build_state_from_cards(
             break
         action = random.choice(legal_actions)
         state.apply_action(action)
+    
+    # 在所有chance节点处理完后，验证当前玩家的手牌
+    # 使用 information_state_tensor 验证（更准确），忽略手牌顺序
+    try:
+        info_state = state.information_state_tensor(current_player_id)
+        num_players = game.num_players()
+        hole_cards_start = num_players
+        hole_cards_end = hole_cards_start + 52
+        hole_cards_bits = info_state[hole_cards_start:hole_cards_end]
+        hole_cards_indices = [i for i, bit in enumerate(hole_cards_bits) if bit > 0.5]
+        
+        # 转换为字符串格式
+        suits = ['d', 's', 'h', 'c']  # OpenSpiel顺序
+        ranks = ['2','3','4','5','6','7','8','9','T','J','Q','K','A']
+        actual_hand_set = set([ranks[c%13] + suits[c//13] for c in hole_cards_indices])
+        expected_hand_set = set([f"{ranks[c%13]}{suits[c//13]}" for c in current_player_hole_indices])
+        
+        # 忽略顺序，只比较牌的集合
+        if actual_hand_set != expected_hand_set:
+            actual_hand_str = "".join(sorted(actual_hand_set))
+            expected_hand_str = "".join(sorted(expected_hand_set))
+            print(f"⚠️ 警告: Player {current_player_id}手牌不匹配！期望: {expected_hand_str}, 实际: {actual_hand_str}", flush=True)
+            print(f"  调试信息: {debug_info[-num_hole_cards:] if len(debug_info) >= num_hole_cards else debug_info}", flush=True)
+    except Exception as e:
+        # 验证失败不影响功能
+        pass
     
     # 应用历史动作（只包含玩家动作，不包含发牌动作）
     # 注意：如果历史动作中包含chance节点，说明公共牌还没发完，需要先发完公共牌
@@ -856,7 +890,7 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             
             def card_index_to_string(card_idx):
                 """将OpenSpiel的card index转换为字符串"""
-                suits = ['d', 'c', 'h', 's']  # OpenSpiel的顺序：Diamonds, Clubs, Hearts, Spades
+                suits = ['d', 's', 'h', 'c']  # OpenSpiel的顺序：Diamonds(0-12), Spades(13-25), Hearts(26-38), Clubs(39-51)
                 ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
                 suit_idx = card_idx // 13
                 rank_idx = card_idx % 13
@@ -864,6 +898,15 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             
             hole_cards_str = [card_index_to_string(c) for c in hole_cards]
             board_cards_str = [card_index_to_string(c) for c in board_cards] if board_cards else []
+            
+            # 验证位置和手牌一致性
+            position_encoding = info_state_raw[:num_players]
+            actual_position_idx = np.argmax(position_encoding)
+            print(f"\n🃏 Solver模式信息状态验证: player={player}, 位置编码索引={actual_position_idx}, 手牌={hole_cards_str}, 公共牌={board_cards_str}", flush=True)
+            if actual_position_idx != player:
+                print(f"⚠️ 警告: 位置编码索引({actual_position_idx})与player({player})不一致！", flush=True)
+            else:
+                print(f"✅ 位置编码和player一致", flush=True)
             
             # 打印动作序列和下注金额（用于调试）
             max_game_length = state.get_game().max_game_length()
@@ -938,6 +981,9 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
                 logits = model._policy_network(info_state)
                 probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
             
+            # 打印原始概率分布（用于调试）
+            print(f"📊 模型原始概率分布（前5个动作）: {dict(zip(range(5), probs[:5]))}", flush=True)
+            
             # 构建概率字典
             legal_probs = {}
             for action in legal_actions:
@@ -953,11 +999,16 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
                 for action in legal_actions:
                     legal_probs[action] = uniform_prob
             
+            # 打印归一化后的概率分布（用于调试）
+            print(f"📊 归一化后的合法动作概率: {legal_probs}", flush=True)
+            
             # 选择推荐动作（概率最大的）
             if legal_probs:
                 recommended_action = max(legal_probs.items(), key=lambda x: x[1])[0]
             else:
                 recommended_action = legal_actions[0]
+            
+            print(f"🎯 推荐动作: {recommended_action} (概率: {legal_probs.get(recommended_action, 0.0):.4f})", flush=True)
             
             return recommended_action, legal_probs, legal_actions
         else:
@@ -1006,7 +1057,7 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
     
     def card_index_to_string(card_idx):
         """将OpenSpiel的card index转换为字符串"""
-        suits = ['d', 'c', 'h', 's']  # OpenSpiel的顺序：Diamonds, Clubs, Hearts, Spades
+        suits = ['d', 's', 'h', 'c']  # OpenSpiel的顺序：Diamonds(0-12), Spades(13-25), Hearts(26-38), Clubs(39-51)
         ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
         suit_idx = card_idx // 13
         rank_idx = card_idx % 13
@@ -1014,20 +1065,44 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
     
     hole_cards_str = [card_index_to_string(c) for c in hole_cards]
     board_cards_str = [card_index_to_string(c) for c in board_cards] if board_cards else []
-    print(f"\n🃏 信息状态中的牌: player={player}, 手牌={hole_cards_str}, 公共牌={board_cards_str}", flush=True)
     
-    # 位置编码映射：如果提供了dealer_pos，将位置编码映射到训练时的位置
-    if dealer_pos is not None:
-        print(f"\n🔍 准备进行位置编码映射: player={player}, dealer_pos={dealer_pos}, num_players={num_players}", flush=True)
-        info_state = map_position_encoding(
-            info_state.squeeze(0),  # 去掉batch维度
-            player,
-            dealer_pos,
-            training_dealer_pos=5,  # 训练时dealer_pos=5
-            num_players=num_players
-        )
+    # 验证位置和手牌一致性
+    position_encoding = info_state_raw[:num_players]
+    actual_position_idx = np.argmax(position_encoding)
+    print(f"\n🃏 信息状态验证: player={player}, 位置编码索引={actual_position_idx}, 手牌={hole_cards_str}, 公共牌={board_cards_str}", flush=True)
+    if actual_position_idx != player:
+        print(f"⚠️ 警告: 位置编码索引({actual_position_idx})与player({player})不一致！", flush=True)
     else:
-        print(f"\n⚠️ 未提供dealer_pos，跳过位置编码映射", flush=True)
+        print(f"✅ 位置编码和player一致", flush=True)
+    
+    # ⚠️ 关键修复：禁用位置编码映射！
+    # 
+    # 问题分析：
+    # OpenSpiel的information_state_tensor(player)返回的是：
+    # - 位置编码：values[player] = 1 - "我是player"
+    # - 手牌：HoleCards(player) - 该player的手牌
+    #
+    # 如果我们映射位置编码（比如从Player 0映射到Player 2），但手牌编码保持不变：
+    # - 位置编码：[0,0,1,0,0,0] - "我是Player 2"
+    # - 手牌编码：Player 0的手牌（As, Ah）
+    # 这是不一致的！模型看到的是"我是Player 2，但我的手牌是Player 0的手牌"
+    #
+    # 正确的做法：
+    # 不应该进行位置编码映射，因为：
+    # 1. OpenSpiel的information_state_tensor已经正确地返回了该player的手牌
+    # 2. 位置编码只是表示"我是player"，不应该改变
+    # 3. 如果模型训练时使用了特定的dealer_pos，那可能是因为训练数据中dealer_pos固定
+    # 4. 但推理时，我们应该相信OpenSpiel的信息状态是正确的
+    # 5. 模型应该能够处理不同dealer位置的情况，因为位置编码表示的是player ID，而不是位置角色
+    #
+    # 如果模型确实需要位置角色信息，应该在训练时使用相对位置特征，而不是绝对位置编码
+    
+    print(f"\n⚠️ 警告: 已禁用位置编码映射，直接使用OpenSpiel的信息状态", flush=True)
+    print(f"   原因: 位置编码映射会导致位置和手牌不一致，影响模型推理", flush=True)
+    print(f"   位置编码表示'我是player'，不应该改变", flush=True)
+    print(f"   手牌编码是相对于实际player的，不应该映射", flush=True)
+    
+    # 不再进行位置编码映射，直接使用原始信息状态
     with torch.no_grad():
         logits = model(info_state)
         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
@@ -1144,6 +1219,9 @@ def recommend_action():
         blinds = data.get('blinds', None)
         stacks = data.get('stacks', None)
         seed = data.get('seed', None)
+        
+        # 调试：打印接收到的action_history和action_sizings
+        print(f"📋 接收到的请求数据: player_id={player_id}, action_history={action_history}, action_sizings={action_sizings}", flush=True)
         
         # 验证action_sizings长度（如果提供）
         if action_sizings is not None and len(action_sizings) != len(action_history):

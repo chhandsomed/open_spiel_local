@@ -442,15 +442,12 @@ def get_ai_action(state, model):
         probs = list(probs_dict.values())
         if sum(probs) > 0:
             probs = np.array(probs) / sum(probs)
-            # Sample or greedy? Let's do weighted sample for variety, or greedy for strength
-            # Using argmax for "best" move
-            # best_idx = np.argmax(probs)
-            # action = actions[best_idx]
-            
-            # Using random sample based on probs
-            action = np.random.choice(actions, p=probs)
+            # Using argmax strategy: select the action with highest probability
+            best_idx = np.argmax(probs)
+            action = actions[best_idx]
         else:
-            action = np.random.choice(actions)
+            # If all probabilities are zero, select first action (argmax fallback)
+            action = actions[0] if actions else None
         return action
     
     # Standard Network
@@ -464,9 +461,11 @@ def get_ai_action(state, model):
     
     if legal_probs.sum() > 0:
         legal_probs /= legal_probs.sum()
-        action = np.random.choice(len(legal_probs), p=legal_probs)
+        # Using argmax strategy: select the action with highest probability
+        action = np.argmax(legal_probs)
     else:
-        action = np.random.choice(legal_actions)
+        # If all probabilities are zero, select first legal action (argmax fallback)
+        action = legal_actions[0] if legal_actions else None
         
     return action
 

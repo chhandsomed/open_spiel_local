@@ -16,7 +16,7 @@ from collections import Counter
 sys.path.append(os.getcwd())
 
 # API服务器配置
-API_BASE_URL = "http://localhost:8819/api/v1"
+API_BASE_URL = "http://localhost:8826/api/v1"
 
 # ==========================================
 # 0. 牌型评估工具 (简化版)
@@ -2170,8 +2170,18 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
     style_injector = gr.HTML()
 
     num_players_display = CONFIG.get('num_players', 5) if CONFIG else 5
-    gr.Markdown(f"# 🃏 德州扑克人机对战 ({num_players_display}人局) - API模式")
+    title_markdown = gr.Markdown(f"# 🃏 德州扑克人机对战 ({num_players_display}人局) - API模式")
     gr.Markdown(f"**API服务器**: {API_BASE_URL}")
+    
+    # 场次选择控件
+    with gr.Row():
+        num_players_selector = gr.Radio(
+            label="选择场次",
+            choices=[("5人场", 5), ("6人场", 6)],
+            value=num_players_display,
+            type="value",
+            interactive=True
+        )
     
     history_state = gr.State([])
     
@@ -2212,13 +2222,64 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
             
             num_players_display = CONFIG.get('num_players', 5) if CONFIG else 5
             num_ai_opponents = num_players_display - 1
-            gr.Markdown(f"""
+            info_markdown = gr.Markdown(f"""
             ### ℹ️ 说明
             - 您是 **Player 0**
             - {num_ai_opponents} 个 AI 对手（通过API服务器推理）
             - API服务器: {API_BASE_URL}
             """)
 
+    # 场次切换回调函数
+    def switch_num_players(num_players):
+        """切换场次"""
+        global CONFIG, GAME, TOURNAMENT_STATE
+        
+        # 更新CONFIG
+        CONFIG = {'num_players': num_players, 'betting_abstraction': 'fchpa'}
+        
+        # 更新TOURNAMENT_STATE
+        if num_players == 5:
+            TOURNAMENT_STATE["stacks"] = [50000] * 5
+            TOURNAMENT_STATE["dealer_pos"] = 4
+            TOURNAMENT_STATE["blinds"] = [100, 200]
+        else:
+            TOURNAMENT_STATE["stacks"] = [2000] * 6
+            TOURNAMENT_STATE["dealer_pos"] = 5
+            TOURNAMENT_STATE["blinds"] = [50, 100]
+        
+        # 重新加载游戏
+        load_game_with_config(TOURNAMENT_STATE["stacks"], TOURNAMENT_STATE["dealer_pos"])
+        
+        # 更新标题和说明
+        num_ai_opponents = num_players - 1
+        title_text = f"# 🃏 德州扑克人机对战 ({num_players}人局) - API模式"
+        info_text = f"""
+            ### ℹ️ 说明
+            - 您是 **Player 0**
+            - {num_ai_opponents} 个 AI 对手（通过API服务器推理）
+            - API服务器: {API_BASE_URL}
+            """
+        
+        return (
+            gr.update(value=title_text),  # title_markdown
+            gr.update(value=info_text),    # info_markdown
+            gr.update(value="<h3>场次已切换，请点击'开始新游戏'</h3>"),  # board_display
+            gr.update(value=""),  # game_log
+            gr.update(value=""),  # settlement_display
+            gr.update(choices=[], value=None, interactive=False),  # action_radio
+            gr.update(interactive=False),  # submit_btn
+            gr.update(visible=False),  # next_hand_btn
+            gr.update(value=[]),  # history_state
+            gr.update(value="")   # style_injector
+        )
+    
+    # 绑定场次切换事件
+    num_players_selector.change(
+        fn=switch_num_players,
+        inputs=[num_players_selector],
+        outputs=[title_markdown, info_markdown, board_display, game_log, settlement_display, action_radio, submit_btn, next_hand_btn, history_state, style_injector]
+    )
+    
     # 绑定 Radio 点击事件直接提交
     action_radio.input(
         fn=on_submit_action,

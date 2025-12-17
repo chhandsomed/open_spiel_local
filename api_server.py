@@ -39,12 +39,18 @@ except ImportError:
 
 app = Flask(__name__)
 
-# 全局变量：模型和游戏
-GAME = None
-MODEL = None
-CONFIG = None
+# 全局变量：模型和游戏（支持多模型）
+MODELS = {}  # {num_players: model} 例如 {5: model_5p, 6: model_6p}
+CONFIGS = {}  # {num_players: config} 例如 {5: config_5p, 6: config_6p}
+GAMES = {}  # {num_players: game} 例如 {5: game_5p, 6: game_6p}（可选，主要用于默认配置）
 DEVICE = 'cpu'
-MODEL_DIR = None
+MODEL_DIRS = {}  # {num_players: model_dir} 例如 {5: dir_5p, 6: dir_6p}
+
+# 向后兼容的全局变量（指向默认模型）
+GAME = None  # 向后兼容，指向GAMES中的第一个或默认模型
+MODEL = None  # 向后兼容，指向MODELS中的第一个或默认模型
+CONFIG = None  # 向后兼容，指向CONFIGS中的第一个或默认配置
+MODEL_DIR = None  # 向后兼容
 
 # 游戏实例缓存：根据配置缓存游戏实例，避免重复创建
 GAME_CACHE = {}  # key: (tuple(blinds), tuple(stacks), dealer_pos, betting_abstraction, num_players)
@@ -626,9 +632,15 @@ def build_state_from_cards(
 # 3. 模型加载和推理
 # ==========================================
 
-def load_model(model_dir, device='cpu'):
-    """加载训练好的模型"""
-    global GAME, MODEL, CONFIG, MODEL_DIR
+def load_model(model_dir, device='cpu', num_players=None):
+    """加载训练好的模型
+    
+    Args:
+        model_dir: 模型目录路径
+        device: 设备（cpu/cuda）
+        num_players: 玩家数量（如果为None，从config.json读取）
+    """
+    global GAME, MODEL, CONFIG, MODEL_DIR, MODELS, CONFIGS, GAMES, MODEL_DIRS
     
     MODEL_DIR = model_dir
     print(f"Loading model from: {model_dir}")
@@ -648,23 +660,35 @@ def load_model(model_dir, device='cpu'):
     
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
-            CONFIG = json.load(f)
+            config = json.load(f)
     else:
         raise FileNotFoundError(f"Config file not found: {config_path}")
     
-    num_players = CONFIG.get('num_players', 6)
-    betting_abstraction = CONFIG.get('betting_abstraction', 'fchpa')
-    game_string = CONFIG.get('game_string', None)
+    # 如果num_players未指定，从config读取
+    if num_players is None:
+        num_players = config.get('num_players', 6)
+    
+    # 存储到对应的字典中
+    CONFIGS[num_players] = config
+    MODEL_DIRS[num_players] = model_dir
+    
+    # 向后兼容：如果是第一个模型，设置为默认
+    if CONFIG is None:
+        CONFIG = config
+    
+    betting_abstraction = config.get('betting_abstraction', 'fchpa')
+    game_string = config.get('game_string', None)
     
     # 创建游戏
+    game = None
     if game_string:
         try:
-            GAME = pyspiel.load_game(game_string)
+            game = pyspiel.load_game(game_string)
         except Exception as e:
             print(f"Failed to load game from game_string: {e}")
-            GAME = None
+            game = None
     
-    if GAME is None:
+    if game is None:
         # Fallback: 手动创建游戏
         if num_players == 6:
             blinds_str = "50 100 0 0 0 0"
@@ -693,10 +717,17 @@ def load_model(model_dir, device='cpu'):
             f"bettingAbstraction={betting_abstraction}"
             f")"
         )
-        GAME = pyspiel.load_game(game_string)
+        game = pyspiel.load_game(game_string)
+    
+    # 存储游戏实例
+    GAMES[num_players] = game
+    
+    # 向后兼容：如果是第一个模型，设置为默认
+    if GAME is None:
+        GAME = game
     
     # 加载模型
-    save_prefix = CONFIG.get('save_prefix', 'deepcfr_texas')
+    save_prefix = config.get('save_prefix', 'deepcfr_texas')
     policy_filename = f"{save_prefix}_policy_network.pt"
     policy_path = os.path.join(model_dir, policy_filename)
     
@@ -725,12 +756,12 @@ def load_model(model_dir, device='cpu'):
         raise FileNotFoundError(f"Model file not found: {policy_path}")
     
     # 获取网络结构
-    use_simple_feature = CONFIG.get('use_simple_feature', False)
-    use_feature_transform = CONFIG.get('use_feature_transform', False)
-    policy_layers = tuple(CONFIG.get('policy_layers', [64, 64]))
+    use_simple_feature = config.get('use_simple_feature', False)
+    use_feature_transform = config.get('use_feature_transform', False)
+    policy_layers = tuple(config.get('policy_layers', [64, 64]))
     
     # 创建测试状态获取embedding size
-    test_state = GAME.new_initial_state()
+    test_state = game.new_initial_state()
     while test_state.is_chance_node():
         legal_actions = test_state.legal_actions()
         if legal_actions:
@@ -739,13 +770,13 @@ def load_model(model_dir, device='cpu'):
             break
     
     embedding_size = len(test_state.information_state_tensor(0))
-    num_actions = GAME.num_distinct_actions()
+    num_actions = game.num_distinct_actions()
     
     # 创建网络（基于 play_gradio.py 的逻辑）
     if use_simple_feature and HAVE_CUSTOM_FEATURES:
-        print("Using Simple Feature Model")
+        print(f"Using Simple Feature Model (num_players={num_players})")
         solver = DeepCFRSimpleFeature(
-            GAME,
+            game,
             policy_network_layers=policy_layers,
             advantage_network_layers=(32, 32),
             num_iterations=1,
@@ -764,18 +795,28 @@ def load_model(model_dir, device='cpu'):
         
         solver._policy_network.load_state_dict(new_state_dict)
         solver._policy_network.eval()
-        MODEL = solver
-        return GAME, MODEL, CONFIG
+        
+        # 存储模型到字典中
+        MODELS[num_players] = solver
+        
+        # 向后兼容：如果是第一个模型，设置为默认
+        if MODEL is None:
+            MODEL = solver
+            GAME = game
+            CONFIG = config
+        
+        print(f"Model loaded successfully (num_players={num_players})")
+        return game, solver, config
         
     elif use_feature_transform and HAVE_CUSTOM_FEATURES:
-        print("Using Feature Transform Model")
+        print(f"Using Feature Transform Model (num_players={num_players})")
         try:
             from deep_cfr_with_feature_transform import DeepCFRWithFeatureTransform
-            transformed_size = CONFIG.get('transformed_size', 150)
-            use_hybrid_transform = CONFIG.get('use_hybrid_transform', True)
+            transformed_size = config.get('transformed_size', 150)
+            use_hybrid_transform = config.get('use_hybrid_transform', True)
             
             solver = DeepCFRWithFeatureTransform(
-                GAME,
+                game,
                 policy_network_layers=policy_layers,
                 advantage_network_layers=(32, 32),
                 num_iterations=1,
@@ -794,22 +835,40 @@ def load_model(model_dir, device='cpu'):
                     new_state_dict[k] = v
             solver._policy_network.load_state_dict(new_state_dict)
             solver._policy_network.eval()
-            MODEL = solver
-            return GAME, MODEL, CONFIG
+            
+            # 存储模型到字典中
+            MODELS[num_players] = solver
+            
+            # 向后兼容：如果是第一个模型，设置为默认
+            if MODEL is None:
+                MODEL = solver
+                GAME = game
+                CONFIG = config
+            
+            print(f"Model loaded successfully (num_players={num_players})")
+            return game, solver, config
         except ImportError:
             print("Import Error for DeepCFRWithFeatureTransform")
             pass
 
     # Standard MLP（基于 play_gradio.py）
-    print("Using Standard MLP")
-    state = GAME.new_initial_state()
+    print(f"Using Standard MLP (num_players={num_players})")
+    state = game.new_initial_state()
     embedding_size = len(state.information_state_tensor(0))
-    num_actions = GAME.num_distinct_actions()
+    num_actions = game.num_distinct_actions()
     network = MLP(embedding_size, list(policy_layers), num_actions)
     network = network.to(device)
     network.load_state_dict(torch.load(policy_path, map_location=device))
     network.eval()
-    MODEL = network
+    
+    # 存储模型到字典中
+    MODELS[num_players] = network
+    
+    # 向后兼容：如果是第一个模型，设置为默认
+    if MODEL is None:
+        MODEL = network
+        GAME = game
+        CONFIG = config
     
     print(f"Model loaded successfully")
     print(f"  Players: {num_players}")
@@ -817,7 +876,7 @@ def load_model(model_dir, device='cpu'):
     print(f"  Embedding size: {embedding_size}")
     print(f"  Num actions: {num_actions}")
     
-    return GAME, MODEL, CONFIG
+    return game, network, config
 
 
 def map_position_encoding(info_state_tensor, actual_player_id, actual_dealer_pos, training_dealer_pos=5, num_players=6):
@@ -1314,11 +1373,12 @@ def recommend_action():
         "error": null
     }
     """
-    if MODEL is None or GAME is None:
+    # 检查是否有模型加载（向后兼容：检查全局MODEL或MODELS字典）
+    if not MODELS and MODEL is None:
         return jsonify({
             'success': False,
             'data': None,
-            'error': 'Model or game not loaded'
+            'error': 'No model loaded. Please load model using /api/v1/reload_model or start server with --model_dir/--model_5p/--model_6p'
         }), 500
     
     try:
@@ -1449,10 +1509,25 @@ def recommend_action():
                 'error': f'Current player mismatch: expected {player_id}, got {current_player}'
             }), 400
         
+        # 根据玩家数量选择对应的模型
+        model = MODELS.get(num_players, None)
+        if model is None:
+            # 如果没有对应玩家数量的模型，尝试使用全局MODEL（向后兼容）
+            if MODEL is None:
+                return jsonify({
+                    'success': False,
+                    'data': None,
+                    'error': f'No model loaded for {num_players} players. Please load model using /api/v1/reload_model or start server with --model_dir'
+                }), 500
+            model = MODEL
+            print(f"⚠️ 警告: 没有找到{num_players}人场的模型，使用默认模型", flush=True)
+        else:
+            print(f"✅ 使用{num_players}人场模型", flush=True)
+        
         # 获取推荐动作（传入dealer_pos用于位置编码映射）
-        print(f"\n🎯 调用get_recommended_action: player_id={player_id}, dealer_pos={dealer_pos}", flush=True)
+        print(f"\n🎯 调用get_recommended_action: player_id={player_id}, dealer_pos={dealer_pos}, num_players={num_players}", flush=True)
         recommended_action, action_probs, legal_actions = get_recommended_action(
-            state, MODEL, DEVICE, dealer_pos=dealer_pos
+            state, model, DEVICE, dealer_pos=dealer_pos
         )
         print(f"✅ get_recommended_action返回: recommended_action={recommended_action}", flush=True)
         
@@ -1495,20 +1570,27 @@ def recommend_action():
 
 @app.route('/api/v1/reload_model', methods=['POST'])
 def reload_model():
-    """重新加载模型（支持动态切换模型）
+    """重新加载模型（支持动态切换模型，支持替换特定场次的模型）
     
     请求格式:
     {
         "model_dir": "models/deepcfr_stable_run",
-        "device": "cpu"  // 可选，默认使用当前设备
+        "device": "cpu",  // 可选，默认使用当前设备
+        "num_players": 5  // 可选，明确指定场次（5或6）。如果不指定，从config.json读取
     }
+    
+    示例：
+    - 替换5人场模型: {"model_dir": "models/5p_model", "num_players": 5}
+    - 替换6人场模型: {"model_dir": "models/6p_model", "num_players": 6}
+    - 自动检测场次: {"model_dir": "models/some_model"}  // 从config.json读取num_players
     """
-    global GAME, MODEL, CONFIG
+    global GAME, MODEL, CONFIG, MODELS, CONFIGS, GAMES, MODEL_DIRS
     
     try:
         data = request.get_json() or {}
         model_dir = data.get('model_dir', MODEL_DIR)
         device = data.get('device', DEVICE)
+        num_players = data.get('num_players', None)  # 可选：明确指定场次
         
         if model_dir is None:
             return jsonify({
@@ -1516,14 +1598,50 @@ def reload_model():
                 'error': 'model_dir not provided and no default model loaded'
             }), 400
         
-        # 加载新模型
-        load_model(model_dir, device=device)
+        # 加载新模型（如果指定了num_players，会明确替换对应场次的模型）
+        # 先保存旧的MODEL_DIRS，用于判断是否新增了模型
+        old_model_dirs = dict(MODEL_DIRS)
+        old_num_players = set(MODEL_DIRS.keys())
+        
+        # 如果指定了num_players，记录它
+        specified_num_players = num_players
+        
+        load_model(model_dir, device=device, num_players=num_players)
+        
+        # 获取实际加载的num_players
+        actual_num_players = None
+        
+        # 方法1: 如果指定了num_players，直接使用它（因为load_model会按此存储）
+        if specified_num_players is not None and specified_num_players in MODEL_DIRS:
+            actual_num_players = specified_num_players
+        else:
+            # 方法2: 从MODEL_DIRS中查找匹配的路径（考虑相对路径和绝对路径）
+            import os
+            abs_model_dir = os.path.abspath(model_dir)
+            for np, dir_path in MODEL_DIRS.items():
+                abs_dir_path = os.path.abspath(dir_path)
+                if dir_path == model_dir or abs_dir_path == abs_model_dir or dir_path == abs_model_dir or abs_dir_path == model_dir:
+                    actual_num_players = np
+                    break
+            
+            # 方法3: 如果没找到，查找新增的模型（刚加载的）
+            if actual_num_players is None:
+                new_num_players = set(MODEL_DIRS.keys()) - old_num_players
+                if new_num_players:
+                    actual_num_players = list(new_num_players)[0]
+            
+            # 方法4: 如果还是没找到，从CONFIGS中查找最新的（刚加载的模型）
+            if actual_num_players is None and CONFIGS:
+                # 找到最近加载的模型对应的num_players（取最大的key，通常是最后加载的）
+                actual_num_players = max(CONFIGS.keys()) if CONFIGS else None
         
         return jsonify({
             'success': True,
             'message': f'Model reloaded from {model_dir}',
             'model_dir': model_dir,
-            'device': device
+            'device': device,
+            'num_players': actual_num_players,
+            'loaded_models': {str(np): MODEL_DIRS.get(np, 'N/A') for np in sorted(MODELS.keys())}
         })
     
     except Exception as e:
@@ -1570,8 +1688,12 @@ def action_mapping():
 
 def main():
     parser = argparse.ArgumentParser(description='API Server for Poker Recommendation')
-    parser.add_argument('--model_dir', type=str, required=True,
-                        help='Path to model directory (containing config.json and model files)')
+    parser.add_argument('--model_dir', type=str, required=False,
+                        help='Path to model directory (containing config.json and model files). Can specify multiple times for different player counts.')
+    parser.add_argument('--model_5p', type=str, default=None,
+                        help='Path to 5-player model directory')
+    parser.add_argument('--model_6p', type=str, default=None,
+                        help='Path to 6-player model directory')
     parser.add_argument('--host', type=str, default='0.0.0.0',
                         help='Host to bind to (default: 0.0.0.0)')
     parser.add_argument('--port', type=int, default=5000,
@@ -1585,14 +1707,55 @@ def main():
     global DEVICE
     DEVICE = args.device
     
-    # 加载模型
-    try:
-        load_model(args.model_dir, device=DEVICE)
-    except Exception as e:
-        print(f"Failed to load model: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+    # 加载模型（支持多模型）
+    models_loaded = False
+    
+    # 加载5人场模型
+    if args.model_5p:
+        try:
+            print(f"\n📦 加载5人场模型: {args.model_5p}")
+            load_model(args.model_5p, device=DEVICE, num_players=5)
+            models_loaded = True
+            print(f"✅ 5人场模型加载成功")
+        except Exception as e:
+            print(f"❌ 加载5人场模型失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # 加载6人场模型
+    if args.model_6p:
+        try:
+            print(f"\n📦 加载6人场模型: {args.model_6p}")
+            load_model(args.model_6p, device=DEVICE, num_players=6)
+            models_loaded = True
+            print(f"✅ 6人场模型加载成功")
+        except Exception as e:
+            print(f"❌ 加载6人场模型失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # 向后兼容：如果指定了--model_dir，加载它（自动检测玩家数量）
+    if args.model_dir:
+        try:
+            print(f"\n📦 加载模型（自动检测玩家数量）: {args.model_dir}")
+            load_model(args.model_dir, device=DEVICE)
+            models_loaded = True
+            print(f"✅ 模型加载成功")
+        except Exception as e:
+            print(f"❌ 加载模型失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    if not models_loaded:
+        print(f"\n⚠️ 警告: 没有加载任何模型！")
+        print(f"   请使用 --model_dir, --model_5p, 或 --model_6p 指定模型目录")
+        print(f"   或者启动后使用 /api/v1/reload_model 接口加载模型")
+    
+    # 打印已加载的模型
+    if MODELS:
+        print(f"\n📊 已加载的模型:")
+        for np, model_dir in MODEL_DIRS.items():
+            print(f"   {np}人场: {model_dir}")
     
     # 启动服务器
     print(f"\nStarting API server on {args.host}:{args.port}")

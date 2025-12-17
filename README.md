@@ -440,6 +440,8 @@ pip install -r requirements_api.txt
 
 ### 启动 API 服务器
 
+#### 单模型模式（向后兼容）
+
 ```bash
 # 使用 CPU
 python api_server.py --model_dir models/deepcfr_parallel_6p --host 0.0.0.0 --port 5000 --device cpu
@@ -448,11 +450,30 @@ python api_server.py --model_dir models/deepcfr_parallel_6p --host 0.0.0.0 --por
 python api_server.py --model_dir models/deepcfr_parallel_6p --host 0.0.0.0 --port 5000 --device cuda
 ```
 
+#### 多模型模式（推荐，支持5人场和6人场）
+
+```bash
+# 同时加载5人场和6人场模型
+nohup python api_server.py \
+  --model_5p models/deepcfr_parallel_5p_custom/checkpoints/iter_4100 \
+  --model_6p models/deepcfr_stable_run/checkpoints/iter_31000 \
+  --host 0.0.0.0 \
+  --port 8826 \
+  --device cpu > api_server_multi_model_8826.log 2>&1 &
+```
+
+**多模型模式说明**：
+- API服务器会根据请求中的`blinds`/`stacks`长度自动选择对应场次的模型
+- 5人场：`blinds`长度为5，`stacks`长度为5
+- 6人场：`blinds`长度为6，`stacks`长度为6
+- 支持同时加载多个场次的模型，无需重启即可切换
+
 ### API 端点
 
 1. **健康检查**: `GET /api/v1/health`
 2. **获取推荐动作**: `POST /api/v1/recommend_action`
 3. **获取动作映射表**: `GET /api/v1/action_mapping`
+4. **动态替换模型**: `POST /api/v1/reload_model` ⭐新增
 
 ### 请求格式
 
@@ -515,6 +536,8 @@ python api_server.py --model_dir models/deepcfr_parallel_6p --host 0.0.0.0 --por
 
 ### 使用示例
 
+#### 获取推荐动作
+
 **Python调用示例**：
 ```python
 import requests
@@ -534,6 +557,78 @@ data = {
 response = requests.post(url, json=data)
 result = response.json()
 ```
+
+#### 动态替换模型 ⭐新增
+
+**替换指定场次的模型**：
+
+```bash
+# 替换5人场模型（明确指定num_players=5）
+curl -X POST http://localhost:8826/api/v1/reload_model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_dir": "models/deepcfr_parallel_5p_custom/checkpoints/iter_5000",
+    "num_players": 5
+  }'
+
+# 替换6人场模型（明确指定num_players=6）
+curl -X POST http://localhost:8826/api/v1/reload_model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_dir": "models/deepcfr_stable_run/checkpoints/iter_32000",
+    "num_players": 6
+  }'
+```
+
+**自动检测场次（从config.json读取）**：
+
+```bash
+# 不指定num_players，自动从config.json读取
+curl -X POST http://localhost:8826/api/v1/reload_model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_dir": "models/some_model"
+  }'
+```
+
+**Python调用示例**：
+
+```python
+import requests
+
+# 替换5人场模型
+url = "http://localhost:8826/api/v1/reload_model"
+data = {
+    "model_dir": "models/deepcfr_parallel_5p_custom/checkpoints/iter_5000",
+    "num_players": 5,  # 可选：明确指定场次
+    "device": "cpu"     # 可选：默认使用当前设备
+}
+
+response = requests.post(url, json=data)
+result = response.json()
+print(result)
+# {
+#   "success": true,
+#   "message": "Model reloaded from models/xxx",
+#   "model_dir": "models/xxx",
+#   "device": "cpu",
+#   "num_players": 5,
+#   "loaded_models": {
+#     "5": "models/deepcfr_parallel_5p_custom/checkpoints/iter_5000",
+#     "6": "models/deepcfr_stable_run/checkpoints/iter_32000"
+#   }
+# }
+```
+
+**请求参数说明**：
+- `model_dir` (必需): 模型目录路径
+- `num_players` (可选): 明确指定场次（5或6）。如果不指定，从`config.json`自动检测
+- `device` (可选): 设备类型（`cpu`或`cuda`），默认使用当前设备
+
+**响应说明**：
+- `success`: 是否成功
+- `num_players`: 实际加载的场次
+- `loaded_models`: 当前所有已加载的模型列表（key为场次，value为模型路径）
 
 ### 并发请求
 
@@ -577,22 +672,35 @@ API的工作流程：
 使用 `play_gradio_api.py` 提供基于API服务器的Web界面，所有位置的AI动作都通过API服务器获取：
 
 ```bash
-# 1. 先启动API服务器（在另一个终端）
-python api_server.py --model_dir models/deepcfr_stable_run --host 0.0.0.0 --port 8819 --device cpu
+# 1. 先启动API服务器（在另一个终端，推荐使用多模型模式）
+python api_server.py \
+  --model_5p models/deepcfr_parallel_5p_custom/checkpoints/iter_4100 \
+  --model_6p models/deepcfr_stable_run/checkpoints/iter_31000 \
+  --host 0.0.0.0 \
+  --port 8826 \
+  --device cpu
 
 # 2. 启动Gradio界面
 python play_gradio_api.py
 ```
 
 **特性**：
-- 所有6个位置的AI动作都通过API服务器获取
+- 所有位置的AI动作都通过API服务器获取
 - 支持动态盲注和筹码配置
 - 实时显示每个位置的API请求和响应（包括Dealer位置）
 - 支持模型动态切换（通过API服务器的reload_model端点）
 - 自动传递位置信息（`dealer_pos`）给API服务器
+- **场次切换功能** ⭐新增：支持在UI中切换5人场和6人场
+
+**场次切换**：
+- UI界面提供场次选择Radio控件（5人场/6人场）
+- 切换场次时自动更新游戏配置、筹码和盲注
+- 5人场配置：`stacks=[50000]*5`, `dealer_pos=4`, `blinds=[100,200]`
+- 6人场配置：`stacks=[2000]*6`, `dealer_pos=5`, `blinds=[50,100]`
+- 切换后提示用户点击"开始新游戏"
 
 **配置**：
-- API服务器地址：默认 `http://localhost:8819/api/v1`（可在代码中修改 `API_BASE_URL`）
+- API服务器地址：默认 `http://localhost:8826/api/v1`（可在代码中修改 `API_BASE_URL`）
 - Gradio端口：默认 `8823`（可在 `demo.launch()` 中修改）
 
 **位置信息说明**：

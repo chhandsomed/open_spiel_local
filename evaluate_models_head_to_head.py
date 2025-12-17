@@ -202,7 +202,9 @@ def get_action(state, network, device):
     probabilities = np.array([action_probs[a] for a in actions])
     probabilities = probabilities / probabilities.sum()
     
-    return np.random.choice(actions, p=probabilities)
+    # 使用 argmax 策略：选择概率最高的动作（与推理时保持一致）
+    best_idx = np.argmax(probabilities)
+    return actions[best_idx]
 
 
 def play_match(game, model_a, model_b, device, seat_assignment, num_games=100):

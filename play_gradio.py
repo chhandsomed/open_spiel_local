@@ -451,7 +451,43 @@ def get_ai_action(state, model):
         return action
     
     # Standard Network
-    info_state = torch.FloatTensor(state.information_state_tensor(player)).unsqueeze(0).to(DEVICE)
+    info_state_raw = state.information_state_tensor(player)
+    
+    # 归一化action_sizings部分（与训练时保持一致）
+    # 获取max_stack（从模型或游戏配置）
+    max_stack = None
+    if hasattr(model, 'max_stack'):
+        max_stack = model.max_stack
+    
+    # 如果模型没有max_stack，从游戏配置解析
+    if max_stack is None:
+        import re
+        game_string = str(GAME)
+        match = re.search(r'stack=([\d\s]+)', game_string)
+        if match:
+            stack_str = match.group(1).strip()
+            stack_values = stack_str.split()
+            if stack_values:
+                try:
+                    max_stack = int(stack_values[0])
+                except ValueError:
+                    max_stack = 2000  # 默认值
+        else:
+            max_stack = 2000  # 默认值
+    
+    # 归一化action_sizings
+    num_players = GAME.num_players()
+    max_game_length = GAME.max_game_length()
+    header_size = num_players + 52 + 52
+    action_seq_size = max_game_length * 2
+    action_sizings_start = header_size + action_seq_size
+    if action_sizings_start < len(info_state_raw):
+        action_sizings_end = action_sizings_start + max_game_length
+        if action_sizings_end <= len(info_state_raw):
+            info_state_raw = info_state_raw.copy()
+            info_state_raw[action_sizings_start:action_sizings_end] /= max_stack
+    
+    info_state = torch.FloatTensor(info_state_raw).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         logits = model(info_state)
         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
@@ -655,7 +691,39 @@ def run_game_step(history, user_action=None, user_seat=0):
                         action_probs = probs_dict
                     else:
                         # Standard Network
-                        info_state = torch.FloatTensor(state.information_state_tensor(player)).unsqueeze(0).to(DEVICE)
+                        info_state_raw = state.information_state_tensor(player)
+                        
+                        # 归一化action_sizings部分（与训练时保持一致）
+                        max_stack = None
+                        if hasattr(MODEL, 'max_stack'):
+                            max_stack = MODEL.max_stack
+                        if max_stack is None:
+                            game_string = str(GAME)
+                            match = re.search(r'stack=([\d\s]+)', game_string)
+                            if match:
+                                stack_str = match.group(1).strip()
+                                stack_values = stack_str.split()
+                                if stack_values:
+                                    try:
+                                        max_stack = int(stack_values[0])
+                                    except ValueError:
+                                        max_stack = 2000
+                            else:
+                                max_stack = 2000
+                        
+                        # 归一化action_sizings
+                        num_players = GAME.num_players()
+                        max_game_length = GAME.max_game_length()
+                        header_size = num_players + 52 + 52
+                        action_seq_size = max_game_length * 2
+                        action_sizings_start = header_size + action_seq_size
+                        if action_sizings_start < len(info_state_raw):
+                            action_sizings_end = action_sizings_start + max_game_length
+                            if action_sizings_end <= len(info_state_raw):
+                                info_state_raw = info_state_raw.copy()
+                                info_state_raw[action_sizings_start:action_sizings_end] /= max_stack
+                        
+                        info_state = torch.FloatTensor(info_state_raw).unsqueeze(0).to(DEVICE)
                         with torch.no_grad():
                             logits = MODEL(info_state)
                             probs = torch.softmax(logits, dim=1).cpu().numpy()[0]

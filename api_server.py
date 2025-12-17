@@ -14,6 +14,7 @@ import argparse
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 import pyspiel
 import re
 import glob
@@ -209,6 +210,69 @@ def get_player_contributions(state):
     except:
         pass
     return []
+
+
+def normalize_info_state_action_sizings(info_state, game, max_stack=None):
+    """归一化information_state_tensor中的action_sizings部分
+    
+    训练时模型使用了归一化的action_sizings（除以max_stack），
+    推理时也需要归一化以保持一致。
+    
+    Args:
+        info_state: information_state_tensor（numpy array或torch tensor）
+        game: OpenSpiel游戏实例
+        max_stack: 最大筹码值（如果为None，从游戏配置解析）
+    
+    Returns:
+        归一化后的info_state（numpy array）
+    """
+    import numpy as np
+    
+    # 转换为numpy array
+    if isinstance(info_state, torch.Tensor):
+        info_state_np = info_state.cpu().numpy()
+        is_torch = True
+    else:
+        info_state_np = np.array(info_state)
+        is_torch = False
+    
+    # 如果已经是2D，取第一个样本
+    if len(info_state_np.shape) == 2:
+        info_state_np = info_state_np[0]
+    
+    num_players = game.num_players()
+    max_game_length = game.max_game_length()
+    
+    # 计算action_sizings的起始位置
+    # 格式：玩家位置(N) + 手牌(52) + 公共牌(52) + 动作序列(2*max_game_length) + action_sizings(max_game_length)
+    header_size = num_players + 52 + 52
+    action_seq_size = max_game_length * 2
+    action_sizings_start = header_size + action_seq_size
+    
+    # 获取max_stack
+    if max_stack is None:
+        # 从游戏配置解析
+        import re
+        game_string = str(game)
+        match = re.search(r'stack=([\d\s]+)', game_string)
+        if match:
+            stack_str = match.group(1).strip()
+            stack_values = stack_str.split()
+            if stack_values:
+                try:
+                    max_stack = int(stack_values[0])
+                except ValueError:
+                    max_stack = 2000  # 默认值
+        else:
+            max_stack = 2000  # 默认值
+    
+    # 归一化action_sizings部分
+    if action_sizings_start < len(info_state_np):
+        action_sizings_end = action_sizings_start + max_game_length
+        if action_sizings_end <= len(info_state_np):
+            info_state_np[action_sizings_start:action_sizings_end] /= max_stack
+    
+    return info_state_np
 
 def create_game_with_config(
     num_players: int,
@@ -874,8 +938,60 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
         if dealer_pos is not None and hasattr(model, '_policy_network'):
             # 使用策略网络，并进行位置编码映射
             info_state_raw = state.information_state_tensor(player)
-            info_state = torch.FloatTensor(info_state_raw).unsqueeze(0).to(device)
             num_players = state.get_game().num_players()
+            
+            # 归一化action_sizings部分（与训练时保持一致）
+            # 获取max_stack（从游戏配置或stacks中）
+            max_stack = None
+            if hasattr(model, '_policy_network'):
+                # 尝试从模型获取max_stack
+                policy_net = model._policy_network
+                if isinstance(policy_net, nn.DataParallel):
+                    policy_net = policy_net.module
+                if hasattr(policy_net, 'max_stack'):
+                    max_stack = policy_net.max_stack
+            
+            # 如果模型没有max_stack，从游戏配置解析
+            if max_stack is None:
+                import re
+                game_string = str(state.get_game())
+                match = re.search(r'stack=([\d\s]+)', game_string)
+                if match:
+                    stack_str = match.group(1).strip()
+                    stack_values = stack_str.split()
+                    if stack_values:
+                        try:
+                            max_stack = int(stack_values[0])
+                        except ValueError:
+                            max_stack = 2000  # 默认值
+                else:
+                    max_stack = 2000  # 默认值
+            
+            # 归一化action_sizings
+            # 注意：在归一化前打印原始值，归一化后打印归一化后的值
+            max_game_length = state.get_game().max_game_length()
+            header_size = num_players + 52 + 52
+            action_seq_size = max_game_length * 2
+            action_sizings_start = header_size + action_seq_size
+            action_sizings_end = action_sizings_start + max_game_length
+            
+            if action_sizings_start < len(info_state_raw):
+                original_sizings = info_state_raw[action_sizings_start:action_sizings_end].copy()
+                nonzero_original = [(i, float(s)) for i, s in enumerate(original_sizings) if abs(s) > 1e-6]
+                if nonzero_original:
+                    print(f"💰 归一化前action_sizings(非零): {nonzero_original[:10]}", flush=True)
+                    print(f"💰 max_stack用于归一化: {max_stack}", flush=True)
+            
+            info_state_raw = normalize_info_state_action_sizings(info_state_raw, state.get_game(), max_stack)
+            
+            # 打印归一化后的值
+            if action_sizings_start < len(info_state_raw):
+                normalized_sizings = info_state_raw[action_sizings_start:action_sizings_end]
+                nonzero_normalized = [(i, float(s)) for i, s in enumerate(normalized_sizings) if abs(s) > 1e-6]
+                if nonzero_normalized:
+                    print(f"💰 归一化后action_sizings(非零): {nonzero_normalized[:10]}", flush=True)
+            
+            info_state = torch.FloatTensor(info_state_raw).unsqueeze(0).to(device)
             
             # 打印手牌和公共牌信息（用于调试）
             hole_cards_start = num_players
@@ -934,8 +1050,8 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
                 else:
                     action_seq.append('?')
             
-            # 提取非零的action_sizings
-            nonzero_sizings = [(i, float(s)) for i, s in enumerate(action_sizings_bits) if s > 0.5]
+            # 提取非零的action_sizings（注意：action_sizings是连续值，不是二进制位）
+            nonzero_sizings = [(i, float(s)) for i, s in enumerate(action_sizings_bits) if abs(s) > 1e-6]
             
             # 找出动作序列中非'f'的位置（实际玩家动作）
             actual_actions = []
@@ -1041,6 +1157,32 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
     
     # Standard Network（基于 play_gradio.py）
     info_state_raw = state.information_state_tensor(player)
+    
+    # 归一化action_sizings部分（与训练时保持一致）
+    # 获取max_stack（从模型或游戏配置）
+    max_stack = None
+    if hasattr(model, 'max_stack'):
+        max_stack = model.max_stack
+    
+    # 如果模型没有max_stack，从游戏配置解析
+    if max_stack is None:
+        import re
+        game_string = str(state.get_game())
+        match = re.search(r'stack=([\d\s]+)', game_string)
+        if match:
+            stack_str = match.group(1).strip()
+            stack_values = stack_str.split()
+            if stack_values:
+                try:
+                    max_stack = int(stack_values[0])
+                except ValueError:
+                    max_stack = 2000  # 默认值
+        else:
+            max_stack = 2000  # 默认值
+    
+    # 归一化action_sizings
+    info_state_raw = normalize_info_state_action_sizings(info_state_raw, state.get_game(), max_stack)
+    
     info_state = torch.FloatTensor(info_state_raw).unsqueeze(0).to(device)
     
     # 打印手牌和公共牌信息（用于调试）

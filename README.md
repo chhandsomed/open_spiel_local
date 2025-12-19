@@ -199,8 +199,8 @@ nohup python deep_cfr_parallel.py \
     --learning_rate 0.001 \
     --policy_layers 256 256 256 \
     --advantage_layers 256 256 256 \
-    --memory_capacity 2000000 \
-    --queue_maxsize 1000 \
+    --memory_capacity 4000000 \
+    --queue_maxsize 10000 \
     --betting_abstraction fchpa \
     --save_prefix deepcfr_parallel_5p_custom_v2 \
     > train_parallel_5p_v2.log 2>&1 &
@@ -210,6 +210,8 @@ nohup python deep_cfr_parallel.py \
 # 从之前的训练目录恢复训练
 # 会自动加载最新的 checkpoint 和配置（玩家数、网络结构、盲注、筹码等）
 # 可以覆盖训练超参数（如 batch_size, learning_rate, num_iterations）
+现在的api_server.py 是不是不支持我最新的只有1个自己添加的特征的模型，能不能兼容一下。然后有个接口可以看目前线上
+
 nohup python deep_cfr_parallel.py \
     --resume models/deepcfr_parallel_5p_custom_v2_20251219_111930 \
     --num_iterations 20000 \
@@ -218,15 +220,15 @@ nohup python deep_cfr_parallel.py \
     --batch_size 4096 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
-    --eval_interval 10 \
+    --eval_interval 100 \
     --checkpoint_interval 100 \
     --eval_with_games \
     --num_test_games 100 \
     --skip_nashconv \
     --learning_rate 0.001 \
-    --memory_capacity 2000000 \
-    --queue_maxsize 2000 \
-    > train_parallel_5p_v2_resume.log 2>&1 &
+    --memory_capacity 4000000 \
+    --queue_maxsize 10000 \
+    > train_parallel_5p_v2_resume_2.log 2>&1 &
 ```
 
 **续训说明**:

@@ -72,7 +72,8 @@ pip install .
 *   **多进程并行训练**: 真正的 CPU 多核利用。
 *   **多 GPU 加速**: 支持 PyTorch `DataParallel`，单机多卡训练。
 *   **增量式 Checkpoint**: 训练过程中无卡顿保存模型，支持从任意 Checkpoint 完美恢复训练 (`--resume`)。
-*   **实时评估**: 训练中定期进行“策略熵”监控和“随机对战测试”，即使跳过 NashConv 也能掌握训练趋势。
+*   **实时评估**: 训练中定期进行"策略熵"监控和"随机对战测试"，即使跳过 NashConv 也能掌握训练趋势。
+*   **TensorBoard 可视化**: 自动记录训练损失、样本数量、评估指标等，支持实时查看训练曲线。
 *   **交互式对战**: 提供人类 vs AI 的实战接口，支持实时显示 AI 思考概率。
 
 ---
@@ -190,7 +191,7 @@ nohup python deep_cfr_parallel.py \
     --batch_size 4096 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
-    --eval_interval 50 \
+    --eval_interval 100 \
     --checkpoint_interval 100 \
     --eval_with_games \
     --num_test_games 100 \
@@ -199,9 +200,10 @@ nohup python deep_cfr_parallel.py \
     --policy_layers 256 256 256 \
     --advantage_layers 256 256 256 \
     --memory_capacity 2000000 \
+    --queue_maxsize 1000 \
     --betting_abstraction fchpa \
-    --save_prefix deepcfr_parallel_5p_custom \
-    > train_parallel_5p.log 2>&1 &
+    --save_prefix deepcfr_parallel_5p_custom_v2 \
+    > train_parallel_5p_v2.log 2>&1 &
 
 #### 续训脚本（从 checkpoint 恢复训练）
 ```bash
@@ -209,20 +211,22 @@ nohup python deep_cfr_parallel.py \
 # 会自动加载最新的 checkpoint 和配置（玩家数、网络结构、盲注、筹码等）
 # 可以覆盖训练超参数（如 batch_size, learning_rate, num_iterations）
 nohup python deep_cfr_parallel.py \
-    --resume models/deepcfr_parallel_5p_custom \
+    --resume models/deepcfr_parallel_5p_custom_v2_20251219_111930 \
     --num_iterations 20000 \
     --num_workers 16 \
+    --num_traversals 1600 \
     --batch_size 4096 \
     --use_gpu \
     --gpu_ids 0 1 2 3 \
-    --eval_interval 50 \
+    --eval_interval 10 \
     --checkpoint_interval 100 \
     --eval_with_games \
     --num_test_games 100 \
     --skip_nashconv \
     --learning_rate 0.001 \
     --memory_capacity 2000000 \
-    > train_parallel_5p_resume.log 2>&1 &
+    --queue_maxsize 2000 \
+    > train_parallel_5p_v2_resume.log 2>&1 &
 ```
 
 **续训说明**:
@@ -296,6 +300,70 @@ nohup python deep_cfr_parallel.py \
 - `--blinds` 和 `--stack_size` 参数会在训练时保存到 `config.json` 中
 - 恢复训练时，如果命令行未指定这些参数，会自动从 `config.json` 加载
 - 如果命令行显式指定了这些参数，会优先使用命令行参数（允许覆盖配置）
+
+### TensorBoard 可视化监控
+
+训练过程中会自动记录训练指标到 TensorBoard，方便实时查看训练曲线和监控训练进度。
+
+#### 安装 TensorBoard
+
+```bash
+pip install tensorboard
+```
+
+#### 启动训练（自动记录）
+
+训练时会自动在模型目录下创建 `tensorboard_logs/` 目录并记录日志：
+
+```bash
+python deep_cfr_parallel.py \
+    --num_players 5 \
+    --num_iterations 20000 \
+    --save_prefix deepcfr_parallel_5p_custom \
+    ...
+```
+
+训练开始时会显示：
+```
+✓ TensorBoard日志目录: models/deepcfr_parallel_5p_custom/tensorboard_logs
+  查看命令: tensorboard --logdir models/deepcfr_parallel_5p_custom/tensorboard_logs
+```
+
+#### 查看训练曲线
+
+在另一个终端启动 TensorBoard：
+
+```bash
+# 查看单个模型的训练日志
+tensorboard --logdir models/deepcfr_parallel_5p_custom/tensorboard_logs
+
+# 或者查看多个模型的对比（推荐）
+tensorboard --logdir models/
+```
+
+然后在浏览器打开 `http://localhost:6006` 即可查看：
+
+**记录的指标包括**：
+
+1. **损失曲线** (`Loss/`):
+   - `Advantage_Player_0`, `Advantage_Player_1`, ... - 每个玩家的优势网络损失
+   - `Policy` - 策略网络损失
+
+2. **训练指标** (`Metrics/`):
+   - `Total_Advantage_Samples` - 总优势样本数量
+   - `Strategy_Buffer_Size` - 策略缓冲区大小
+   - `Policy_Entropy` - 策略熵（策略的随机性）
+
+3. **评估结果** (`Evaluation/`) - 如果启用了 `--eval_with_games`:
+   - `Avg_Return` - 平均回报（vs 随机策略）
+   - `Win_Rate` - 胜率（vs 随机策略）
+
+**使用技巧**：
+- 使用对数刻度查看损失曲线（TensorBoard 默认支持）
+- 可以同时加载多个训练日志进行对比
+- 损失增长是正常的（因为使用了 `sqrt(iteration)` 加权）
+- 重要的是观察损失的趋势：应该逐渐稳定或缓慢增长
+- 如果损失突然大幅增长，可能是训练不稳定，需要调整学习率或网络结构
 
 ### 关键参数说明
 

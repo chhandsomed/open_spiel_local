@@ -19,6 +19,8 @@ os.environ.setdefault('TORCH_COMPILE_DISABLE', '1')
 import time
 import signal
 import argparse
+import logging
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,6 +29,35 @@ from multiprocessing import Process, Queue, Event, Value, Manager
 from collections import namedtuple
 import queue
 import resource
+
+# 配置logging
+def setup_logging(log_file=None):
+    """配置logging，同时输出到控制台和文件"""
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, mode='a', encoding='utf-8'))
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=handlers,
+        force=True  # 强制重新配置
+    )
+    return logging.getLogger(__name__)
+
+# 全局logger（会在main函数中初始化）
+logger = None
+
+def get_logger():
+    """获取logger，如果未初始化则返回一个简单的logger"""
+    global logger
+    if logger is None:
+        # 如果logger未初始化，创建一个简单的logger（用于Worker进程）
+        import logging
+        logging.basicConfig(level=logging.INFO, format='%(message)s', force=True)
+        logger = logging.getLogger(__name__)
+    return logger
 
 try:
     import psutil
@@ -340,7 +371,7 @@ def worker_process(
                     if stop_event.is_set():
                         break
                     traverse_game_tree(root_node.clone(), player, current_iteration)
-            
+                
             # 强制刷新缓冲区：无论是否达到 batch_limit，都将手中的样本发送出去
             # 这防止了在多玩家游戏中，某些玩家的样本积累太慢导致的主进程饥饿
             for p in list(local_advantage_batches.keys()):
@@ -494,7 +525,7 @@ class ParallelDeepCFRSolver:
         
         # 验证策略网络输入维度
         actual_input_size = policy_net.mlp.model[0]._weight.shape[1]
-        expected_input_size = self._embedding_size + 7  # 7维手动特征（位置4 + 手牌强度1 + 下注统计2）
+        expected_input_size = self._embedding_size + 1  # 1维手动特征（手牌强度）
         assert actual_input_size == expected_input_size, \
             f"策略网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
         
@@ -526,7 +557,7 @@ class ParallelDeepCFRSolver:
             
             # 验证优势网络输入维度
             actual_input_size = net.mlp.model[0]._weight.shape[1]
-            expected_input_size = self._embedding_size + 7  # 7维手动特征（位置4 + 手牌强度1 + 下注统计2）
+            expected_input_size = self._embedding_size + 1  # 1维手动特征（手牌强度）
             assert actual_input_size == expected_input_size, \
                 f"玩家 {player} 优势网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
             
@@ -728,13 +759,14 @@ class ParallelDeepCFRSolver:
         # 2. 清理队列中的积压样本（队列积压会占用大量内存）
         # 3. 如果内存使用超过限制，清理队列并提示用户减少配置
         
-        # 关键修复：检查缓冲区是否接近满（90%阈值）
+        # 关键修复：检查缓冲区是否接近满（85%阈值，提前清理）
         buffer_near_full = False
-        for player in range(self.num_players):
-            if len(self._advantage_memories[player]) >= self.memory_capacity * 0.9:
+        total_advantage_samples = sum(len(m) for m in self._advantage_memories)
+        # 检查总优势样本数（所有玩家加起来）是否超过 memory_capacity 的85%
+        advantage_threshold = self.memory_capacity * 0.85
+        if total_advantage_samples >= advantage_threshold:
                 buffer_near_full = True
-                break
-        if len(self._strategy_memories) >= self.memory_capacity * 0.9:
+        if len(self._strategy_memories) >= self.memory_capacity * 0.85:
             buffer_near_full = True
         
         should_cleanup = False
@@ -766,28 +798,50 @@ class ParallelDeepCFRSolver:
             cleanup_reason = "强制清理"
         
         if should_cleanup:
-            print(f"\n  ⚠️ {cleanup_reason}，清理旧样本...")
+            get_logger().info(f"\n  ⚠️ {cleanup_reason}，清理旧样本...")
             if mem_gb and self.max_memory_gb and mem_gb > self.max_memory_gb * 0.9:
-                print(f"  ⚠️ 注意：建议减少 --memory_capacity 或 --num_workers")
+                get_logger().warning(f"  ⚠️ 注意：建议减少 --memory_capacity 或 --num_workers")
             
             try:
                 # 关键修复：清理ReservoirBuffer（当缓冲区接近满时）
                 if buffer_near_full:
-                    # 清理策略：保留最新的95%样本（基于iteration），删除最旧的5%
-                    for player in range(self.num_players):
-                        buffer = self._advantage_memories[player]
-                        if len(buffer) >= self.memory_capacity * 0.9:
-                            all_samples = list(buffer._data)
-                            # 按iteration降序排序（最新的在前）
-                            all_samples.sort(key=lambda x: x.iteration, reverse=True)
-                            # 保留最新的95%
-                            keep_count = int(self.memory_capacity * 0.95)
-                            samples_to_keep = all_samples[:keep_count]
-                            # 清空并重新添加保留的样本
-                            buffer.clear()
-                            for sample in samples_to_keep:
-                                buffer.add(sample)
-                            print(f"      玩家 {player} 优势样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
+                    # 检查总优势样本数是否超标
+                    total_advantage = sum(len(m) for m in self._advantage_memories)
+                    advantage_threshold = self.memory_capacity * 0.85
+                    
+                    # 决定是否需要清理优势样本
+                    need_advantage_cleanup = total_advantage >= advantage_threshold
+                    if mem_gb and mem_gb > 100:
+                        need_advantage_cleanup = True  # 内存过高时强制清理
+                    
+                    if need_advantage_cleanup and total_advantage > 0:
+                        # 计算每个玩家应该保留的比例
+                        keep_ratio = 0.70 if (mem_gb and mem_gb > 100) else 0.80
+                        target_total = int(self.memory_capacity * keep_ratio)
+                        reduction_ratio = target_total / total_advantage if total_advantage > target_total else 0.90
+                        
+                        # 清理每个玩家的优势样本（使用numpy优化）
+                        for player in range(self.num_players):
+                            buffer = self._advantage_memories[player]
+                            data = buffer._data
+                            original_len = len(data)
+                            if original_len > 0:
+                                keep_count = max(1000, int(original_len * reduction_ratio))
+                                
+                                if keep_count < original_len:
+                                    iterations = np.array([data[i].iteration for i in range(original_len)])
+                                    keep_indices = np.argpartition(iterations, -keep_count)[-keep_count:]
+                                    keep_set = set(keep_indices)
+                                    
+                                    removed_count = 0
+                                    for idx in range(original_len - 1, -1, -1):
+                                        if idx not in keep_set:
+                                            del data[idx]
+                                            removed_count += 1
+                                    
+                                    # 修复：ReservoirBuffer的_add_calls是普通int，不是Value对象
+                                    buffer._add_calls = len(data)
+                                    get_logger().info(f"      玩家 {player} 优势样本: {original_len:,} -> {len(data):,} (删除 {removed_count:,} 个)")
                     
                     # 清理策略样本
                     if len(self._strategy_memories) >= self.memory_capacity * 0.9:
@@ -798,7 +852,7 @@ class ParallelDeepCFRSolver:
                         self._strategy_memories.clear()
                         for sample in samples_to_keep:
                             self._strategy_memories.add(sample)
-                        print(f"      策略样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
+                        get_logger().info(f"      策略样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
                 
                 # 清理队列中的积压样本（队列积压会占用大量内存）
                 for player, q in enumerate(self._advantage_queues):
@@ -811,7 +865,7 @@ class ParallelDeepCFRSolver:
                                 q.get_nowait()
                             except queue.Empty:
                                 break
-                        print(f"      玩家 {player} 队列清理: {queue_size} -> {q.qsize()} (丢弃了 {to_discard} 个积压样本)")
+                        get_logger().info(f"      玩家 {player} 队列清理: {queue_size} -> {q.qsize()} (丢弃了 {to_discard} 个积压样本)")
                 
                 strategy_queue_size = self._strategy_queue.qsize()
                 if strategy_queue_size > self.queue_maxsize * 0.7:
@@ -821,7 +875,7 @@ class ParallelDeepCFRSolver:
                             self._strategy_queue.get_nowait()
                         except queue.Empty:
                             break
-                    print(f"      策略队列清理: {strategy_queue_size} -> {self._strategy_queue.qsize()} (丢弃了 {to_discard} 个积压样本)")
+                    get_logger().info(f"      策略队列清理: {strategy_queue_size} -> {self._strategy_queue.qsize()} (丢弃了 {to_discard} 个积压样本)")
                 
                 # 强制 Python 垃圾回收
                 import gc
@@ -834,9 +888,9 @@ class ParallelDeepCFRSolver:
                         new_mem_info = process.memory_info()
                         new_mem_gb = new_mem_info.rss / 1024 / 1024 / 1024
                         if mem_gb:
-                            print(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB (释放了 {mem_gb - new_mem_gb:.2f}GB)")
+                            get_logger().info(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB (释放了 {mem_gb - new_mem_gb:.2f}GB)")
                         else:
-                            print(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB")
+                            get_logger().info(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB")
                     except:
                         pass
                 
@@ -844,7 +898,7 @@ class ParallelDeepCFRSolver:
                 import gc
                 gc.collect()
             except Exception as e:
-                print(f"  ⚠️ 内存清理失败: {e}")
+                get_logger().error(f"  ⚠️ 内存清理失败: {e}")
                 import traceback
                 traceback.print_exc()
     
@@ -1130,7 +1184,7 @@ class ParallelDeepCFRSolver:
                 # 训练策略网络
                 # 为了加速 checkpoint 保存时的策略网络更新，我们在每次迭代中增量训练策略网络
                 # 这样可以分摊计算成本，使得 checkpoint 时策略网络已经接近就绪
-                policy_loss = self._learn_strategy_network()
+                        policy_loss = self._learn_strategy_network()
                 
                 # 同步网络参数到 Worker
                 if (iteration + 1) % self.sync_interval == 0:
@@ -1141,10 +1195,10 @@ class ParallelDeepCFRSolver:
                 iter_time = time.time() - iter_start
                 
                 if verbose:
-                    print(f"\r  迭代 {iteration + 1}/{self.num_iterations} "
+                    get_logger().info(f"  迭代 {iteration + 1}/{self.num_iterations} "
                           f"(耗时: {iter_time:.2f}秒) | "
                           f"优势样本: {sum(len(m) for m in self._advantage_memories):,} | "
-                          f"策略样本: {len(self._strategy_memories):,}", end="")
+                          f"策略样本: {len(self._strategy_memories):,}")
                 
                 if (iteration + 1) % eval_interval == 0:
                     print()
@@ -1165,7 +1219,7 @@ class ParallelDeepCFRSolver:
                                 max_depth=None,
                                 verbose=True  # 启用详细输出以查看错误
                             )
-                            print(" 完成")
+                            get_logger().info(" 完成")
                             
                             # 打印简要评估信息
                             metrics = eval_result['metrics']
@@ -1190,19 +1244,18 @@ class ParallelDeepCFRSolver:
                     # 保存 checkpoint
                     if checkpoint_interval > 0 and (iteration + 1) % checkpoint_interval == 0:
                         if model_dir and save_prefix and game:
-                            print(f"\n  💾 保存 checkpoint (迭代 {iteration + 1})...", end="", flush=True)
+                            get_logger().info(f"\n  💾 保存 checkpoint (迭代 {iteration + 1})...")
                             try:
-                                # 虽然已经增量训练了，但在保存前再多训练几次以确保最新
-                                print("\n    正在最终优化策略网络 (用于 Checkpoint)...", end="")
-                                for _ in range(5):  # 额外训练 5 次
-                                    policy_loss = self._learn_strategy_network()
+                                # 优化：checkpoint时只训练1次，提升保存速度
+                                get_logger().info("    正在训练策略网络 (用于 Checkpoint)...")
+                                policy_loss = self._learn_strategy_network()
                                 if policy_loss is not None:
-                                    print(f" 完成 (Loss: {policy_loss:.6f})")
+                                    get_logger().info(f"    完成 (Loss: {policy_loss:.6f})")
                                 else:
-                                    print(" 完成 (无足够样本训练)")
+                                    get_logger().info("    完成 (无足够样本训练)")
                                 
                                 save_checkpoint(self, game, model_dir, save_prefix, iteration + 1)
-                                print("  ✓ Checkpoint 已保存")
+                                get_logger().info("  ✓ Checkpoint 已保存")
                             except Exception as e:
                                 print(f" 失败: {e}")
             
@@ -1218,12 +1271,12 @@ class ParallelDeepCFRSolver:
         except KeyboardInterrupt:
             print("\n\n⚠️ 训练被用户中断")
             if model_dir and save_prefix and game:
-                print(f"  💾 保存中断时的 checkpoint (迭代 {self._iteration})...")
+                get_logger().info(f"  💾 保存中断时的 checkpoint (迭代 {self._iteration})...")
                 try:
                     save_checkpoint(self, game, model_dir, save_prefix, self._iteration)
-                    print(f"  ✓ Checkpoint 已保存")
+                    get_logger().info(f"  ✓ Checkpoint 已保存")
                 except Exception as e:
-                    print(f"  ✗ 保存失败: {e}")
+                    get_logger().error(f"  ✗ 保存失败: {e}")
         finally:
             # 停止 Worker
             self._stop_workers()
@@ -1420,9 +1473,13 @@ def save_checkpoint(solver, game, model_dir, save_prefix, iteration, is_final=Fa
 
 
 def main():
+    global logger
+    # 初始化logging（输出到stdout，nohup会捕获）
+    logger = setup_logging()
+    
     # 注册信号处理，确保被 kill 时也能清理子进程
     def signal_handler(signum, frame):
-        print(f"\n接收到信号 {signum}，正在清理并退出...")
+        get_logger().info(f"\n接收到信号 {signum}，正在清理并退出...")
         # 注意：这里不能直接调用 solver._stop_workers() 因为 solver 不在作用域内
         # 但由于 worker 进程已设置为 daemon=True，主进程退出时它们会自动被系统清理
         sys.exit(0)

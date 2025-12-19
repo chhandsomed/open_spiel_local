@@ -169,7 +169,7 @@ def load_model(model_dir, num_players=None, device='cpu'):
         # 使用简单特征版本
         state = game.new_initial_state()
         embedding_size = len(state.information_state_tensor(0))
-        print(f"  使用简单特征版本（{embedding_size}维 + 7维特征 = {embedding_size + 7}维）")
+        print(f"  使用简单特征版本（{embedding_size}维 + 1维特征 = {embedding_size + 1}维）")
         solver = DeepCFRSimpleFeature(
             game,
             policy_network_layers=policy_layers,

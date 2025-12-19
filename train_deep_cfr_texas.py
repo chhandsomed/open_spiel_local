@@ -145,7 +145,7 @@ def train_deep_cfr(
     save_history=True,
     save_dir="models",
     use_feature_transform=True,  # 新增：是否使用特征转换层
-    use_simple_feature=True,  # 新增：是否使用简单版本（直接拼接7维特征，推荐True）
+    use_simple_feature=True,  # 新增：是否使用简单版本（直接拼接1维手牌强度特征，推荐True）
     transformed_size=150,  # 新增：转换后的特征大小（仅用于复杂版本）
     use_hybrid_transform=True,  # 新增：是否使用混合特征转换（仅用于复杂版本）
     betting_abstraction="fcpa", # 新增：下注抽象模式
@@ -296,7 +296,7 @@ def train_deep_cfr(
     try:
         if use_feature_transform:
             if use_simple_feature:
-                # 使用简单版本：直接拼接7维手动特征
+                # 使用简单版本：直接拼接1维手牌强度特征
                 deep_cfr_solver = DeepCFRSimpleFeature(
                     game,
                     policy_network_layers=policy_layers,
@@ -313,9 +313,9 @@ def train_deep_cfr(
                 )
                 print("  ✓ DeepCFR Simple Feature 求解器创建成功（简单版本）")
                 print(f"  ✓ 原始信息状态大小: {deep_cfr_solver._embedding_size}")
-                print(f"  ✓ 手动特征维度: 7 (直接拼接)")
-                print(f"  ✓ MLP输入维度: {deep_cfr_solver._embedding_size + 7}")
-                print(f"  ✓ 说明: 信息状态({deep_cfr_solver._embedding_size}维) + 手动特征(7维) -> MLP")
+                print(f"  ✓ 手动特征维度: 1 (手牌强度)")
+                print(f"  ✓ MLP输入维度: {deep_cfr_solver._embedding_size + 1}")
+                print(f"  ✓ 说明: 信息状态({deep_cfr_solver._embedding_size}维) + 手动特征(1维) -> MLP")
             else:
                 # 使用复杂版本：特征转换层
                 deep_cfr_solver = DeepCFRWithFeatureTransform(
@@ -336,10 +336,10 @@ def train_deep_cfr(
                 )
                 print("  ✓ DeepCFR with Feature Transform 求解器创建成功（复杂版本）")
                 print(f"  ✓ 原始信息状态大小: {deep_cfr_solver._embedding_size} (自动检测，保留)")
-                print(f"  ✓ 手动特征维度: 7 (新增)")
+                print(f"  ✓ 手动特征维度: 1 (手牌强度)")
                 print(f"  ✓ 可学习特征维度: 64 (新增)")
-                combined_size = deep_cfr_solver._embedding_size + 7 + 64
-                print(f"  ✓ 合并后维度: {combined_size} (原始{deep_cfr_solver._embedding_size} + 手动7 + 可学习64)")
+                combined_size = deep_cfr_solver._embedding_size + 1 + 64
+                print(f"  ✓ 合并后维度: {combined_size} (原始{deep_cfr_solver._embedding_size} + 手动1 + 可学习64)")
                 print(f"  ✓ 最终输出维度: {transformed_size}")
                 print(f"  ✓ 使用混合特征转换: {use_hybrid_transform}")
         else:
@@ -691,7 +691,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_history", action="store_true", default=True, help="保存训练历史到JSON文件")
     parser.add_argument("--use_feature_transform", action="store_true", default=True, help="使用特征转换层（默认启用）")
     parser.add_argument("--no_feature_transform", dest="use_feature_transform", action="store_false", help="不使用特征转换层")
-    parser.add_argument("--use_simple_feature", action="store_true", default=True, help="使用简单版本（直接拼接7维特征，默认启用，推荐）")
+    parser.add_argument("--use_simple_feature", action="store_true", default=True, help="使用简单版本（直接拼接1维手牌强度特征，默认启用，推荐）")
     parser.add_argument("--no_simple_feature", dest="use_simple_feature", action="store_false", help="不使用简单版本（使用复杂特征转换层）")
     parser.add_argument("--transformed_size", type=int, default=150, help="转换后的特征大小（仅用于复杂版本，默认150）")
     parser.add_argument("--use_hybrid_transform", action="store_true", default=True, help="使用混合特征转换（仅用于复杂版本，默认启用）")

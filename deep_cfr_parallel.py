@@ -441,6 +441,20 @@ class ParallelDeepCFRSolver:
         self._last_memory_check = 0
         self._memory_check_interval = 60  # 每60秒检查一次内存
         
+        # 队列监控和动态调整
+        self._queue_stats = {
+            'last_queue_sizes': {},  # {queue_name: size}
+            'queue_growth_rates': {},  # {queue_name: samples/sec}
+            'last_check_time': time.time(),
+            'collection_counts': {},  # {queue_name: count} 用于统计收集速度
+        }
+        self._adaptive_max_collect = {
+            'base': 20000,  # 基础值
+            'min': 5000,    # 最小值
+            'max': 100000,  # 最大值（根据队列大小动态调整）
+            'current': 20000,  # 当前值
+        }
+        
         # 多 GPU 设置
         self.gpu_ids = gpu_ids
         self.use_multi_gpu = gpu_ids is not None and len(gpu_ids) > 1 and torch.cuda.is_available()
@@ -733,13 +747,13 @@ class ParallelDeepCFRSolver:
         - 清理队列不会影响已收集的样本数量
         - 队列积压会占用内存，需要及时清理
         """
-        # 检查队列是否积压
+        # 检查队列是否积压（提高阈值到90%，减少清理频率）
         queue_backlog = False
         for q in self._advantage_queues:
-            if q.qsize() > self.queue_maxsize * 0.85:  # 提高到85%阈值
+            if q.qsize() > self.queue_maxsize * 0.90:  # 从85%提高到90%
                 queue_backlog = True
                 break
-        if self._strategy_queue.qsize() > self.queue_maxsize * 0.85:
+        if self._strategy_queue.qsize() > self.queue_maxsize * 0.90:  # 从85%提高到90%
             queue_backlog = True
         
         if not queue_backlog:
@@ -748,27 +762,32 @@ class ParallelDeepCFRSolver:
         total_advantage_queue = sum(q.qsize() for q in self._advantage_queues)
         strategy_queue_size = self._strategy_queue.qsize()
         
-        # 清理队列中的积压样本（减少丢弃比例：从50%降到25%）
+        # 清理队列中的积压样本（减少丢弃比例：从25%降到10%，只清理超出90%的部分）
         for player, q in enumerate(self._advantage_queues):
             queue_size = q.qsize()
-            if queue_size > self.queue_maxsize * 0.85:
-                # 丢弃队列中最旧的25%样本（原来是50%）
-                to_discard = queue_size // 4
+            if queue_size > self.queue_maxsize * 0.90:
+                # 只丢弃超出90%的部分，而不是整个队列的10%
+                # 这样可以减少样本丢失
+                target_size = int(self.queue_maxsize * 0.90)
+                to_discard = queue_size - target_size
                 for _ in range(to_discard):
                     try:
                         q.get_nowait()
                     except queue.Empty:
                         break
-                get_logger().info(f"      玩家 {player} 队列清理: {queue_size} -> {q.qsize()} (丢弃了 {to_discard} 个积压样本)")
+                if to_discard > 0:
+                    get_logger().info(f"      玩家 {player} 队列清理: {queue_size} -> {q.qsize()} (丢弃了 {to_discard} 个积压样本)")
         
-        if strategy_queue_size > self.queue_maxsize * 0.85:
-            to_discard = strategy_queue_size // 4  # 从50%降到25%
+        if strategy_queue_size > self.queue_maxsize * 0.90:
+            target_size = int(self.queue_maxsize * 0.90)
+            to_discard = strategy_queue_size - target_size
             for _ in range(to_discard):
                 try:
                     self._strategy_queue.get_nowait()
                 except queue.Empty:
                     break
-            get_logger().info(f"      策略队列清理: {strategy_queue_size} -> {self._strategy_queue.qsize()} (丢弃了 {to_discard} 个积压样本)")
+            if to_discard > 0:
+                get_logger().info(f"      策略队列清理: {strategy_queue_size} -> {self._strategy_queue.qsize()} (丢弃了 {to_discard} 个积压样本)")
     
     def _cleanup_buffers(self, force=False):
         """清理缓冲区（不应该在样本收集循环中执行）
@@ -865,20 +884,46 @@ class ParallelDeepCFRSolver:
                                         del data[idx]
                                         removed_count += 1
                                 
-                                # 修复：ReservoirBuffer的_add_calls是普通int，不是Value对象
-                                buffer._add_calls = len(data)
-                                get_logger().info(f"      玩家 {player} 优势样本: {original_len:,} -> {len(data):,} (删除 {removed_count:,} 个)")
+                                # 关键修复：保持_add_calls的累计值，不要重置
+                                # _add_calls应该记录总共添加了多少次样本（包括被替换的），
+                                # 这样才能保证蓄水池采样的正确性。
+                                # 如果重置为len(data)，会导致后续新样本的替换概率变得很低。
+                                # 我们保持_add_calls不变，或者至少不要重置为当前长度。
+                                # 这里我们使用一个保守的估计：保持原来的_add_calls，或者
+                                # 如果_add_calls太小（说明之前被重置过），则设置为一个合理的值
+                                if buffer._add_calls < original_len:
+                                    # 如果_add_calls被重置过，设置为一个合理的值
+                                    # 假设每个保留的样本平均被添加了多次
+                                    buffer._add_calls = max(buffer._add_calls, len(data) * 2)
+                                # 否则保持_add_calls不变
+                                get_logger().info(f"      玩家 {player} 优势样本: {original_len:,} -> {len(data):,} (删除 {removed_count:,} 个, _add_calls: {buffer._add_calls:,})")
                 
                 # 清理策略样本
                 if len(self._strategy_memories) >= self.memory_capacity * 0.90:  # 从0.9提高到0.90（保持一致）
-                    all_samples = list(self._strategy_memories._data)
+                    buffer = self._strategy_memories
+                    all_samples = list(buffer._data)
                     all_samples.sort(key=lambda x: x.iteration, reverse=True)
                     keep_count = int(self.memory_capacity * 0.90)  # 从0.95降到0.90，与优势样本一致
                     samples_to_keep = all_samples[:keep_count]
-                    self._strategy_memories.clear()
+                    
+                    # 保存_add_calls的值
+                    old_add_calls = buffer._add_calls
+                    
+                    # 清理并重新添加
+                    buffer.clear()
                     for sample in samples_to_keep:
-                        self._strategy_memories.add(sample)
-                    get_logger().info(f"      策略样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个)")
+                        buffer.add(sample)
+                    
+                    # 关键修复：恢复_add_calls的累计值
+                    # 如果原来的_add_calls太小（说明之前被重置过），设置为一个合理的值
+                    if old_add_calls < len(all_samples):
+                        buffer._add_calls = max(old_add_calls, len(samples_to_keep) * 2)
+                    else:
+                        # 保持原来的累计值，但减去被删除的样本数
+                        # 这是一个近似，因为_add_calls应该记录总添加次数，而不是当前样本数
+                        buffer._add_calls = old_add_calls
+                    
+                    get_logger().info(f"      策略样本: {len(all_samples):,} -> {len(samples_to_keep):,} (删除最旧 {len(all_samples) - len(samples_to_keep):,} 个, _add_calls: {buffer._add_calls:,})")
             
             # 强制 Python 垃圾回收
             import gc
@@ -924,17 +969,157 @@ class ParallelDeepCFRSolver:
         if cleanup_buffers:
             self._cleanup_buffers(force=force)
     
+    def _update_adaptive_max_collect(self):
+        """动态调整max_collect，根据队列积压情况和CPU使用率自适应调整消费速度
+        
+        判断逻辑（优先级从高到低）：
+        1. **队列使用率**（主要指标）：队列积压情况，反映消费速度是否足够
+           - 使用率 > 80%：消费速度不够，需要增加max_collect
+           - 使用率 < 30%：消费速度过快，可以减少max_collect节省CPU
+        2. **队列增长率**（次要指标）：Worker产生速度，反映是否需要更快消费
+           - 增长率 > 100样本/秒：队列在快速增长，需要增加消费速度
+        3. **CPU使用率**（限制指标）：主进程CPU使用情况，避免过度消费导致CPU过载
+           - CPU使用率 > 90%：减少max_collect，避免CPU过载
+           - CPU使用率 < 50%：可以适当增加max_collect
+        
+        max_collect的范围：[min, max]，其中max = queue_maxsize * 0.5（避免一次性消费太多）
+        """
+        current_time = time.time()
+        stats = self._queue_stats
+        
+        # 计算所有队列的最大使用率
+        max_queue_usage = 0.0
+        total_queue_size = 0
+        total_queue_capacity = 0
+        
+        for player in range(self.num_players):
+            q_size = self._advantage_queues[player].qsize()
+            usage = q_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
+            max_queue_usage = max(max_queue_usage, usage)
+            total_queue_size += q_size
+            total_queue_capacity += self.queue_maxsize
+        
+        strategy_q_size = self._strategy_queue.qsize()
+        strategy_usage = strategy_q_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
+        max_queue_usage = max(max_queue_usage, strategy_usage)
+        total_queue_size += strategy_q_size
+        total_queue_capacity += self.queue_maxsize
+        
+        # 计算队列增长率（如果队列大小在增长）
+        time_delta = current_time - stats['last_check_time']
+        if time_delta > 1.0:  # 至少间隔1秒才更新
+            # 更新增长率
+            for player in range(self.num_players):
+                queue_name = f'advantage_{player}'
+                current_size = self._advantage_queues[player].qsize()
+                if queue_name in stats['last_queue_sizes']:
+                    old_size = stats['last_queue_sizes'][queue_name]
+                    growth = (current_size - old_size) / time_delta
+                    stats['queue_growth_rates'][queue_name] = growth
+                stats['last_queue_sizes'][queue_name] = current_size
+            
+            # 策略队列
+            queue_name = 'strategy'
+            current_size = self._strategy_queue.qsize()
+            if queue_name in stats['last_queue_sizes']:
+                old_size = stats['last_queue_sizes'][queue_name]
+                growth = (current_size - old_size) / time_delta
+                stats['queue_growth_rates'][queue_name] = growth
+            stats['last_queue_sizes'][queue_name] = current_size
+            
+            stats['last_check_time'] = current_time
+        
+        # 计算平均队列增长率
+        avg_growth_rate = 0.0
+        if stats['queue_growth_rates']:
+            avg_growth_rate = sum(stats['queue_growth_rates'].values()) / len(stats['queue_growth_rates'])
+        
+        # 获取CPU使用率（如果可用）
+        cpu_percent = None
+        if HAS_PSUTIL:
+            try:
+                process = psutil.Process()
+                cpu_percent = process.cpu_percent(interval=0.1)  # 非阻塞，快速获取
+                # 如果获取失败，尝试获取系统CPU使用率
+                if cpu_percent is None or cpu_percent == 0:
+                    cpu_percent = psutil.cpu_percent(interval=0.1)
+            except:
+                pass
+        
+        # 动态调整max_collect
+        adaptive = self._adaptive_max_collect
+        base = adaptive['base']
+        min_val = adaptive['min']
+        # 修复：max_val不应该限制为队列大小的50%，应该允许一次性消费更多
+        # 队列大小5000时，max_val应该是队列大小的4-10倍，确保能快速消费
+        max_val = min(adaptive['max'], max(self.queue_maxsize * 4, 20000))  # 至少队列大小的4倍，或20000
+        
+        # 1. 根据队列使用率调整（主要指标）
+        if max_queue_usage > 0.80:
+            # 队列使用率 > 80%，增加消费速度
+            factor = 1.0 + (max_queue_usage - 0.80) * 2.0  # 最多增加到2倍
+            new_max_collect = int(base * factor)
+        elif max_queue_usage < 0.30:
+            # 队列使用率 < 30%，减少消费速度（节省CPU）
+            factor = 0.5 + (max_queue_usage / 0.30) * 0.5  # 最少减少到0.5倍
+            new_max_collect = int(base * factor)
+        else:
+            # 正常范围，保持基础值
+            new_max_collect = base
+        
+        # 2. 根据队列增长率调整（次要指标）
+        if avg_growth_rate > 100:  # 每秒增长超过100个样本
+            growth_factor = min(1.5, 1.0 + avg_growth_rate / 1000.0)  # 最多1.5倍
+            new_max_collect = int(new_max_collect * growth_factor)
+        
+        # 3. 根据CPU使用率调整（限制指标，避免CPU过载）
+        # 注意：如果队列使用率很高（>90%），优先处理队列积压，即使CPU高也要增加消费速度
+        if cpu_percent is not None:
+            if max_queue_usage > 0.90:
+                # 队列使用率 > 90%，优先处理队列积压，即使CPU高也要增加消费速度
+                # 但如果CPU非常高（>95%），适当限制，避免系统过载
+                if cpu_percent > 95:
+                    # CPU > 95%，稍微限制，但不要减少太多
+                    cpu_factor = max(0.8, 1.0 - (cpu_percent - 95) / 10.0)  # 最多减少到0.8倍
+                    new_max_collect = int(new_max_collect * cpu_factor)
+                # 否则，队列积压优先，不限制消费速度
+            elif cpu_percent > 90:
+                # 队列使用率不高，但CPU使用率 > 90%，减少消费速度，避免CPU过载
+                cpu_factor = max(0.5, 1.0 - (cpu_percent - 90) / 20.0)  # 最多减少到0.5倍
+                new_max_collect = int(new_max_collect * cpu_factor)
+            elif cpu_percent < 50 and max_queue_usage > 0.50:
+                # CPU使用率 < 50% 且队列使用率 > 50%，可以适当增加消费速度
+                cpu_factor = min(1.2, 1.0 + (50 - cpu_percent) / 100.0)  # 最多增加1.2倍
+                new_max_collect = int(new_max_collect * cpu_factor)
+        
+        # 限制在合理范围内
+        new_max_collect = max(min_val, min(max_val, new_max_collect))
+        adaptive['current'] = new_max_collect
+        
+        # 记录调整原因（用于调试）
+        adaptive['last_adjustment'] = {
+            'queue_usage': max_queue_usage,
+            'growth_rate': avg_growth_rate,
+            'cpu_percent': cpu_percent,
+            'final_value': new_max_collect,
+        }
+        
+        return new_max_collect
+    
     def _collect_samples(self, timeout=0.1):
         """从队列收集样本
         
         关键修复：
         1. 只清理队列积压（不影响样本收集进度）
         2. 缓冲区清理在样本收集完成后执行，避免删除正在收集的样本
-        3. 这样可以避免清理操作导致收集进度倒退
+        3. 动态调整max_collect，根据队列积压情况自适应调整消费速度
         """
         # 只清理队列积压（安全，不影响收集进度）
         # 缓冲区清理在样本收集完成后执行
         self._check_and_cleanup_memory(cleanup_buffers=False)
+        
+        # 动态调整max_collect
+        max_collect = self._update_adaptive_max_collect()
         
         # 检查 Worker 状态（增强版：检查退出码）
         dead_workers = []
@@ -952,42 +1137,65 @@ class ParallelDeepCFRSolver:
                     error_msg += f"\n  可能的错误原因: 退出码 {exit_code} 通常表示进程被系统杀死（如OOM）"
             raise RuntimeError(error_msg)
 
-        # 收集优势样本
+        # 收集优势样本（批量处理，提高效率）
         # 注意：队列积压清理已在 _collect_samples() 中执行，不影响收集进度
+        total_collected_advantage = 0
         for player in range(self.num_players):
             collected_count = 0
-            max_collect = 10000 
+            batch_list = []
+            # 先批量获取，减少锁竞争
             while collected_count < max_collect:
                 try:
                     batch = self._advantage_queues[player].get_nowait()
-                    # 检查是单个样本还是批次
+                    batch_list.append(batch)
                     if isinstance(batch, list):
-                        for sample in batch:
-                            self._advantage_memories[player].add(sample)
                         collected_count += len(batch)
                     else:
-                        self._advantage_memories[player].add(batch)
                         collected_count += 1
                 except queue.Empty:
                     break
+            
+            # 批量添加到缓冲区
+            for batch in batch_list:
+                if isinstance(batch, list):
+                    for sample in batch:
+                        self._advantage_memories[player].add(sample)
+                    total_collected_advantage += len(batch)
+                else:
+                    self._advantage_memories[player].add(batch)
+                    total_collected_advantage += 1
         
-        # 收集策略样本
+        # 收集策略样本（批量处理，提高效率）
         # 注意：队列积压清理已在 _collect_samples() 中执行，不影响收集进度
         collected_count = 0
-        max_collect = 10000
+        batch_list = []
+        # 先批量获取，减少锁竞争
         while collected_count < max_collect:
             try:
                 batch = self._strategy_queue.get_nowait()
-                # 检查是单个样本还是批次
+                batch_list.append(batch)
                 if isinstance(batch, list):
-                    for sample in batch:
-                        self._strategy_memories.add(sample)
                     collected_count += len(batch)
                 else:
-                    self._strategy_memories.add(batch)
                     collected_count += 1
             except queue.Empty:
                 break
+        
+        # 批量添加到缓冲区
+        total_collected_strategy = 0
+        for batch in batch_list:
+            if isinstance(batch, list):
+                for sample in batch:
+                    self._strategy_memories.add(sample)
+                total_collected_strategy += len(batch)
+            else:
+                self._strategy_memories.add(batch)
+                total_collected_strategy += 1
+        
+        # 记录收集统计（用于调试和监控）
+        if total_collected_advantage > 0 or total_collected_strategy > 0:
+            self._queue_stats['collection_counts']['advantage'] = total_collected_advantage
+            self._queue_stats['collection_counts']['strategy'] = total_collected_strategy
     
     def _learn_advantage_network(self, player):
         """训练优势网络"""
@@ -1125,7 +1333,15 @@ class ParallelDeepCFRSolver:
                 no_progress_count = 0  # 连续无进展次数
                 
                 # 关键修复：样本收集循环中只清理队列积压，不清理缓冲区
+                # 优化：根据队列状态动态调整sleep时间，队列满时不sleep，队列空时才sleep
                 while True:
+                    # 检查队列状态，决定是否需要sleep
+                    queue_sizes = [q.qsize() for q in self._advantage_queues]
+                    strategy_queue_size = self._strategy_queue.qsize()
+                    total_queue_size = sum(queue_sizes) + strategy_queue_size
+                    max_queue_size = max(max(queue_sizes) if queue_sizes else 0, strategy_queue_size)
+                    queue_usage = max_queue_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
+                    
                     self._collect_samples()  # 内部只清理队列积压
                     new_current_samples = sum(len(m) for m in self._advantage_memories)
                     
@@ -1194,8 +1410,17 @@ class ParallelDeepCFRSolver:
                         print(f"\n  ⚠️ 警告: 连续 {no_progress_count * 0.5:.1f}秒无样本收集进展")
                         no_progress_count = 0  # 重置计数器，避免重复打印
                     
-                    # 稍微睡一下，避免 CPU 空转，同时也给 Worker 提交数据的机会
-                    time.sleep(0.5)
+                    # 优化：根据队列状态动态调整sleep时间
+                    # 队列使用率 > 80% 时不sleep，队列空时才sleep，避免消费速度不够快
+                    if queue_usage > 0.80:
+                        # 队列满了，不sleep，立即继续消费
+                        pass
+                    elif total_queue_size == 0:
+                        # 队列为空，sleep 0.5秒，避免CPU空转
+                        time.sleep(0.5)
+                    else:
+                        # 队列有数据但不满，sleep 0.1秒，平衡消费速度和CPU使用率
+                        time.sleep(0.1)
                 
                 # 关键修复：样本收集完成后，清理缓冲区（避免在收集过程中删除样本）
                 # 这样可以避免清理操作导致收集进度倒退
@@ -1221,10 +1446,41 @@ class ParallelDeepCFRSolver:
                 iter_time = time.time() - iter_start
                 
                 if verbose:
+                    # 显示队列状态和消费速度信息
+                    queue_info = []
+                    max_queue_usage = 0.0
+                    for player in range(self.num_players):
+                        q_size = self._advantage_queues[player].qsize()
+                        usage = q_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
+                        max_queue_usage = max(max_queue_usage, usage)
+                        if q_size > 0:
+                            queue_info.append(f"玩家{player}:{q_size}")
+                    
+                    strategy_q_size = self._strategy_queue.qsize()
+                    strategy_usage = strategy_q_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
+                    max_queue_usage = max(max_queue_usage, strategy_usage)
+                    
+                    queue_status = ""
+                    if queue_info or strategy_q_size > 0:
+                        queue_status = f" | 队列: {', '.join(queue_info)}"
+                        if strategy_q_size > 0:
+                            queue_status += f",策略:{strategy_q_size}"
+                        
+                        # 显示调整信息
+                        adj_info = self._adaptive_max_collect.get('last_adjustment', {})
+                        cpu_info = ""
+                        if adj_info.get('cpu_percent') is not None:
+                            cpu_info = f", CPU:{adj_info['cpu_percent']:.0f}%"
+                        growth_info = ""
+                        if adj_info.get('growth_rate', 0) > 0:
+                            growth_info = f", 增长率:{adj_info['growth_rate']:.0f}/s"
+                        
+                        queue_status += f" (使用率:{max_queue_usage*100:.0f}%{growth_info}{cpu_info}, max_collect:{self._adaptive_max_collect['current']:,})"
+                    
                     get_logger().info(f"  迭代 {iteration + 1}/{self.num_iterations} "
                           f"(耗时: {iter_time:.2f}秒) | "
                           f"优势样本: {sum(len(m) for m in self._advantage_memories):,} | "
-                          f"策略样本: {len(self._strategy_memories):,}")
+                          f"策略样本: {len(self._strategy_memories):,}{queue_status}")
                 
                 if (iteration + 1) % eval_interval == 0:
                     print()

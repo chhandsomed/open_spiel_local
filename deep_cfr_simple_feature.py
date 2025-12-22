@@ -56,11 +56,58 @@ def unwrap_data_parallel(model):
     return model
 
 
+def detect_manual_feature_size_from_state_dict(state_dict, raw_input_size):
+    """从模型权重自动检测手动特征维度
+    
+    Args:
+        state_dict: 模型权重字典
+        raw_input_size: 原始信息状态大小
+    
+    Returns:
+        manual_feature_size: 手动特征维度（1或7），如果无法检测则返回None
+    """
+    # 查找 MLP 第一层的权重
+    # MLP 的第一层权重形状是 [hidden_size, input_size]
+    # input_size = raw_input_size + manual_feature_size
+    
+    for key, value in state_dict.items():
+        # 处理 DataParallel 的 key（可能包含 'module.' 前缀）
+        clean_key = key.replace('module.', '')
+        
+        # 查找 MLP 的第一层（通常是 'mlp.model.0._linear._weight' 或类似）
+        if 'mlp' in clean_key.lower() and ('weight' in clean_key.lower() or 'linear' in clean_key.lower()):
+            if len(value.shape) == 2:
+                # 第一层的输入维度
+                mlp_input_size = value.shape[1]
+                
+                # 计算特征维度
+                feature_size = mlp_input_size - raw_input_size
+                
+                if feature_size == 1:
+                    return 1  # 新版本：1维特征
+                elif feature_size == 7:
+                    return 7  # 老版本：7维特征
+                else:
+                    # 如果检测到其他维度，返回None让用户手动指定
+                    print(f"⚠️  检测到未知的特征维度: {feature_size} (MLP输入: {mlp_input_size}, 原始输入: {raw_input_size})")
+                    return None
+    
+    return None
+
+
 class SimpleFeatureMLP(nn.Module):
-    """简单的MLP，在输入前拼接手动特征"""
+    """简单的MLP，在输入前拼接手动特征
+    
+    兼容性说明：
+    - 新版本：1维特征（手牌强度）
+    - 老版本：7维特征（位置4维 + 手牌强度1维 + 下注统计2维）
+    
+    自动检测：根据 MLP 第一层的输入维度推断特征维度
+    """
     
     def __init__(self, raw_input_size, hidden_sizes, output_size, 
-                 num_players=6, max_game_length=52, activate_final=False, max_stack=2000):
+                 num_players=6, max_game_length=52, activate_final=False, max_stack=2000,
+                 manual_feature_size=None):
         """
         Args:
             raw_input_size: 原始信息状态大小（例如224，取决于游戏配置）
@@ -70,19 +117,21 @@ class SimpleFeatureMLP(nn.Module):
             max_game_length: 最大游戏长度
             activate_final: 最后一层是否使用激活函数
             max_stack: 单个玩家的最大筹码量（用于归一化下注统计特征，默认2000）
+            manual_feature_size: 手动特征维度（None时自动推断：1维或7维）
         """
         super(SimpleFeatureMLP, self).__init__()
         self.num_players = num_players
         self.max_game_length = max_game_length
         self.max_stack = float(max_stack)  # 保留用于兼容性
-        self.manual_feature_size = 1  # 手动特征维度：只有手牌强度(1维)
         
-        # 输入维度 = 原始信息状态 + 手动特征（1维：手牌强度）
+        # 如果未指定，默认使用新版本（1维）
+        if manual_feature_size is None:
+            self.manual_feature_size = 1  # 新版本：只有手牌强度(1维)
+        else:
+            self.manual_feature_size = manual_feature_size
+        
+        # 输入维度 = 原始信息状态 + 手动特征
         input_size = raw_input_size + self.manual_feature_size
-        
-        # 验证：确保没有意外添加额外的特征
-        assert input_size == raw_input_size + 1, \
-            f"输入维度错误: 期望 {raw_input_size + 1}，实际计算为 {input_size}"
         
         # 使用原始的MLP结构
         self.mlp = deep_cfr.MLP(
@@ -96,17 +145,62 @@ class SimpleFeatureMLP(nn.Module):
         self.raw_input_size = raw_input_size
     
     def extract_manual_features(self, x):
-        """提取手动特征 - 只保留手牌强度特征（1维）"""
+        """提取手动特征
+        
+        兼容性支持：
+        - 新版本（1维）：只提取手牌强度
+        - 老版本（7维）：位置特征(4维) + 手牌强度(1维) + 下注统计(2维)
+        """
         batch_size = x.shape[0]
+        features = []
         
-        # 手牌强度特征（唯一保留的手动特征）
-        hole_cards = x[:, self.num_players:self.num_players+52]
-        board_cards = x[:, self.num_players+52:self.num_players+104]
-        hand_strength_features = calculate_hand_strength_features(
-            hole_cards, board_cards
-        )
+        if self.manual_feature_size == 1:
+            # 新版本：只有手牌强度特征（1维）
+            hole_cards = x[:, self.num_players:self.num_players+52]
+            board_cards = x[:, self.num_players+52:self.num_players+104]
+            hand_strength_features = calculate_hand_strength_features(
+                hole_cards, board_cards
+            )
+            return hand_strength_features  # 1维：手牌强度
         
-        return hand_strength_features  # 只有1维：手牌强度
+        elif self.manual_feature_size == 7:
+            # 老版本：7维特征（位置4维 + 手牌强度1维 + 下注统计2维）
+            # 1. 位置特征（4维）
+            try:
+                from deep_cfr_with_feature_transform import calculate_position_advantage
+                player_pos = x[:, 0:self.num_players]
+                player_idx = torch.argmax(player_pos, dim=1, keepdim=True).float()
+                position_features = calculate_position_advantage(player_idx, self.num_players)
+                features.append(position_features)  # 4维
+            except ImportError:
+                # 如果没有该函数，使用零填充
+                features.append(torch.zeros(batch_size, 4, device=x.device))
+            
+            # 2. 手牌强度特征（1维）
+            hole_cards = x[:, self.num_players:self.num_players+52]
+            board_cards = x[:, self.num_players+52:self.num_players+104]
+            hand_strength_features = calculate_hand_strength_features(
+                hole_cards, board_cards
+            )
+            features.append(hand_strength_features)  # 1维
+            
+            # 3. 下注统计特征（2维）
+            action_seq_start = self.num_players + 104
+            action_seq_end = action_seq_start + self.max_game_length * 2
+            action_seq = x[:, action_seq_start:action_seq_end]
+            action_sizings_start = action_seq_end
+            action_sizings = x[:, action_sizings_start:action_sizings_start+self.max_game_length]
+            
+            total_bet = torch.sum(action_sizings, dim=1, keepdim=True)
+            max_bet = torch.max(action_sizings, dim=1, keepdim=True)[0]
+            max_bet_norm = max_bet / self.max_stack
+            total_bet_norm = total_bet / self.max_stack
+            
+            features.extend([max_bet_norm, total_bet_norm])  # 2维
+            
+            return torch.cat(features, dim=1)  # 总共7维
+        else:
+            raise ValueError(f"不支持的特征维度: {self.manual_feature_size}，只支持1维或7维")
     
     def forward(self, x):
         """
@@ -188,11 +282,9 @@ class SimpleFeatureMLP(nn.Module):
         # 提取手动特征（1维：手牌强度）
         manual_features = self.extract_manual_features(x)
         
-        # 验证手动特征维度（应该是1维：手牌强度）
+        # 验证手动特征维度
         assert manual_features.shape[1] == self.manual_feature_size, \
             f"手动特征维度错误: 期望 {self.manual_feature_size}，实际 {manual_features.shape[1]}"
-        assert self.manual_feature_size == 1, \
-            f"手动特征维度应该是1维（手牌强度），当前为 {self.manual_feature_size}"
         
         # 2. 对原始输入 x 进行归一化处理 (Critical Fix!)
         # 原始 x 中的 sizings 部分包含绝对金额 (0-20000)，必须归一化
@@ -252,13 +344,15 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
                  reinitialize_advantage_networks: bool = True,
                  device=None,
                  multi_gpu: bool = False,
-                 gpu_ids=None):
+                 gpu_ids=None,
+                 manual_feature_size=None):
         """
         与原始DeepCFRSolver相同，但使用SimpleFeatureMLP
         
         Args:
             multi_gpu: 是否使用多 GPU 并行
             gpu_ids: GPU ID 列表（None 表示使用所有可用 GPU）
+            manual_feature_size: 手动特征维度（None时使用默认1维，7表示老版本）
         """
         # 先初始化基础属性（不创建网络）
         import pyspiel
@@ -281,6 +375,9 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
         self._reinitialize_advantage_networks = reinitialize_advantage_networks
         self._num_actions = game.num_distinct_actions()
         self._iteration = 1
+        
+        # 保存手动特征维度（用于创建网络）
+        self._manual_feature_size = manual_feature_size
         
         # 多 GPU 设置
         self._multi_gpu = multi_gpu
@@ -307,6 +404,8 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
                     pass
         
         # 创建策略网络（使用SimpleFeatureMLP）
+        # 支持手动指定特征维度（用于兼容老模型）
+        manual_feature_size = getattr(self, '_manual_feature_size', None)
         self._strategy_memories = deep_cfr.ReservoirBuffer(memory_capacity)
         policy_net = SimpleFeatureMLP(
             self._embedding_size,
@@ -314,7 +413,8 @@ class DeepCFRSimpleFeature(deep_cfr.DeepCFRSolver):
             self._num_actions,
             num_players=self._num_players,
             max_game_length=game.max_game_length(),
-            max_stack=max_stack
+            max_stack=max_stack,
+            manual_feature_size=manual_feature_size  # 传递特征维度
         )
         
         # 多 GPU 包装

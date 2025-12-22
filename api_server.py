@@ -662,7 +662,14 @@ def load_model(model_dir, device='cpu', num_players=None):
         with open(config_path, 'r') as f:
             config = json.load(f)
     else:
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        # 兼容老模型：如果没有 config.json，使用默认配置（标准MLP）
+        print(f"⚠️  Config file not found: {config_path}, using default config for legacy model")
+        config = {
+            'use_simple_feature': False,
+            'use_feature_transform': False,
+            'policy_layers': [64, 64],  # 默认层数，老模型常用
+            'betting_abstraction': 'fchpa'
+        }
     
     # 如果num_players未指定，从config读取
     if num_players is None:
@@ -775,16 +782,8 @@ def load_model(model_dir, device='cpu', num_players=None):
     # 创建网络（基于 play_gradio.py 的逻辑）
     if use_simple_feature and HAVE_CUSTOM_FEATURES:
         print(f"Using Simple Feature Model (num_players={num_players})")
-        solver = DeepCFRSimpleFeature(
-            game,
-            policy_network_layers=policy_layers,
-            advantage_network_layers=(32, 32),
-            num_iterations=1,
-            num_traversals=1,
-            learning_rate=1e-4,
-            device=device
-        )
-        # 处理 DataParallel
+        
+        # 先加载权重，检测特征维度
         state_dict = torch.load(policy_path, map_location=device)
         new_state_dict = {}
         for k, v in state_dict.items():
@@ -792,6 +791,32 @@ def load_model(model_dir, device='cpu', num_players=None):
                 new_state_dict[k[7:]] = v
             else:
                 new_state_dict[k] = v
+        
+        # 自动检测手动特征维度（兼容老模型7维和新模型1维）
+        from deep_cfr_simple_feature import detect_manual_feature_size_from_state_dict
+        detected_feature_size = detect_manual_feature_size_from_state_dict(
+            new_state_dict, embedding_size
+        )
+        
+        if detected_feature_size is not None:
+            print(f"  ✓ 自动检测到特征维度: {detected_feature_size}维 ({'老版本' if detected_feature_size == 7 else '新版本'})")
+            manual_feature_size = detected_feature_size
+        else:
+            # 如果无法检测，默认使用新版本（1维）
+            print(f"  ⚠️  无法自动检测特征维度，使用默认值: 1维（新版本）")
+            manual_feature_size = 1
+        
+        # 创建 solver（指定特征维度）
+        solver = DeepCFRSimpleFeature(
+            game,
+            policy_network_layers=policy_layers,
+            advantage_network_layers=(32, 32),
+            num_iterations=1,
+            num_traversals=1,
+            learning_rate=1e-4,
+            device=device,
+            manual_feature_size=manual_feature_size  # 传递特征维度
+        )
         
         solver._policy_network.load_state_dict(new_state_dict)
         solver._policy_network.eval()
@@ -851,14 +876,24 @@ def load_model(model_dir, device='cpu', num_players=None):
             print("Import Error for DeepCFRWithFeatureTransform")
             pass
 
-    # Standard MLP（基于 play_gradio.py）
+    # Standard MLP（老模型或默认模型）
     print(f"Using Standard MLP (num_players={num_players})")
     state = game.new_initial_state()
     embedding_size = len(state.information_state_tensor(0))
     num_actions = game.num_distinct_actions()
     network = MLP(embedding_size, list(policy_layers), num_actions)
     network = network.to(device)
-    network.load_state_dict(torch.load(policy_path, map_location=device))
+    
+    # 处理 DataParallel（老模型可能也有）
+    state_dict = torch.load(policy_path, map_location=device)
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith('module.'):
+            new_state_dict[k[7:]] = v
+        else:
+            new_state_dict[k] = v
+    
+    network.load_state_dict(new_state_dict)
     network.eval()
     
     # 存储模型到字典中
@@ -1214,14 +1249,20 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             
             return recommended_action, legal_probs, legal_actions
     
-    # Standard Network（基于 play_gradio.py）
+    # Standard Network（老模型：直接是 Network 对象）
+    print(f"\n📦 使用标准 Network 模型（老模型格式）", flush=True)
     info_state_raw = state.information_state_tensor(player)
     
     # 归一化action_sizings部分（与训练时保持一致）
     # 获取max_stack（从模型或游戏配置）
     max_stack = None
-    if hasattr(model, 'max_stack'):
-        max_stack = model.max_stack
+    # 处理 DataParallel（老模型可能也有）
+    actual_model = model
+    if isinstance(model, nn.DataParallel):
+        actual_model = model.module
+    
+    if hasattr(actual_model, 'max_stack'):
+        max_stack = actual_model.max_stack
     
     # 如果模型没有max_stack，从游戏配置解析
     if max_stack is None:
@@ -1304,8 +1345,9 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
     print(f"   手牌编码是相对于实际player的，不应该映射", flush=True)
     
     # 不再进行位置编码映射，直接使用原始信息状态
+    # 处理 DataParallel（老模型可能也有）
     with torch.no_grad():
-        logits = model(info_state)
+        logits = model(info_state)  # DataParallel 会自动处理
         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
     
     # 只保留合法动作的概率
@@ -1653,6 +1695,203 @@ def reload_model():
         }), 500
 
 
+@app.route('/api/v1/model_info', methods=['GET'])
+def model_info():
+    """查看当前使用的模型信息
+    
+    返回所有已加载模型的详细信息
+    """
+    global MODELS, CONFIGS, MODEL_DIRS, GAMES
+    
+    try:
+        num_players = request.args.get('num_players', type=int)
+        
+        if num_players is not None:
+            # 返回指定场次的模型信息
+            if num_players not in MODELS:
+                return jsonify({
+                    'success': False,
+                    'error': f'No model loaded for {num_players} players'
+                }), 404
+            
+            model = MODELS[num_players]
+            config = CONFIGS.get(num_players, {})
+            model_dir = MODEL_DIRS.get(num_players, 'N/A')
+            game = GAMES.get(num_players)
+            
+            # 获取模型类型信息
+            model_type = 'unknown'
+            feature_info = {}
+            
+            # 检查是否是 DeepCFRSolver（新模型）或直接是 Network（老模型）
+            if hasattr(model, '_policy_network'):
+                # 新模型：DeepCFRSolver 包装
+                policy_net = model._policy_network
+                # 处理 DataParallel
+                if isinstance(policy_net, nn.DataParallel):
+                    policy_net = policy_net.module
+                
+                if isinstance(policy_net, SimpleFeatureMLP):
+                    model_type = 'SimpleFeatureMLP'
+                    feature_info = {
+                        'manual_feature_size': policy_net.manual_feature_size,
+                        'raw_input_size': policy_net.raw_input_size,
+                        'input_size': policy_net.raw_input_size + policy_net.manual_feature_size,
+                        'description': '简单特征模型：原始信息状态 + 1维手牌强度特征'
+                    }
+                elif hasattr(policy_net, 'transformed_size'):
+                    model_type = 'FeatureTransformMLP'
+                    feature_info = {
+                        'transformed_size': getattr(policy_net, 'transformed_size', 'N/A'),
+                        'description': '特征转换模型：使用特征转换层'
+                    }
+                else:
+                    model_type = 'StandardMLP'
+                    feature_info = {
+                        'description': '标准MLP模型：无自定义特征（DeepCFRSolver包装）'
+                    }
+            elif isinstance(model, nn.Module):
+                # 老模型：直接是 Network 对象
+                policy_net = model
+                # 处理 DataParallel
+                if isinstance(policy_net, nn.DataParallel):
+                    policy_net = policy_net.module
+                
+                # 检查是否是 SimpleFeatureMLP（虽然老模型通常不是，但兼容性检查）
+                if isinstance(policy_net, SimpleFeatureMLP):
+                    model_type = 'SimpleFeatureMLP'
+                    feature_info = {
+                        'manual_feature_size': policy_net.manual_feature_size,
+                        'raw_input_size': policy_net.raw_input_size,
+                        'input_size': policy_net.raw_input_size + policy_net.manual_feature_size,
+                        'description': '简单特征模型：原始信息状态 + 1维手牌强度特征'
+                    }
+                elif hasattr(policy_net, 'transformed_size'):
+                    model_type = 'FeatureTransformMLP'
+                    feature_info = {
+                        'transformed_size': getattr(policy_net, 'transformed_size', 'N/A'),
+                        'description': '特征转换模型：使用特征转换层'
+                    }
+                else:
+                    # 标准 MLP（老模型）
+                    model_type = 'StandardMLP'
+                    feature_info = {
+                        'description': '标准MLP模型：无自定义特征（老模型格式）'
+                    }
+            
+            return jsonify({
+                'success': True,
+                'num_players': num_players,
+                'model_dir': model_dir,
+                'model_type': model_type,
+                'feature_info': feature_info,
+                'config': {
+                    'policy_layers': config.get('policy_layers', []),
+                    'advantage_layers': config.get('advantage_layers', []),
+                    'betting_abstraction': config.get('betting_abstraction', 'N/A'),
+                    'use_simple_feature': config.get('use_simple_feature', False),
+                    'use_feature_transform': config.get('use_feature_transform', False),
+                    'save_prefix': config.get('save_prefix', 'N/A'),
+                    'blinds': config.get('blinds', 'N/A'),
+                    'stack_size': config.get('stack_size', 'N/A'),
+                },
+                'device': str(model._device) if hasattr(model, '_device') else 'N/A'
+            })
+        else:
+            # 返回所有已加载模型的信息
+            all_models = {}
+            for np in sorted(MODELS.keys()):
+                model = MODELS[np]
+                config = CONFIGS.get(np, {})
+                model_dir = MODEL_DIRS.get(np, 'N/A')
+                
+                # 获取模型类型
+                model_type = 'unknown'
+                feature_info = {}
+                
+                # 检查是否是 DeepCFRSolver（新模型）或直接是 Network（老模型）
+                if hasattr(model, '_policy_network'):
+                    # 新模型：DeepCFRSolver 包装
+                    policy_net = model._policy_network
+                    if isinstance(policy_net, nn.DataParallel):
+                        policy_net = policy_net.module
+                    
+                    if isinstance(policy_net, SimpleFeatureMLP):
+                        model_type = 'SimpleFeatureMLP'
+                        feature_info = {
+                            'manual_feature_size': policy_net.manual_feature_size,
+                            'raw_input_size': policy_net.raw_input_size,
+                            'input_size': policy_net.raw_input_size + policy_net.manual_feature_size,
+                            'description': '简单特征模型：原始信息状态 + 1维手牌强度特征'
+                        }
+                    elif hasattr(policy_net, 'transformed_size'):
+                        model_type = 'FeatureTransformMLP'
+                        feature_info = {
+                            'transformed_size': getattr(policy_net, 'transformed_size', 'N/A'),
+                            'description': '特征转换模型：使用特征转换层'
+                        }
+                    else:
+                        model_type = 'StandardMLP'
+                        feature_info = {
+                            'description': '标准MLP模型：无自定义特征（DeepCFRSolver包装）'
+                        }
+                elif isinstance(model, nn.Module):
+                    # 老模型：直接是 Network 对象
+                    policy_net = model
+                    if isinstance(policy_net, nn.DataParallel):
+                        policy_net = policy_net.module
+                    
+                    # 检查是否是 SimpleFeatureMLP（虽然老模型通常不是，但兼容性检查）
+                    if isinstance(policy_net, SimpleFeatureMLP):
+                        model_type = 'SimpleFeatureMLP'
+                        feature_info = {
+                            'manual_feature_size': policy_net.manual_feature_size,
+                            'raw_input_size': policy_net.raw_input_size,
+                            'input_size': policy_net.raw_input_size + policy_net.manual_feature_size,
+                            'description': '简单特征模型：原始信息状态 + 1维手牌强度特征'
+                        }
+                    elif hasattr(policy_net, 'transformed_size'):
+                        model_type = 'FeatureTransformMLP'
+                        feature_info = {
+                            'transformed_size': getattr(policy_net, 'transformed_size', 'N/A'),
+                            'description': '特征转换模型：使用特征转换层'
+                        }
+                    else:
+                        # 标准 MLP（老模型）
+                        model_type = 'StandardMLP'
+                        feature_info = {
+                            'description': '标准MLP模型：无自定义特征（老模型格式）'
+                        }
+                
+                all_models[str(np)] = {
+                    'model_dir': model_dir,
+                    'model_type': model_type,
+                    'feature_info': feature_info,
+                    'config': {
+                        'policy_layers': config.get('policy_layers', []),
+                        'advantage_layers': config.get('advantage_layers', []),
+                        'betting_abstraction': config.get('betting_abstraction', 'N/A'),
+                        'use_simple_feature': config.get('use_simple_feature', False),
+                        'use_feature_transform': config.get('use_feature_transform', False),
+                        'save_prefix': config.get('save_prefix', 'N/A'),
+                    }
+                }
+            
+            return jsonify({
+                'success': True,
+                'loaded_models': all_models,
+                'total_models': len(all_models)
+            })
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': f'Failed to get model info: {str(e)}'
+        }), 500
+
+
 @app.route('/api/v1/action_mapping', methods=['GET'])
 def action_mapping():
     """获取动作映射表"""
@@ -1764,6 +2003,7 @@ def main():
     print(f"  GET  /api/v1/health - Health check")
     print(f"  POST /api/v1/recommend_action - Get recommended action")
     print(f"  POST /api/v1/reload_model - Reload model (dynamic model switching)")
+    print(f"  GET  /api/v1/model_info - Get current model information (supports ?num_players=X)")
     print(f"  GET  /api/v1/action_mapping - Get action mapping")
     print()
     

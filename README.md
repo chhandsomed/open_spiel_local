@@ -200,10 +200,10 @@ nohup python deep_cfr_parallel.py \
     --policy_layers 256 256 256 \
     --advantage_layers 256 256 256 \
     --memory_capacity 4000000 \
-    --queue_maxsize 10000 \
+    --queue_maxsize 30000 \
     --betting_abstraction fchpa \
     --save_prefix deepcfr_parallel_5p_custom_v2 \
-    > train_parallel_5p_v2.log 2>&1 &
+    > train_parallel_5p_v2_6.log 2>&1 &
 
 #### 续训脚本（从 checkpoint 恢复训练）
 ```bash
@@ -227,7 +227,7 @@ nohup python deep_cfr_parallel.py \
     --skip_nashconv \
     --learning_rate 0.001 \
     --memory_capacity 4000000 \
-    --queue_maxsize 10000 \
+    --queue_maxsize 30000 \
     > train_parallel_5p_v2_resume_2.log 2>&1 &
 ```
 

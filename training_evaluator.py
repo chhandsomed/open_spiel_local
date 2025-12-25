@@ -8,6 +8,7 @@
 import numpy as np
 import torch
 import pyspiel
+import re
 from collections import defaultdict
 
 
@@ -195,7 +196,8 @@ def play_test_game(
     deep_cfr_solver,
     opponent_strategy="random",
     verbose=False,
-    use_trained_for_all=True
+    use_trained_for_all=True,
+    trained_player=None
 ):
     """测试对局（自对弈或与随机策略对局）
     
@@ -205,6 +207,7 @@ def play_test_game(
         opponent_strategy: 对手策略 ("random" 或 "uniform")
         verbose: 是否显示详细信息
         use_trained_for_all: 是否所有玩家都使用训练策略（自对弈模式）
+        trained_player: 指定哪个玩家使用训练策略（None时在vs_random模式下随机选择）
     
     Returns:
         dict: 包含对局结果的字典
@@ -213,6 +216,10 @@ def play_test_game(
     returns = None
     num_players = game.num_players()
     max_steps = 1000  # 防止无限循环
+    
+    # 如果未指定trained_player且不是自对弈模式，随机选择一个玩家使用训练策略
+    if not use_trained_for_all and trained_player is None:
+        trained_player = np.random.randint(0, num_players)
     
     try:
         steps = 0
@@ -241,7 +248,7 @@ def play_test_game(
                     return None
                 
                 # 决定是否使用训练策略
-                use_trained = use_trained_for_all or (player == 0)
+                use_trained = use_trained_for_all or (player == trained_player)
                 
                 if use_trained:  # 使用训练的策略
                     try:
@@ -270,8 +277,9 @@ def play_test_game(
                             print(f"  ⚠️ 获取动作概率失败: {e}")
                         # 使用固定策略：选择第一个合法动作
                         action = legal_actions[0]
-                else:  # 对手使用固定策略：选择第一个合法动作
-                    action = legal_actions[0]
+                else:  # 对手使用随机策略
+                    # 随机选择合法动作
+                    action = np.random.choice(legal_actions)
                 
                 state = state.child(action)
             
@@ -285,10 +293,11 @@ def play_test_game(
             traceback.print_exc()
         return None
     
-    # 返回所有玩家的收益
+    # 返回所有玩家的收益和使用的训练玩家
     result = {
         'returns': returns,
         'num_players': num_players,
+        'trained_player': trained_player if not use_trained_for_all else None,
     }
     if returns:
         for i in range(min(len(returns), num_players)):
@@ -310,7 +319,7 @@ def evaluate_with_test_games(
         deep_cfr_solver: DeepCFRSolver 实例
         num_games: 测试对局数量
         verbose: 是否显示详细信息
-        mode: "self_play" (自对弈) 或 "vs_random" (玩家0用模型，其他用随机)
+        mode: "self_play" (自对弈) 或 "vs_random" (随机位置用模型，其他用随机)
     
     Returns:
         dict: 包含测试结果的字典
@@ -318,7 +327,7 @@ def evaluate_with_test_games(
     num_players = game.num_players()
     use_trained_for_all = (mode == "self_play")
     
-    # 初始化每个玩家的结果
+    # 初始化每个玩家的结果（包括作为训练玩家时的统计）
     results = {
         'num_players': num_players,
         'games_played': 0,
@@ -327,6 +336,10 @@ def evaluate_with_test_games(
     for i in range(num_players):
         results[f'player{i}_returns'] = []
         results[f'player{i}_wins'] = 0
+        # 当该玩家使用训练策略时的统计
+        results[f'player{i}_trained_returns'] = []
+        results[f'player{i}_trained_wins'] = 0
+        results[f'player{i}_trained_count'] = 0
     
     failed_games = 0
     error_messages = {}  # 记录错误类型和次数
@@ -340,10 +353,16 @@ def evaluate_with_test_games(
         if game_result:
             results['games_played'] += 1
             returns = game_result.get('returns', [])
+            trained_player = game_result.get('trained_player')
             
             # 记录每个玩家的收益
             for i in range(min(len(returns), num_players)):
                 results[f'player{i}_returns'].append(returns[i])
+            
+            # 如果使用训练策略的玩家不是所有玩家，记录该玩家的表现
+            if trained_player is not None:
+                results[f'player{trained_player}_trained_returns'].append(returns[trained_player])
+                results[f'player{trained_player}_trained_count'] += 1
             
             # 找出赢家（收益最高的玩家）
             if returns:
@@ -351,6 +370,9 @@ def evaluate_with_test_games(
                 winners = [i for i, r in enumerate(returns) if r == max_return]
                 if len(winners) == 1:
                     results[f'player{winners[0]}_wins'] += 1
+                    # 如果赢家是使用训练策略的玩家，记录
+                    if trained_player is not None and winners[0] == trained_player:
+                        results[f'player{trained_player}_trained_wins'] += 1
         else:
             failed_games += 1
             # 记录错误（简化版，不打印详细堆栈）
@@ -377,23 +399,103 @@ def evaluate_with_test_games(
         else:
             results[f'player{i}_avg_return'] = 0.0
             results[f'player{i}_win_rate'] = 0.0
+        
+        # 计算使用训练策略时的统计
+        trained_returns = results[f'player{i}_trained_returns']
+        trained_count = results[f'player{i}_trained_count']
+        if trained_count > 0:
+            results[f'player{i}_trained_avg_return'] = np.mean(trained_returns)
+            results[f'player{i}_trained_win_rate'] = results[f'player{i}_trained_wins'] / trained_count
+        else:
+            results[f'player{i}_trained_avg_return'] = 0.0
+            results[f'player{i}_trained_win_rate'] = 0.0
     
-    # 兼容旧接口
-    results['player0_returns'] = results.get('player0_returns', [])
-    results['player0_avg_return'] = results.get('player0_avg_return', 0.0)
-    results['player0_win_rate'] = results.get('player0_win_rate', 0.0)
+    # 兼容旧接口（使用训练策略时的平均表现）
+    if not use_trained_for_all:
+        # 计算所有位置使用训练策略时的平均表现
+        all_trained_returns = []
+        all_trained_wins = 0
+        total_trained_games = 0
+        for i in range(num_players):
+            all_trained_returns.extend(results[f'player{i}_trained_returns'])
+            all_trained_wins += results[f'player{i}_trained_wins']
+            total_trained_games += results[f'player{i}_trained_count']
+        
+        if total_trained_games > 0:
+            results['player0_avg_return'] = np.mean(all_trained_returns)  # 所有位置的平均
+            results['player0_win_rate'] = all_trained_wins / total_trained_games
+        else:
+            results['player0_avg_return'] = 0.0
+            results['player0_win_rate'] = 0.0
+    else:
+        # 自对弈模式，使用玩家0的统计
+        results['player0_returns'] = results.get('player0_returns', [])
+        results['player0_avg_return'] = results.get('player0_avg_return', 0.0)
+        results['player0_win_rate'] = results.get('player0_win_rate', 0.0)
     
     return results
 
 
-def print_evaluation_summary(metrics, test_results=None, iteration=None):
-    """打印评估摘要"""
+def _get_big_blind_from_game(game):
+    """从游戏对象中获取大盲注（BB）值
+    
+    Args:
+        game: OpenSpiel 游戏对象
+        
+    Returns:
+        int: 大盲注值，如果无法获取则返回 None
+    """
+    try:
+        # 尝试从游戏字符串中解析
+        game_string = str(game)
+        blind_match = re.search(r'blind=([\d\s]+)', game_string)
+        if blind_match:
+            blinds = [int(x) for x in blind_match.group(1).strip().split()]
+            # 找到最大的非零盲注（即大盲）
+            bb = max([b for b in blinds if b > 0], default=None)
+            return bb
+    except:
+        pass
+    return None
+
+
+def _format_return_with_bb(return_value, bb=None):
+    """格式化回报显示，同时显示筹码和BB单位
+    
+    Args:
+        return_value: 回报值（筹码）
+        bb: 大盲注值，如果为None则不显示BB
+        
+    Returns:
+        str: 格式化后的字符串
+    """
+    if bb is not None and bb > 0:
+        bb_value = return_value / bb
+        return f"{return_value:.2f} ({bb_value:+.2f} BB)"
+    else:
+        return f"{return_value:.2f}"
+
+
+def print_evaluation_summary(metrics, test_results=None, iteration=None, game=None):
+    """打印评估摘要
+    
+    Args:
+        metrics: 评估指标
+        test_results: 测试对局结果
+        iteration: 迭代次数
+        game: 游戏对象（用于获取BB值）
+    """
     print("\n" + "=" * 70)
     if iteration is not None:
         print(f"训练评估 (迭代 {iteration})")
     else:
         print("训练评估")
     print("=" * 70)
+    
+    # 获取大盲注值
+    bb = None
+    if game is not None:
+        bb = _get_big_blind_from_game(game)
     
     # 策略质量指标
     print("\n[策略质量]")
@@ -415,12 +517,42 @@ def print_evaluation_summary(metrics, test_results=None, iteration=None):
     # 测试对局结果
     if test_results:
         mode = test_results.get('mode', 'unknown')
-        mode_str = "自对弈" if mode == "self_play" else "vs 随机策略"
+        num_players = test_results.get('num_players', 0)
+        mode_str = "自对弈" if mode == "self_play" else "vs 随机策略（随机位置）"
         print(f"\n[测试对局] ({mode_str})")
-        print(f"  玩家0平均收益: {test_results.get('player0_avg_return', 0):.4f} "
-              f"(±{test_results.get('player0_std_return', 0):.4f})")
-        print(f"  玩家0胜率: {test_results.get('player0_win_rate', 0)*100:.2f}%")
-        print(f"  对局数: {len(test_results.get('player0_returns', []))}")
+        print(f"  对局数: {test_results.get('games_played', 0)}")
+        if bb is not None:
+            print(f"  大盲注: {bb} 筹码")
+        
+        if mode == "self_play":
+            # 自对弈模式：显示所有玩家的表现
+            print(f"  各位置表现:")
+            for i in range(num_players):
+                avg_return = test_results.get(f'player{i}_avg_return', 0)
+                win_rate = test_results.get(f'player{i}_win_rate', 0) * 100
+                std_return = test_results.get(f'player{i}_std_return', 0)
+                return_str = _format_return_with_bb(avg_return, bb)
+                std_str = _format_return_with_bb(std_return, bb) if std_return > 0 else f"{std_return:.2f}"
+                print(f"    玩家{i}: 平均回报 {return_str} (±{std_str}), 胜率 {win_rate:.1f}%")
+        else:
+            # vs_random模式：显示所有位置使用训练策略时的表现
+            print(f"  各位置使用训练策略时的表现:")
+            total_trained_games = 0
+            for i in range(num_players):
+                trained_count = test_results.get(f'player{i}_trained_count', 0)
+                if trained_count > 0:
+                    avg_return = test_results.get(f'player{i}_trained_avg_return', 0)
+                    win_rate = test_results.get(f'player{i}_trained_win_rate', 0) * 100
+                    total_trained_games += trained_count
+                    return_str = _format_return_with_bb(avg_return, bb)
+                    print(f"    玩家{i}: {trained_count}局, 平均回报 {return_str}, 胜率 {win_rate:.1f}%")
+            
+            # 显示总体统计
+            if total_trained_games > 0:
+                overall_avg_return = test_results.get('player0_avg_return', 0)
+                overall_win_rate = test_results.get('player0_win_rate', 0) * 100
+                return_str = _format_return_with_bb(overall_avg_return, bb)
+                print(f"  总体（所有位置）: 平均回报 {return_str}, 胜率 {overall_win_rate:.1f}%")
     
     print("=" * 70)
 

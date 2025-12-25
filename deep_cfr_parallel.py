@@ -21,6 +21,7 @@ import signal
 import argparse
 import logging
 import sys
+import re
 import numpy as np
 import torch
 import torch.nn as nn
@@ -1675,12 +1676,59 @@ class ParallelDeepCFRSolver:
                             if eval_with_games and eval_result.get('test_results'):
                                 test_results = eval_result['test_results']
                                 num_games = test_results.get('games_played', 0)
-                                avg_return = test_results.get('player0_avg_return', 0)
-                                win_rate = test_results.get('player0_win_rate', 0) * 100
+                                mode = test_results.get('mode', 'unknown')
+                                num_players = test_results.get('num_players', 0)
+                                
+                                # 获取大盲注值
+                                bb = None
+                                try:
+                                    game_string = str(game)
+                                    blind_match = re.search(r'blind=([\d\s]+)', game_string)
+                                    if blind_match:
+                                        blinds = [int(x) for x in blind_match.group(1).strip().split()]
+                                        bb = max([b for b in blinds if b > 0], default=None)
+                                except:
+                                    pass
+                                
                                 if num_games > 0:
-                                    print(f"    测试对局: {num_games} 局 | "
-                                          f"玩家0平均回报: {avg_return:.2f} | "
-                                          f"胜率: {win_rate:.1f}%")
+                                    if mode == "self_play":
+                                        # 自对弈模式：显示所有位置
+                                        print(f"    测试对局: {num_games} 局 (自对弈)")
+                                        for i in range(num_players):
+                                            avg_return = test_results.get(f'player{i}_avg_return', 0)
+                                            win_rate = test_results.get(f'player{i}_win_rate', 0) * 100
+                                            if bb is not None and bb > 0:
+                                                bb_value = avg_return / bb
+                                                print(f"      玩家{i}: 平均回报 {avg_return:.2f} ({bb_value:+.2f} BB), 胜率 {win_rate:.1f}%")
+                                            else:
+                                                print(f"      玩家{i}: 平均回报 {avg_return:.2f}, 胜率 {win_rate:.1f}%")
+                                    else:
+                                        # vs_random模式：显示所有位置使用训练策略时的表现
+                                        print(f"    测试对局: {num_games} 局 (vs Random, 随机位置)")
+                                        # 显示各位置的表现
+                                        position_stats = []
+                                        for i in range(num_players):
+                                            trained_count = test_results.get(f'player{i}_trained_count', 0)
+                                            if trained_count > 0:
+                                                avg_return = test_results.get(f'player{i}_trained_avg_return', 0)
+                                                win_rate = test_results.get(f'player{i}_trained_win_rate', 0) * 100
+                                                if bb is not None and bb > 0:
+                                                    bb_value = avg_return / bb
+                                                    position_stats.append(f"玩家{i}: {trained_count}局, 回报{avg_return:.0f} ({bb_value:+.2f}BB), 胜率{win_rate:.0f}%")
+                                                else:
+                                                    position_stats.append(f"玩家{i}: {trained_count}局, 回报{avg_return:.0f}, 胜率{win_rate:.0f}%")
+                                        
+                                        if position_stats:
+                                            print(f"      {' | '.join(position_stats)}")
+                                        
+                                        # 显示总体统计
+                                        overall_avg_return = test_results.get('player0_avg_return', 0)
+                                        overall_win_rate = test_results.get('player0_win_rate', 0) * 100
+                                        if bb is not None and bb > 0:
+                                            bb_value = overall_avg_return / bb
+                                            print(f"      总体: 平均回报 {overall_avg_return:.2f} ({bb_value:+.2f} BB), 胜率 {overall_win_rate:.1f}%")
+                                        else:
+                                            print(f"      总体: 平均回报 {overall_avg_return:.2f}, 胜率 {overall_win_rate:.1f}%")
                         except ImportError:
                             pass  # training_evaluator 不可用
                         except Exception as e:

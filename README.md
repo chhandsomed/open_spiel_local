@@ -637,7 +637,7 @@ result = response.json()
 curl -X POST http://localhost:8826/api/v1/reload_model \
   -H "Content-Type: application/json" \
   -d '{
-    "model_dir": "models/deepcfr_parallel_5p_custom_v2_20251222_231256/checkpoints/iter_3100",
+    "model_dir": "models/deepcfr_parallel_5p_custom_v3/checkpoints/iter_2900",
     "num_players": 5
   }'
 

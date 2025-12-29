@@ -403,9 +403,9 @@ def worker_process(
                     stop_event.set()  # 设置停止事件
                     break
             
-            current_iteration = iteration_counter.value
-            
-            # 检查是否需要同步网络参数
+            # 关键修复：先同步网络参数，再读取迭代计数器
+            # 这样可以确保Worker使用的网络参数和迭代标记是匹配的
+            network_synced = False
             try:
                 while True:
                     params = network_params_queue.get_nowait()
@@ -415,9 +415,13 @@ def worker_process(
                             state_dict = {k: torch.from_numpy(v) for k, v in numpy_dict.items()}
                             advantage_networks[player].load_state_dict(state_dict)
                             advantage_networks[player] = advantage_networks[player].to(device)
-                    last_sync_iteration = current_iteration
+                    network_synced = True
+                    last_sync_iteration = iteration_counter.value
             except queue.Empty:
                 pass
+            
+            # 在同步网络后读取迭代计数器，确保迭代标记准确
+            current_iteration = iteration_counter.value
             
             # 遍历游戏树
             for player in range(num_players):
@@ -454,6 +458,30 @@ def worker_process(
         # 不重新抛出异常，让进程正常退出
         # 这样可以避免异常传播导致其他问题
     finally:
+        # 确保停止事件被设置
+        stop_event.set()
+        
+        # 清理资源
+        try:
+            # 清空本地批次缓冲区
+            local_advantage_batches.clear()
+            local_strategy_batch.clear()
+            
+            # 清理网络
+            for net in advantage_networks:
+                del net
+            advantage_networks.clear()
+            
+            # 清理游戏状态
+            del game
+            del root_node
+            
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+        except:
+            pass
+        
         print(f"[Worker {worker_id}] 停止")
 
 
@@ -757,6 +785,9 @@ class ParallelDeepCFRSolver:
     
     def _stop_workers(self):
         """停止 Worker 进程"""
+        if not self._workers:
+            return
+        
         self._stop_event.set()
         
         # 清空所有队列，防止 Worker 阻塞在 put 操作
@@ -773,15 +804,43 @@ class ParallelDeepCFRSolver:
         for q in self._network_params_queues:
             drain_queue(q)
         
-        # 等待 Worker 退出
-        for p in self._workers:
-            p.join(timeout=5)
+        # 等待 Worker 退出（增加超时时间，确保进程完全退出）
+        alive_workers = []
+        for i, p in enumerate(self._workers):
             if p.is_alive():
-                p.terminate()
-                p.join(timeout=1)
+                p.join(timeout=5)
+                if p.is_alive():
+                    # 如果正常退出失败，强制终止
+                    try:
+                        p.terminate()
+                        p.join(timeout=2)
+                        if p.is_alive():
+                            # 最后手段：强制杀死
+                            try:
+                                import os
+                                import signal
+                                os.kill(p.pid, signal.SIGKILL)
+                                p.join(timeout=1)
+                            except:
+                                pass
+                        alive_workers.append(i)
+                    except Exception as e:
+                        get_logger().warning(f"  终止 Worker {i} 失败: {e}")
+                        alive_workers.append(i)
+        
+        if alive_workers:
+            get_logger().warning(f"  ⚠️ 部分 Worker 未能正常退出: {alive_workers}")
+        else:
+            get_logger().info("  ✓ 所有 Worker 已停止")
         
         self._workers = []
-        print("所有 Worker 已停止")
+        
+        # 清理 Manager（释放共享资源）
+        if self._manager:
+            try:
+                self._manager.shutdown()
+            except:
+                pass
     
     def _sync_network_params(self):
         """同步网络参数到所有 Worker"""
@@ -1479,7 +1538,12 @@ class ParallelDeepCFRSolver:
             for iteration in range(start_iteration, self.num_iterations):
                 iter_start = time.time()
                 
-                # 更新迭代计数器
+                # 关键修复：在迭代开始时先同步网络参数，确保Worker使用最新网络
+                # 然后再更新迭代计数器，确保样本的迭代标记准确
+                if iteration > start_iteration:  # 第一次迭代不需要同步（网络刚初始化）
+                    self._sync_network_params()
+                
+                # 更新迭代计数器（在同步网络后，确保Worker使用正确的迭代标记）
                 self._iteration_counter.value = iteration + 1
                 
                 # 动态收集样本：直到收集到足够数量的新样本
@@ -1599,11 +1663,12 @@ class ParallelDeepCFRSolver:
                 # 训练策略网络
                 # 为了加速 checkpoint 保存时的策略网络更新，我们在每次迭代中增量训练策略网络
                 # 这样可以分摊计算成本，使得 checkpoint 时策略网络已经接近就绪
-                        policy_loss = self._learn_strategy_network()
+                policy_loss = self._learn_strategy_network()
                 
-                # 同步网络参数到 Worker
-                if (iteration + 1) % self.sync_interval == 0:
-                    self._sync_network_params()
+                # 注意：网络参数同步已在迭代开始时执行，这里不再重复同步
+                # 如果需要更频繁的同步，可以在这里也同步一次（但通常不需要）
+                # if (iteration + 1) % self.sync_interval == 0:
+                #     self._sync_network_params()
                 
                 self._iteration += 1
                 
@@ -1673,6 +1738,23 @@ class ParallelDeepCFRSolver:
                                   f"策略缓冲区: {len(self._strategy_memories):,} | "
                                   f"优势样本: {sum(len(m) for m in self._advantage_memories):,}")
                             
+                            # 显示动作统计（策略采样）
+                            if metrics.get('action_statistics'):
+                                action_stats = metrics['action_statistics']
+                                sorted_actions = sorted(action_stats.items(), 
+                                                      key=lambda x: x[1]['percentage'], 
+                                                      reverse=True)
+                                action_summary = []
+                                for action, stats in sorted_actions[:5]:  # 只显示前5个最常见的动作
+                                    percentage = stats['percentage']
+                                    count = stats['count']
+                                    # 简单的动作名称映射
+                                    action_names = {0: "Fold", 1: "Call", 2: "Bet", 3: "AllIn", 4: "HalfPot"}
+                                    action_name = action_names.get(action, f"动作{action}")
+                                    action_summary.append(f"{action_name}({percentage:.1f}%)")
+                                if action_summary:
+                                    print(f"    动作占比: {', '.join(action_summary)}")
+                            
                             if eval_with_games and eval_result.get('test_results'):
                                 test_results = eval_result['test_results']
                                 num_games = test_results.get('games_played', 0)
@@ -1729,6 +1811,23 @@ class ParallelDeepCFRSolver:
                                             print(f"      总体: 平均回报 {overall_avg_return:.2f} ({bb_value:+.2f} BB), 胜率 {overall_win_rate:.1f}%")
                                         else:
                                             print(f"      总体: 平均回报 {overall_avg_return:.2f}, 胜率 {overall_win_rate:.1f}%")
+                                        
+                                        # 显示动作统计（测试对局）
+                                        if test_results.get('action_statistics'):
+                                            action_stats = test_results['action_statistics']
+                                            sorted_actions = sorted(action_stats.items(), 
+                                                                  key=lambda x: x[1]['percentage'], 
+                                                                  reverse=True)
+                                            action_summary = []
+                                            for action, stats in sorted_actions[:5]:  # 只显示前5个最常见的动作
+                                                percentage = stats['percentage']
+                                                count = stats['count']
+                                                # 简单的动作名称映射
+                                                action_names = {0: "Fold", 1: "Call", 2: "Bet", 3: "AllIn", 4: "HalfPot"}
+                                                action_name = action_names.get(action, f"动作{action}")
+                                                action_summary.append(f"{action_name}({percentage:.1f}%)")
+                                            if action_summary:
+                                                print(f"      动作占比: {', '.join(action_summary)}")
                         except ImportError:
                             pass  # training_evaluator 不可用
                         except Exception as e:
@@ -1966,15 +2065,24 @@ def save_checkpoint(solver, game, model_dir, save_prefix, iteration, is_final=Fa
 
 
 def main():
-    global logger
+    global logger, global_solver
     # 初始化logging（输出到stdout，nohup会捕获）
     logger = setup_logging()
+    
+    # 全局变量，用于信号处理时访问 solver
+    global_solver = None
     
     # 注册信号处理，确保被 kill 时也能清理子进程
     def signal_handler(signum, frame):
         get_logger().info(f"\n接收到信号 {signum}，正在清理并退出...")
-        # 注意：这里不能直接调用 solver._stop_workers() 因为 solver 不在作用域内
-        # 但由于 worker 进程已设置为 daemon=True，主进程退出时它们会自动被系统清理
+        # 尝试清理 worker 进程
+        if global_solver is not None:
+            try:
+                global_solver._stop_workers()
+            except:
+                pass
+        # 由于 worker 进程已设置为 daemon=True，主进程退出时它们会自动被系统清理
+        # 但为了更彻底，我们主动调用 _stop_workers()
         sys.exit(0)
         
     signal.signal(signal.SIGTERM, signal_handler)
@@ -2142,7 +2250,7 @@ def main():
     if args.checkpoint_interval > 0:
         print(f"Checkpoint 保存间隔: 每 {args.checkpoint_interval} 次迭代")
     
-    # 创建求解器
+    # 创建求解器（设置全局变量，用于信号处理）
     solver = ParallelDeepCFRSolver(
         game,
         num_workers=args.num_workers,
@@ -2159,6 +2267,7 @@ def main():
         max_memory_gb=args.max_memory_gb,
         queue_maxsize=args.queue_maxsize,
     )
+    global_solver = solver  # 设置全局变量
     
     # 显示内存配置
     if args.max_memory_gb:

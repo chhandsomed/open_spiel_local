@@ -12,6 +12,35 @@ import re
 from collections import defaultdict
 
 
+def _get_action_name(action_id, game=None):
+    """将动作ID转换为可读的动作名称
+    
+    Args:
+        action_id: 动作ID
+        game: 游戏对象（可选，用于获取动作信息）
+    
+    Returns:
+        str: 动作名称
+    """
+    # Universal Poker 的动作映射
+    # kFold = 0, kCall = 1, kBet = 2, kAllIn = 3, kHalfPot = 4
+    action_names = {
+        0: "Fold",
+        1: "Call/Check",
+        2: "Bet (Pot)",
+        3: "All-In",
+        4: "Bet (Half Pot)",
+    }
+    
+    if action_id in action_names:
+        return action_names[action_id]
+    elif action_id > 4:
+        # FCHPA 模式下，动作ID可能是下注金额
+        return f"Bet ({action_id})"
+    else:
+        return f"动作{action_id}"
+
+
 def compute_policy_entropy(probs_dict):
     """计算策略熵（衡量策略的随机性）
     
@@ -66,6 +95,10 @@ def evaluate_policy_quality(
     entropies = []
     states_sampled = 0
     
+    # 动作统计
+    action_counts = defaultdict(int)  # {action: count}
+    action_total_prob = defaultdict(float)  # {action: total_probability}
+    
     try:
         # 采样一些状态，计算策略熵
         for sample_idx in range(num_sample_states):
@@ -118,6 +151,11 @@ def evaluate_policy_quality(
                                 entropies.append(entropy)
                                 states_sampled += 1
                             
+                            # 统计动作占比
+                            for action, prob in action_probs.items():
+                                action_counts[action] += 1
+                                action_total_prob[action] += prob
+                            
                             # 根据策略采样动作继续
                             actions = list(action_probs.keys())
                             probabilities = list(action_probs.values())
@@ -156,6 +194,19 @@ def evaluate_policy_quality(
     else:
         metrics['avg_entropy'] = 0.0
         metrics['states_sampled'] = 0
+    
+    # 动作统计
+    if action_counts:
+        total_states = sum(action_counts.values())
+        metrics['action_statistics'] = {}
+        for action in sorted(action_counts.keys()):
+            count = action_counts[action]
+            avg_prob = action_total_prob[action] / count if count > 0 else 0.0
+            metrics['action_statistics'][action] = {
+                'count': count,
+                'percentage': (count / total_states * 100) if total_states > 0 else 0.0,
+                'avg_probability': avg_prob
+            }
     
     # 2. 缓冲区大小（探索的状态数量）
     try:
@@ -210,12 +261,16 @@ def play_test_game(
         trained_player: 指定哪个玩家使用训练策略（None时在vs_random模式下随机选择）
     
     Returns:
-        dict: 包含对局结果的字典
+        dict: 包含对局结果的字典，包括动作统计
     """
     state = game.new_initial_state()
     returns = None
     num_players = game.num_players()
     max_steps = 1000  # 防止无限循环
+    
+    # 动作统计（本局对局中的动作）
+    game_action_counts = defaultdict(int)  # {action: count}
+    game_action_total_prob = defaultdict(float)  # {action: total_probability}
     
     # 如果未指定trained_player且不是自对弈模式，随机选择一个玩家使用训练策略
     if not use_trained_for_all and trained_player is None:
@@ -269,6 +324,11 @@ def play_test_game(
                         else:
                             # 如果所有概率为0，使用均匀分布
                             action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
+                        # 统计动作占比
+                        for act, prob in action_probs.items():
+                            game_action_counts[act] += 1
+                            game_action_total_prob[act] += prob
+                        
                         # 使用确定性策略：选择概率最高的动作（如果相同则选择第一个）
                         best_action = max(legal_actions, key=lambda a: action_probs.get(a, 0.0))
                         action = best_action
@@ -298,6 +358,8 @@ def play_test_game(
         'returns': returns,
         'num_players': num_players,
         'trained_player': trained_player if not use_trained_for_all else None,
+        'action_counts': dict(game_action_counts),  # 转换为普通字典
+        'action_total_prob': dict(game_action_total_prob),  # 转换为普通字典
     }
     if returns:
         for i in range(min(len(returns), num_players)):
@@ -341,6 +403,10 @@ def evaluate_with_test_games(
         results[f'player{i}_trained_wins'] = 0
         results[f'player{i}_trained_count'] = 0
     
+    # 动作统计（所有测试对局中的动作）
+    game_action_counts = defaultdict(int)  # {action: count}
+    game_action_total_prob = defaultdict(float)  # {action: total_probability}
+    
     failed_games = 0
     error_messages = {}  # 记录错误类型和次数
     for game_idx in range(num_games):
@@ -363,6 +429,14 @@ def evaluate_with_test_games(
             if trained_player is not None:
                 results[f'player{trained_player}_trained_returns'].append(returns[trained_player])
                 results[f'player{trained_player}_trained_count'] += 1
+            
+            # 汇总动作统计
+            action_counts = game_result.get('action_counts', {})
+            action_total_prob = game_result.get('action_total_prob', {})
+            for action, count in action_counts.items():
+                game_action_counts[action] += count
+            for action, prob in action_total_prob.items():
+                game_action_total_prob[action] += prob
             
             # 找出赢家（收益最高的玩家）
             if returns:
@@ -409,6 +483,19 @@ def evaluate_with_test_games(
         else:
             results[f'player{i}_trained_avg_return'] = 0.0
             results[f'player{i}_trained_win_rate'] = 0.0
+    
+    # 动作统计
+    if game_action_counts:
+        total_game_actions = sum(game_action_counts.values())
+        results['action_statistics'] = {}
+        for action in sorted(game_action_counts.keys()):
+            count = game_action_counts[action]
+            avg_prob = game_action_total_prob[action] / count if count > 0 else 0.0
+            results['action_statistics'][action] = {
+                'count': count,
+                'percentage': (count / total_game_actions * 100) if total_game_actions > 0 else 0.0,
+                'avg_probability': avg_prob
+            }
     
     # 兼容旧接口（使用训练策略时的平均表现）
     if not use_trained_for_all:
@@ -514,6 +601,23 @@ def print_evaluation_summary(metrics, test_results=None, iteration=None, game=No
             print(f"  玩家{player}优势缓冲区: {size:,} 样本")
     print(f"  总优势样本: {metrics.get('total_advantage_samples', 0):,}")
     
+    # 动作统计
+    if metrics.get('action_statistics'):
+        print("\n[动作统计] (策略采样)")
+        action_stats = metrics['action_statistics']
+        total_count = sum(s['count'] for s in action_stats.values())
+        if total_count > 0:
+            # 按占比排序
+            sorted_actions = sorted(action_stats.items(), 
+                                  key=lambda x: x[1]['percentage'], 
+                                  reverse=True)
+            for action, stats in sorted_actions:
+                count = stats['count']
+                percentage = stats['percentage']
+                avg_prob = stats['avg_probability']
+                action_name = _get_action_name(action, game)
+                print(f"  {action_name}: {count}次 ({percentage:.1f}%), 平均概率 {avg_prob:.3f}")
+    
     # 测试对局结果
     if test_results:
         mode = test_results.get('mode', 'unknown')
@@ -553,6 +657,23 @@ def print_evaluation_summary(metrics, test_results=None, iteration=None, game=No
                 overall_win_rate = test_results.get('player0_win_rate', 0) * 100
                 return_str = _format_return_with_bb(overall_avg_return, bb)
                 print(f"  总体（所有位置）: 平均回报 {return_str}, 胜率 {overall_win_rate:.1f}%")
+        
+        # 动作统计（测试对局）
+        if test_results.get('action_statistics'):
+            print(f"\n[动作统计] (测试对局)")
+            action_stats = test_results['action_statistics']
+            total_count = sum(s['count'] for s in action_stats.values())
+            if total_count > 0:
+                # 按占比排序
+                sorted_actions = sorted(action_stats.items(), 
+                                      key=lambda x: x[1]['percentage'], 
+                                      reverse=True)
+                for action, stats in sorted_actions:
+                    count = stats['count']
+                    percentage = stats['percentage']
+                    avg_prob = stats['avg_probability']
+                    action_name = _get_action_name(action, game)
+                    print(f"  {action_name}: {count}次 ({percentage:.1f}%), 平均概率 {avg_prob:.3f}")
     
     print("=" * 70)
 

@@ -179,6 +179,9 @@ nohup python deep_cfr_parallel.py \
 ```
 
 #### 自定义盲注和筹码配置示例
+
+
+
 ```bash
 # 5人场，自定义盲注和筹码
 nohup python deep_cfr_parallel.py \
@@ -204,6 +207,32 @@ nohup python deep_cfr_parallel.py \
     --betting_abstraction fchpa \
     --save_prefix deepcfr_parallel_5p_custom_v2 \
     > train_parallel_5p_v2_6.log 2>&1 &
+
+
+# 6人场
+nohup python deep_cfr_parallel.py \
+    --num_players 6 \
+    --blinds "100 200 0 0 0 0" \
+    --stack_size 50000 \
+    --num_iterations 20000 \
+    --num_traversals 1600 \
+    --num_workers 16 \
+    --batch_size 4096 \
+    --use_gpu \
+    --gpu_ids 0 1 2 3 \
+    --eval_interval 100 \
+    --checkpoint_interval 100 \
+    --eval_with_games \
+    --num_test_games 100 \
+    --skip_nashconv \
+    --learning_rate 0.001 \
+    --policy_layers 256 256 256 \
+    --advantage_layers 256 256 256 \
+    --memory_capacity 4000000 \
+    --queue_maxsize 30000 \
+    --betting_abstraction fchpa \
+    --save_prefix deepcfr_parallel_6p_custom_v3 \
+    > train_parallel_6p_v3.log 2>&1 &
 
 #### 续训脚本（从 checkpoint 恢复训练）
 ```bash

@@ -425,6 +425,7 @@ def worker_process(
                 for _ in range(num_traversals_per_batch):
                     if stop_event.is_set():
                         break
+                    current_iteration = iteration_counter.value
                     traverse_game_tree(root_node.clone(), player, current_iteration)
                 
             # 强制刷新缓冲区：无论是否达到 batch_limit，都将手中的样本发送出去
@@ -601,7 +602,7 @@ class ParallelDeepCFRSolver:
         
         # 验证策略网络输入维度
         actual_input_size = policy_net.mlp.model[0]._weight.shape[1]
-        expected_input_size = self._embedding_size + 1  # 1维手动特征（手牌强度）
+        expected_input_size = self._embedding_size + 23  # 23维手动特征（增强版本）
         assert actual_input_size == expected_input_size, \
             f"策略网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
         
@@ -633,7 +634,7 @@ class ParallelDeepCFRSolver:
             
             # 验证优势网络输入维度
             actual_input_size = net.mlp.model[0]._weight.shape[1]
-            expected_input_size = self._embedding_size + 1  # 1维手动特征（手牌强度）
+            expected_input_size = self._embedding_size + 23  # 23维手动特征（增强版本）
             assert actual_input_size == expected_input_size, \
                 f"玩家 {player} 优势网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
             

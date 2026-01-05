@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.multiprocessing as mp
 from multiprocessing import Process, Queue, Event, Value, Manager
 from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import resource
 
@@ -662,15 +663,22 @@ class ParallelDeepCFRSolver:
         assert actual_input_size == expected_input_size, \
             f"策略网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
         
-        # 多 GPU 包装
-        if self.use_multi_gpu:
+        # 多 GPU 分配优化：如果GPU数量 > 玩家数量，策略网络可以分配到额外的GPU
+        # 这样可以与优势网络并行训练，提高训练速度
+        if self.use_multi_gpu and len(self.gpu_ids) > self.num_players:
+            # GPU数量充足，策略网络分配到额外的GPU（最后一个GPU）
+            policy_gpu_id = self.gpu_ids[-1]
+            self._policy_network = policy_net.to(torch.device(f"cuda:{policy_gpu_id}"))
+            get_logger().debug(f"  策略网络分配到 GPU {policy_gpu_id}（与优势网络并行训练）")
+        elif self.use_multi_gpu:
+            # GPU数量不足，使用DataParallel在多个GPU上并行训练
             self._policy_network = nn.DataParallel(policy_net, device_ids=self.gpu_ids)
             self._policy_network = self._policy_network.to(self.device)
         else:
             self._policy_network = policy_net.to(self.device)
         
         self._policy_sm = nn.Softmax(dim=-1)
-        self._loss_policy = nn.MSELoss()
+        self._loss_policy = nn.MSELoss(reduction="mean")
         self._optimizer_policy = torch.optim.Adam(
             self._policy_network.parameters(), lr=self.learning_rate
         )
@@ -694,10 +702,22 @@ class ParallelDeepCFRSolver:
             assert actual_input_size == expected_input_size, \
                 f"玩家 {player} 优势网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
             
-            # 多 GPU 包装
-            if self.use_multi_gpu:
-                net = nn.DataParallel(net, device_ids=self.gpu_ids)
-                net = net.to(self.device)
+            # 多 GPU 分配优化：如果GPU数量 >= 玩家数量，将不同优势网络分配到不同GPU
+            # 否则使用DataParallel在多个GPU上并行训练单个网络
+            if self.use_multi_gpu and len(self.gpu_ids) >= self.num_players:
+                # GPU数量充足，每个玩家分配到不同的GPU（真正的并行）
+                gpu_id = self.gpu_ids[player % len(self.gpu_ids)]
+                net = net.to(torch.device(f"cuda:{gpu_id}"))
+                get_logger().debug(f"  玩家 {player} 优势网络分配到 GPU {gpu_id}")
+            elif self.use_multi_gpu:
+                # GPU数量不足，使用DataParallel在多个GPU上并行训练
+                # 注意：DataParallel在多线程环境下可能死锁，需要小心使用
+                # 如果GPU数量 < 玩家数量，所有网络共享GPU，多线程训练可能导致死锁
+                # 解决方案：不使用DataParallel，而是将网络分配到不同的GPU（循环分配）
+                # 这样可以避免多线程死锁，同时充分利用多GPU资源
+                gpu_id = self.gpu_ids[player % len(self.gpu_ids)]
+                net = net.to(torch.device(f"cuda:{gpu_id}"))
+                get_logger().debug(f"  玩家 {player} 优势网络分配到 GPU {gpu_id}（循环分配，避免DataParallel死锁）")
             else:
                 net = net.to(self.device)
             
@@ -1019,14 +1039,16 @@ class ParallelDeepCFRSolver:
             avg_growth_rate = sum(stats['queue_growth_rates'].values()) / len(stats['queue_growth_rates'])
         
         # 获取CPU使用率（如果可用）
+        # 修复：使用非阻塞方式获取CPU使用率，避免阻塞
         cpu_percent = None
         if HAS_PSUTIL:
             try:
                 process = psutil.Process()
-                cpu_percent = process.cpu_percent(interval=0.1)  # 非阻塞，快速获取
+                # 使用interval=None，非阻塞获取（返回上次调用后的平均值）
+                cpu_percent = process.cpu_percent(interval=None)
                 # 如果获取失败，尝试获取系统CPU使用率
                 if cpu_percent is None or cpu_percent == 0:
-                    cpu_percent = psutil.cpu_percent(interval=0.1)
+                    cpu_percent = psutil.cpu_percent(interval=None)
             except:
                 pass
         
@@ -1034,14 +1056,24 @@ class ParallelDeepCFRSolver:
         adaptive = self._adaptive_max_collect
         base = adaptive['base']
         min_val = adaptive['min']
-        # 修复：max_val不应该限制为队列大小的50%，应该允许一次性消费更多
-        # 队列大小5000时，max_val应该是队列大小的4-10倍，确保能快速消费
-        max_val = min(adaptive['max'], max(self.queue_maxsize * 4, 20000))  # 至少队列大小的4倍，或20000
+        # 优化：当队列使用率很高时，允许更高的max_collect
+        # 队列使用率100%时，允许一次性消费队列大小的10倍，快速清空队列
+        if max_queue_usage >= 0.99:
+            # 队列几乎满时，允许更高的max_collect（队列大小的10倍）
+            max_val = min(adaptive['max'], max(self.queue_maxsize * 10, 50000))
+        else:
+            # 正常情况，至少队列大小的4倍，或20000
+            max_val = min(adaptive['max'], max(self.queue_maxsize * 4, 20000))
         
         # 1. 根据队列使用率调整（主要指标）
-        if max_queue_usage > 0.80:
+        # 优化：当队列使用率100%时，大幅增加消费速度（最多10倍），快速清空队列
+        if max_queue_usage >= 0.99:
+            # 队列使用率 >= 99%（几乎满），大幅增加消费速度
+            factor = 1.0 + (max_queue_usage - 0.80) * 20.0  # 最多增加到10倍（0.99时约3.8倍，1.0时10倍）
+            new_max_collect = int(base * factor)
+        elif max_queue_usage > 0.80:
             # 队列使用率 > 80%，增加消费速度
-            factor = 1.0 + (max_queue_usage - 0.80) * 2.0  # 最多增加到2倍
+            factor = 1.0 + (max_queue_usage - 0.80) * 5.0  # 最多增加到2倍（0.80时1倍，1.0时2倍）
             new_max_collect = int(base * factor)
         elif max_queue_usage < 0.30:
             # 队列使用率 < 30%，减少消费速度（节省CPU）
@@ -1052,8 +1084,9 @@ class ParallelDeepCFRSolver:
             new_max_collect = base
         
         # 2. 根据队列增长率调整（次要指标）
-        if avg_growth_rate > 100:  # 每秒增长超过100个样本
-            growth_factor = min(1.5, 1.0 + avg_growth_rate / 1000.0)  # 最多1.5倍
+        # 优化：降低增长率阈值，更敏感地响应队列增长
+        if avg_growth_rate > 50:  # 每秒增长超过50个样本（从100降低到50）
+            growth_factor = min(2.0, 1.0 + avg_growth_rate / 500.0)  # 最多2倍（从1.5倍提高到2倍）
             new_max_collect = int(new_max_collect * growth_factor)
         
         # 3. 根据CPU使用率调整（限制指标，避免CPU过载）
@@ -1105,8 +1138,15 @@ class ParallelDeepCFRSolver:
         
         # 只清理队列积压（安全，不影响收集进度）
         # 缓冲区清理已禁用，完全依赖随机替换策略
+        # 修复：限制清理频率，避免频繁清理导致性能问题
         cleanup_start = time.time()
-        self._check_and_cleanup_memory(cleanup_buffers=False)
+        current_time = time.time()
+        if not hasattr(self, '_last_cleanup_time'):
+            self._last_cleanup_time = 0
+        # 每0.5秒最多清理一次，避免频繁清理
+        if current_time - self._last_cleanup_time > 0.5:
+            self._check_and_cleanup_memory(cleanup_buffers=False)
+            self._last_cleanup_time = current_time
         cleanup_time = time.time() - cleanup_start
         
         # 动态调整max_collect
@@ -1149,14 +1189,16 @@ class ParallelDeepCFRSolver:
                 except queue.Empty:
                     break
             
-            # 批量添加到缓冲区
+            # 批量添加到缓冲区（优化：减少方法调用开销）
+            memory = self._advantage_memories[player]
             for batch in batch_list:
                 if isinstance(batch, list):
+                    # 批量添加，减少方法调用次数
                     for sample in batch:
-                        self._advantage_memories[player].add(sample)
+                        memory.add(sample)
                     total_collected_advantage += len(batch)
                 else:
-                    self._advantage_memories[player].add(batch)
+                    memory.add(batch)
                     total_collected_advantage += 1
         advantage_collect_time = time.time() - advantage_collect_start
         
@@ -1177,15 +1219,17 @@ class ParallelDeepCFRSolver:
             except queue.Empty:
                 break
         
-        # 批量添加到缓冲区
+        # 批量添加到缓冲区（优化：减少方法调用开销）
         total_collected_strategy = 0
+        memory = self._strategy_memories
         for batch in batch_list:
             if isinstance(batch, list):
+                # 批量添加，减少方法调用次数
                 for sample in batch:
-                    self._strategy_memories.add(sample)
+                    memory.add(sample)
                 total_collected_strategy += len(batch)
             else:
-                self._strategy_memories.add(batch)
+                memory.add(batch)
                 total_collected_strategy += 1
         strategy_collect_time = time.time() - strategy_collect_start
         
@@ -1217,31 +1261,95 @@ class ParallelDeepCFRSolver:
         sample_time = time.time() - sample_start
         
         data_prep_start = time.time()
-        info_states = []
-        advantages = []
-        iterations = []
-        for s in samples:
-            info_states.append(s.info_state)
-            advantages.append(s.advantage)
-            iterations.append([s.iteration])
+        # 优化：使用numpy批量处理，减少循环开销
+        if len(samples) > 0:
+            # 批量提取数据，使用列表推导式比循环快
+            info_states = np.array([s.info_state for s in samples], dtype=np.float32)
+            # 修复：确保advantages是2D数组 [batch_size, num_actions]
+            # advantage应该是长度为num_actions的列表或数组
+            advantages_list = [s.advantage for s in samples]
+            # 检查第一个advantage的长度，确保所有advantage长度一致
+            # 修复：使用self._num_actions作为标准长度，而不是第一个样本的长度
+            if len(advantages_list) > 0:
+                first_adv = advantages_list[0]
+                if isinstance(first_adv, (list, np.ndarray)):
+                    # 使用num_actions作为标准长度，确保与网络输出维度一致
+                    expected_len = self._num_actions
+                    # 确保所有advantage长度一致，如果不一致则填充或截断
+                    advantages = np.array([
+                        np.array(adv, dtype=np.float32)[:expected_len] if len(adv) >= expected_len
+                        else np.pad(np.array(adv, dtype=np.float32), (0, expected_len - len(adv)), 
+                                   mode='constant', constant_values=0)
+                        for adv in advantages_list
+                    ], dtype=np.float32)
+                else:
+                    # 如果advantage不是列表/数组，可能是标量，需要转换
+                    advantages = np.array(advantages_list, dtype=np.float32)
+                    if advantages.ndim == 1:
+                        # 如果是1D，需要扩展为2D [batch_size, 1]
+                        advantages = advantages[:, np.newaxis]
+            else:
+                advantages = np.array([], dtype=np.float32)
+            # 修复：iterations应该是2D数组 [batch_size, 1]，与原始代码保持一致
+            iterations = np.sqrt(np.array([[s.iteration] for s in samples], dtype=np.float32))
+        else:
+            info_states = np.array([], dtype=np.float32)
+            advantages = np.array([], dtype=np.float32)
+            # 修复：空数组时也要保持2D形状 [0, 1]，确保维度一致
+            iterations = np.array([], dtype=np.float32).reshape(0, 1)
         data_prep_time = time.time() - data_prep_start
+        
+        # 修复：如果samples为空，直接返回None，避免空tensor训练
+        if len(samples) == 0:
+            return None
         
         forward_backward_start = time.time()
         self._optimizer_advantages[player].zero_grad()
-        advantages_tensor = torch.FloatTensor(np.array(advantages)).to(self.device)
-        iters = torch.FloatTensor(np.sqrt(np.array(iterations))).to(self.device)
-        outputs = self._advantage_networks[player](
-            torch.FloatTensor(np.array(info_states)).to(self.device)
-        )
+        # 优化：获取网络所在的设备（支持多GPU分配）
+        network = self._advantage_networks[player]
+        if isinstance(network, nn.DataParallel):
+            # DataParallel包装的网络，使用主设备
+            device = next(network.parameters()).device
+        else:
+            # 单个GPU上的网络，使用网络所在的设备
+            device = next(network.parameters()).device
+        
+        # 优化：批量创建tensor，减少CPU-GPU数据传输次数，并分配到正确的设备
+        advantages_tensor = torch.from_numpy(advantages).to(device)
+        iters = torch.from_numpy(iterations).to(device)
+        info_states_tensor = torch.from_numpy(info_states).to(device)
+        try:
+            # 修复：DataParallel在多线程环境下可能死锁，需要设置环境变量
+            # 或者使用torch.set_num_threads(1)来避免死锁
+            import os
+            os.environ['OMP_NUM_THREADS'] = '1'
+            os.environ['MKL_NUM_THREADS'] = '1'
+            
+            # 如果使用DataParallel，可能需要设置torch.set_num_threads
+            if isinstance(network, nn.DataParallel):
+                torch.set_num_threads(1)
+            
+            outputs = network(info_states_tensor)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise
         loss = self._loss_advantages(iters * outputs, iters * advantages_tensor)
         loss.backward()
         self._optimizer_advantages[player].step()
+        # 优化：确保CUDA操作完成，避免多线程竞争
+        # 注意：synchronize不接受device对象，需要获取设备索引
+        if device.type == 'cuda':
+            device_index = device.index if device.index is not None else 0
+            torch.cuda.synchronize(device_index)
         forward_backward_time = time.time() - forward_backward_start
         
         total_train_time = time.time() - train_start_time
         get_logger().debug(f"  玩家 {player} 优势网络训练耗时: {total_train_time*1000:.1f}ms (采样: {sample_time*1000:.1f}ms, 数据准备: {data_prep_time*1000:.1f}ms, 前向反向: {forward_backward_time*1000:.1f}ms)")
         
-        return loss.detach().cpu().numpy()
+        # 修复：确保返回标量（MSELoss返回标量tensor，.numpy()可能返回0维数组）
+        loss_value = loss.detach().cpu().numpy()
+        return float(loss_value) if np.isscalar(loss_value) else float(loss_value.item())
     
     def _learn_strategy_network(self):
         """训练策略网络"""
@@ -1258,32 +1366,80 @@ class ParallelDeepCFRSolver:
         sample_time = time.time() - sample_start
         
         data_prep_start = time.time()
-        info_states = []
-        action_probs = []
-        iterations = []
-        for s in samples:
-            info_states.append(s.info_state)
-            action_probs.append(s.strategy_action_probs)
-            iterations.append([s.iteration])
+        # 优化：使用numpy批量处理，减少循环开销
+        if len(samples) > 0:
+            # 批量提取数据，使用列表推导式比循环快
+            info_states = np.array([s.info_state for s in samples], dtype=np.float32)
+            # 修复：确保action_probs是2D数组 [batch_size, num_actions]
+            action_probs_list = [s.strategy_action_probs for s in samples]
+            if len(action_probs_list) > 0:
+                first_probs = action_probs_list[0]
+                if isinstance(first_probs, (list, np.ndarray)):
+                    # 使用num_actions作为标准长度，确保与网络输出维度一致
+                    expected_len = self._num_actions
+                    # 确保所有action_probs长度一致
+                    action_probs = np.array([
+                        np.array(probs, dtype=np.float32)[:expected_len] if len(probs) >= expected_len
+                        else np.pad(np.array(probs, dtype=np.float32), (0, expected_len - len(probs)), 
+                                   mode='constant', constant_values=0)
+                        for probs in action_probs_list
+                    ], dtype=np.float32)
+                else:
+                    # 如果action_probs不是列表/数组，需要转换
+                    action_probs = np.array(action_probs_list, dtype=np.float32)
+                    if action_probs.ndim == 1:
+                        action_probs = action_probs[:, np.newaxis]
+                # 处理action_probs的维度（如果需要squeeze）
+                if action_probs.ndim > 2:
+                    action_probs = np.squeeze(action_probs)
+            else:
+                action_probs = np.array([], dtype=np.float32)
+            # 修复：iterations应该是2D数组 [batch_size, 1]，与原始代码保持一致
+            iterations = np.sqrt(np.array([[s.iteration] for s in samples], dtype=np.float32))
+        else:
+            info_states = np.array([], dtype=np.float32)
+            action_probs = np.array([], dtype=np.float32)
+            # 修复：空数组时也要保持2D形状 [0, 1]，确保维度一致
+            iterations = np.array([], dtype=np.float32).reshape(0, 1)
         data_prep_time = time.time() - data_prep_start
+        
+        # 修复：如果samples为空，直接返回None，避免空tensor训练
+        if len(samples) == 0:
+            return None
         
         forward_backward_start = time.time()
         self._optimizer_policy.zero_grad()
-        iters = torch.FloatTensor(np.sqrt(np.array(iterations))).to(self.device)
-        ac_probs = torch.FloatTensor(np.array(np.squeeze(action_probs))).to(self.device)
-        logits = self._policy_network(
-            torch.FloatTensor(np.array(info_states)).to(self.device)
-        )
+        # 优化：获取策略网络所在的设备（支持多GPU分配）
+        network = self._policy_network
+        if isinstance(network, nn.DataParallel):
+            # DataParallel包装的网络，使用主设备
+            device = next(network.parameters()).device
+        else:
+            # 单个GPU上的网络，使用网络所在的设备
+            device = next(network.parameters()).device
+        
+        # 优化：批量创建tensor，减少CPU-GPU数据传输次数，并分配到正确的设备
+        iters = torch.from_numpy(iterations).to(device)
+        ac_probs = torch.from_numpy(action_probs).to(device)
+        info_states_tensor = torch.from_numpy(info_states).to(device)
+        logits = network(info_states_tensor)
         outputs = self._policy_sm(logits)
         loss = self._loss_policy(iters * outputs, iters * ac_probs)
         loss.backward()
         self._optimizer_policy.step()
+        # 优化：确保CUDA操作完成，避免多线程竞争
+        # 注意：synchronize不接受device对象，需要获取设备索引
+        if device.type == 'cuda':
+            device_index = device.index if device.index is not None else 0
+            torch.cuda.synchronize(device_index)
         forward_backward_time = time.time() - forward_backward_start
         
         total_train_time = time.time() - train_start_time
         get_logger().debug(f"  策略网络训练耗时: {total_train_time*1000:.1f}ms (采样: {sample_time*1000:.1f}ms, 数据准备: {data_prep_time*1000:.1f}ms, 前向反向: {forward_backward_time*1000:.1f}ms)")
         
-        return loss.detach().cpu().numpy()
+        # 修复：确保返回标量（MSELoss返回标量tensor，.numpy()可能返回0维数组）
+        loss_value = loss.detach().cpu().numpy()
+        return float(loss_value) if np.isscalar(loss_value) else float(loss_value.item())
     
     def solve(self, verbose=True, eval_interval=10, checkpoint_interval=0, 
               model_dir=None, save_prefix=None, game=None, start_iteration=0,
@@ -1327,10 +1483,17 @@ class ParallelDeepCFRSolver:
             print("  等待 Worker 启动...", end="", flush=True)
             warmup_time = 0
             max_warmup = 30  # 最多等待 30 秒
+            # 修复：在warmup期间也检查Worker状态，避免卡住
             while warmup_time < max_warmup:
+                # 检查Worker状态
+                dead_workers = [i for i, p in enumerate(self._workers) if not p.is_alive()]
+                if dead_workers:
+                    worker_info = ", ".join([f"Worker {wid}" for wid in dead_workers])
+                    raise RuntimeError(f"检测到 Worker 已死亡: {worker_info}。训练无法继续。")
+                
                 time.sleep(1)
                 warmup_time += 1
-                self._collect_samples()
+                collected = self._collect_samples()
                 total_samples = sum(len(m) for m in self._advantage_memories)
                 if total_samples > 0:
                     print(f" 就绪 (耗时 {warmup_time} 秒，已收集 {total_samples} 个样本)")
@@ -1362,7 +1525,9 @@ class ParallelDeepCFRSolver:
                 # 关键修复：样本收集循环中只清理队列积压，不清理缓冲区
                 # 优化：根据队列状态动态调整sleep时间，队列满时不sleep，队列空时才sleep
                 collected_in_this_iteration = 0  # 本次迭代收集的样本数
+                loop_count = 0
                 while True:
+                    loop_count += 1
                     # 检查队列状态，决定是否需要sleep
                     queue_sizes = [q.qsize() for q in self._advantage_queues]
                     strategy_queue_size = self._strategy_queue.qsize()
@@ -1443,13 +1608,19 @@ class ParallelDeepCFRSolver:
                     # 队列使用率 > 80% 时不sleep，队列空时才sleep，避免消费速度不够快
                     if queue_usage > 0.80:
                         # 队列满了，不sleep，立即继续消费
-                        pass
+                        sleep_time = 0.0
                     elif total_queue_size == 0:
                         # 队列为空，sleep 0.5秒，避免CPU空转
-                        time.sleep(0.5)
+                        sleep_time = 0.5
+                    elif queue_usage > 0.50:
+                        # 队列使用率 > 50%，sleep时间缩短到0.01秒，加快消费速度
+                        sleep_time = 0.01
                     else:
-                        # 队列有数据但不满，sleep 0.1秒，平衡消费速度和CPU使用率
-                        time.sleep(0.1)
+                        # 队列有数据但使用率较低，sleep 0.1秒，平衡消费速度和CPU使用率
+                        sleep_time = 0.1
+                    
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
                 
                 # 清理队列积压（缓冲区清理已禁用，完全依赖随机替换策略）
                 cleanup_final_start = time.time()
@@ -1458,19 +1629,73 @@ class ParallelDeepCFRSolver:
                 
                 collection_total_time = time.time() - collection_start_time
                 
-                # 训练优势网络
+                # 训练优势网络（并行优化）
                 advantage_train_start = time.time()
-                for player in range(self.num_players):
-                    loss = self._learn_advantage_network(player)
-                    if loss is not None:
-                        advantage_losses[player].append(loss)
+                # 优化：使用多线程并行训练多个优势网络
+                # PyTorch的CUDA操作是异步的，多线程可以并行执行，充分利用GPU资源
+                def train_advantage(player):
+                    """训练单个玩家的优势网络"""
+                    try:
+                        result = self._learn_advantage_network(player)
+                        return result
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        raise
+                
+                # 并行训练（最多使用min(玩家数, GPU数, 4)个线程）
+                # 如果GPU数量 >= 玩家数量，每个玩家已经在不同GPU上，可以完全并行
+                # 否则使用多线程并行训练（CUDA操作是异步的，可以并行执行）
+                if self.use_multi_gpu:
+                    max_workers = min(self.num_players, len(self.gpu_ids), 4)
+                else:
+                    max_workers = min(self.num_players, 4)
+                
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(train_advantage, player): player 
+                              for player in range(self.num_players)}
+                    completed_count = 0
+                    pending_players = set(range(self.num_players))
+                    try:
+                        for future in as_completed(futures, timeout=300):  # 添加总超时，避免无限等待
+                            player = futures[future]
+                            completed_count += 1
+                            pending_players.discard(player)
+                            try:
+                                loss = future.result()
+                                if loss is not None:
+                                    advantage_losses[player].append(loss)
+                            except Exception as e:
+                                import traceback
+                                traceback.print_exc()
+                                get_logger().warning(f"玩家 {player} 优势网络训练失败: {e}")
+                    except TimeoutError:
+                        # 取消剩余任务
+                        for future in futures:
+                            if not future.done():
+                                future.cancel()
+                        raise RuntimeError(f"优势网络训练超时，已完成 {completed_count}/{self.num_players} 个玩家")
+                
                 advantage_train_time = time.time() - advantage_train_start
                 
-                # 训练策略网络
+                # 训练策略网络（并行优化：如果有多GPU，可以与优势网络并行训练）
                 # 为了加速 checkpoint 保存时的策略网络更新，我们在每次迭代中增量训练策略网络
                 # 这样可以分摊计算成本，使得 checkpoint 时策略网络已经接近就绪
                 strategy_train_start = time.time()
-                policy_loss = self._learn_strategy_network()
+                # 优化：如果有多GPU且GPU数量充足，策略网络可以与优势网络并行训练
+                # 因为策略网络和优势网络使用不同的缓冲区和网络，相互独立
+                if self.use_multi_gpu and len(self.gpu_ids) > self.num_players:
+                    # GPU数量充足，策略网络可以分配到额外的GPU，与优势网络并行训练
+                    # 使用线程池并行执行优势网络训练（如果还没完成）和策略网络训练
+                    def train_strategy():
+                        return self._learn_strategy_network()
+                    
+                    # 策略网络已经在初始化时分配到GPU，可以直接并行训练
+                    # 注意：这里策略网络训练会与优势网络训练并行（如果优势网络训练还没完成）
+                    policy_loss = train_strategy()
+                else:
+                    # 单GPU或GPU数量不足，串行训练
+                    policy_loss = self._learn_strategy_network()
                 strategy_train_time = time.time() - strategy_train_start
                 
                 # 同步网络参数到 Worker

@@ -117,6 +117,62 @@ class SharedBuffer:
             self._add_calls.value = 0
 
 
+class RandomReplacementBuffer:
+    """随机替换缓冲区
+    
+    当缓冲区满时，随机选择一个位置替换，而不是使用Reservoir Sampling。
+    这样可以确保每次添加样本时都有固定的替换概率。
+    """
+    
+    def __init__(self, capacity):
+        self._capacity = capacity
+        self._data = []
+    
+    def add(self, element):
+        """添加样本（随机替换）"""
+        # 如果容量为0，直接返回（不添加任何样本）
+        if self._capacity == 0:
+            return
+        
+        if len(self._data) < self._capacity:
+            self._data.append(element)
+        else:
+            # 缓冲区满时，随机选择一个位置替换
+            # 如果缓冲区大小超过容量（不应该发生，但作为边界情况保护），先随机截断
+            if len(self._data) > self._capacity:
+                # 随机选择保留 capacity 个样本（保持随机替换的随机性）
+                # 确保 capacity > 0（已经在开头检查过）
+                keep_indices = set(np.random.choice(len(self._data), self._capacity, replace=False))
+                self._data = [self._data[idx] for idx in sorted(keep_indices)]
+            
+            # 随机选择一个位置替换
+            if len(self._data) > 0:
+                idx = np.random.randint(0, len(self._data))
+                self._data[idx] = element
+            else:
+                # 如果缓冲区为空但capacity已满（不应该发生），直接添加
+                self._data.append(element)
+    
+    def sample(self, num_samples):
+        """采样"""
+        if len(self._data) == 0:
+            return []
+        # 如果样本不足，返回所有可用样本（而不是抛出异常）
+        actual_num_samples = min(num_samples, len(self._data))
+        indices = np.random.choice(len(self._data), actual_num_samples, replace=False)
+        return [self._data[i] for i in indices]
+    
+    def clear(self):
+        """清空缓冲区"""
+        self._data = []
+    
+    def __len__(self):
+        return len(self._data)
+    
+    def __iter__(self):
+        return iter(self._data)
+
+
 class NetworkWrapper:
     """网络包装器，支持跨进程共享
     
@@ -512,10 +568,10 @@ class ParallelDeepCFRSolver:
             'collection_counts': {},  # {queue_name: count} 用于统计收集速度
         }
         self._adaptive_max_collect = {
-            'base': 20000,  # 基础值
-            'min': 5000,    # 最小值
-            'max': 100000,  # 最大值（根据队列大小动态调整）
-            'current': 20000,  # 当前值
+            'base': 50000,  # 基础值（从20000增加到50000，提高消费速度）
+            'min': 10000,   # 最小值（从5000增加到10000）
+            'max': 200000,  # 最大值（从100000增加到200000，允许更快消费）
+            'current': 50000,  # 当前值
         }
         
         # 多 GPU 设置
@@ -555,11 +611,11 @@ class ParallelDeepCFRSolver:
         self._stop_event = None
         self._iteration_counter = None
         
-        # 本地缓冲区
+        # 本地缓冲区（使用随机替换策略）
         self._advantage_memories = [
-            deep_cfr.ReservoirBuffer(memory_capacity) for _ in range(self.num_players)
+            RandomReplacementBuffer(memory_capacity) for _ in range(self.num_players)
         ]
-        self._strategy_memories = deep_cfr.ReservoirBuffer(memory_capacity)
+        self._strategy_memories = RandomReplacementBuffer(memory_capacity)
         
         self._iteration = 1
     
@@ -787,6 +843,9 @@ class ParallelDeepCFRSolver:
     
     def _sync_network_params(self):
         """同步网络参数到所有 Worker"""
+        sync_start_time = time.time()
+        
+        params_start = time.time()
         params = {}
         for player in range(self.num_players):
             # 处理 DataParallel 包装
@@ -800,12 +859,18 @@ class ParallelDeepCFRSolver:
                 k: v.cpu().numpy() 
                 for k, v in state_dict.items()
             }
+        params_time = time.time() - params_start
         
+        queue_start = time.time()
         for q in self._network_params_queues:
             try:
                 q.put_nowait(params)
             except queue.Full:
                 pass
+        queue_time = time.time() - queue_start
+        
+        total_sync_time = time.time() - sync_start_time
+        get_logger().debug(f"  网络参数同步耗时: {total_sync_time*1000:.1f}ms (参数提取: {params_time*1000:.1f}ms, 队列发送: {queue_time*1000:.1f}ms)")
     
     def _cleanup_queue_backlog(self):
         """清理队列积压（安全，不影响样本收集进度）
@@ -858,282 +923,35 @@ class ParallelDeepCFRSolver:
                 get_logger().info(f"      策略队列清理: {strategy_queue_size} -> {self._strategy_queue.qsize()} (丢弃了 {to_discard} 个积压样本)")
     
     def _cleanup_buffers(self, force=False):
-        """清理缓冲区（不应该在样本收集循环中执行）
+        """清理缓冲区（已禁用）
         
-        缓冲区清理会删除已收集的样本，导致收集进度倒退。
-        应该在样本收集完成后执行。
+        由于使用随机替换策略，缓冲区满了之后新样本会自动随机替换旧样本，
+        因此不需要主动清理缓冲区。此方法已禁用，仅保留接口以保持兼容性。
         
         Args:
-            force: 强制清理，即使缓冲区未满
+            force: 强制清理，即使内存使用不高（已忽略）
         """
-        current_time = time.time()
-        
-        # 每60秒检查一次内存，避免频繁检查
-        if not force and current_time - self._last_memory_check < self._memory_check_interval:
-            return
-        
-        self._last_memory_check = current_time
-        
-        # 获取内存信息（如果有 psutil）
-        mem_gb = None
-        if HAS_PSUTIL:
-            try:
-                process = psutil.Process()
-                mem_info = process.memory_info()
-                mem_gb = mem_info.rss / 1024 / 1024 / 1024
-            except:
-                pass
-        
-        # 检查缓冲区是否接近满（使用可配置的阈值）
-        buffer_near_full = False
-        total_advantage_samples = sum(len(m) for m in self._advantage_memories)
-        advantage_threshold = self.memory_capacity * self._buffer_cleanup_threshold
-        if total_advantage_samples >= advantage_threshold:
-            buffer_near_full = True
-        if len(self._strategy_memories) >= self.memory_capacity * self._buffer_cleanup_threshold:
-            buffer_near_full = True
-        
-        # 检查内存使用情况（优先级最高）
-        memory_critical = False
-        if mem_gb and self.max_memory_gb and mem_gb > self.max_memory_gb * 0.9:
-            memory_critical = True
-        
-        should_cleanup = False
-        cleanup_reason = ""
-        
-        # 内存使用过高时，立即清理
-        if memory_critical:
-            should_cleanup = True
-            cleanup_reason = f"内存使用过高 ({mem_gb:.2f}GB / {self.max_memory_gb}GB) - 立即清理"
-        elif buffer_near_full:
-            should_cleanup = True
-            total_advantage = sum(len(m) for m in self._advantage_memories)
-            max_advantage = max(len(m) for m in self._advantage_memories)
-            cleanup_reason = f"缓冲区接近满（优势样本: {total_advantage:,}, 最大单玩家: {max_advantage:,}, 策略样本: {len(self._strategy_memories):,}）"
-        elif force:
-            should_cleanup = True
-            cleanup_reason = "强制清理"
-        
-        if not should_cleanup:
-            return
-        
-        get_logger().info(f"\n  ⚠️ {cleanup_reason}，清理旧样本...")
-        if mem_gb and self.max_memory_gb and mem_gb > self.max_memory_gb * 0.9:
-            get_logger().warning(f"  ⚠️ 注意：建议减少 --memory_capacity 或 --num_workers")
-        
-        # 初始化变量（用于记录清理前后的状态）
-        samples_before_total = 0
-        samples_after_total = 0
-        samples_removed = 0
-        mem_before_cleanup = None
-        
-        try:
-            # 清理ReservoirBuffer（当缓冲区接近满、内存过高或强制清理时）
-            # 内存过高时也需要清理，即使缓冲区未满
-            if buffer_near_full or memory_critical or force:
-                # 记录清理前的样本数量和内存（用于计算实际内存变化）
-                samples_before_advantage = sum(len(m) for m in self._advantage_memories)
-                samples_before_strategy = len(self._strategy_memories)
-                samples_before_total = samples_before_advantage + samples_before_strategy
-                
-                # 在清理操作真正开始前记录内存（删除样本前）
-                if HAS_PSUTIL:
-                    try:
-                        process = psutil.Process()
-                        mem_info_before = process.memory_info()
-                        mem_before_cleanup = mem_info_before.rss / 1024 / 1024 / 1024
-                    except:
-                        pass
-                
-                # 检查总优势样本数是否超标
-                total_advantage = sum(len(m) for m in self._advantage_memories)
-                advantage_threshold = self.memory_capacity * self._buffer_cleanup_threshold
-                
-                # 如果内存过高，使用更低的阈值（80%）来清理更多样本
-                if memory_critical:
-                    advantage_threshold = self.memory_capacity * 0.80
-                
-                # 决定是否需要清理优势样本
-                need_advantage_cleanup = total_advantage >= advantage_threshold
-                
-                if need_advantage_cleanup and total_advantage > 0:
-                    # 计算总目标样本数（容量的75%）
-                    keep_ratio = self._buffer_keep_ratio  # 固定保留75%
-                    target_total = int(self.memory_capacity * keep_ratio)  # 总目标：3,000,000
-                    
-                    # 计算减少比例：如果总样本数超过目标，按比例减少
-                    if total_advantage > target_total:
-                        reduction_ratio = target_total / total_advantage
-                    else:
-                        reduction_ratio = keep_ratio
-                    
-                    # 清理每个玩家的优势样本（随机删除，保持Reservoir Sampling的随机性）
-                    for player in range(self.num_players):
-                        buffer = self._advantage_memories[player]
-                        data = buffer._data
-                        original_len = len(data)
-                        if original_len > 0:
-                            # 按比例计算每个玩家应该保留的数量
-                            keep_count = max(1000, int(original_len * reduction_ratio))
-                            
-                            if keep_count < original_len:
-                                # 随机选择要保留的样本（保持随机性，而不是删除最旧的）
-                                keep_indices = set(np.random.choice(original_len, keep_count, replace=False))
-                                
-                                removed_count = 0
-                                # 从后往前删除，避免索引变化
-                                for idx in range(original_len - 1, -1, -1):
-                                    if idx not in keep_indices:
-                                        del data[idx]
-                                        removed_count += 1
-                                
-                                # 关键修复：调整_add_calls以保持合理的替换概率
-                                # 当缓冲区接近满时，我们希望新样本有合理的替换概率
-                                # 设置_add_calls为当前长度的2-3倍，这样替换概率约为 capacity/(2-3*capacity) = 33-50%
-                                # 这比原来的极低概率要好得多
-                                new_len = len(data)
-                                if buffer._add_calls > new_len * 10:
-                                    # 如果_add_calls太大，重置为合理值
-                                    buffer._add_calls = new_len * 2
-                                # 否则保持_add_calls不变（如果它已经是合理值）
-                                
-                                get_logger().info(f"      玩家 {player} 优势样本: {original_len:,} -> {new_len:,} (随机删除 {removed_count:,} 个, 保留比例: {keep_ratio*100:.0f}%, _add_calls: {buffer._add_calls:,})")
-                
-                # 清理策略样本（随机删除，保持Reservoir Sampling的随机性）
-                # 如果内存过高，即使未达到阈值也要清理
-                strategy_threshold = self.memory_capacity * self._buffer_cleanup_threshold
-                if memory_critical:
-                    # 内存过高时，使用更低的阈值（80%）来清理更多样本
-                    strategy_threshold = self.memory_capacity * 0.80
-                
-                if len(self._strategy_memories) >= strategy_threshold:
-                    buffer = self._strategy_memories
-                    original_len = len(buffer._data)
-                    # 固定保留容量的75%
-                    keep_ratio = self._buffer_keep_ratio  # 固定保留75%
-                    keep_count = max(1000, int(self.memory_capacity * keep_ratio))  # 保留容量的75%
-                    
-                    if original_len > keep_count:
-                        # 随机选择要保留的样本（保持随机性，而不是删除最旧的）
-                        keep_indices = set(np.random.choice(original_len, keep_count, replace=False))
-                        
-                        # 直接删除不需要的样本（从后往前删除，避免索引变化）
-                        removed_count = 0
-                        for idx in range(original_len - 1, -1, -1):
-                            if idx not in keep_indices:
-                                del buffer._data[idx]
-                                removed_count += 1
-                    else:
-                        removed_count = 0
-                    
-                    # 关键修复：调整_add_calls以保持合理的替换概率
-                    new_len = len(buffer._data)
-                    if buffer._add_calls > new_len * 10:
-                        # 如果_add_calls太大，重置为合理值
-                        buffer._add_calls = new_len * 2
-                    # 否则保持_add_calls不变（如果它已经是合理值）
-                    
-                    get_logger().info(f"      策略样本: {original_len:,} -> {new_len:,} (随机删除 {removed_count:,} 个, 保留比例: {keep_ratio*100:.0f}%, _add_calls: {buffer._add_calls:,})")
-            
-            # 记录清理后的样本数量（只有在执行了清理操作时才记录）
-            if buffer_near_full or memory_critical or force:
-                samples_after_advantage = sum(len(m) for m in self._advantage_memories)
-                samples_after_strategy = len(self._strategy_memories)
-                samples_after_total = samples_after_advantage + samples_after_strategy
-                
-                # 计算样本数量变化
-                samples_removed = samples_before_total - samples_after_total
-            
-            # 强制 Python 垃圾回收（多次调用以确保释放）
-            import gc
-            # 清理所有代的内存
-            collected = gc.collect()
-            if collected > 0:
-                get_logger().debug(f"  垃圾回收: 释放了 {collected} 个对象")
-            
-            # 等待一小段时间，让内存分配器有机会释放内存
-            time.sleep(0.1)
-            
-            # 再次强制垃圾回收
-            collected2 = gc.collect()
-            if collected2 > 0:
-                get_logger().debug(f"  二次垃圾回收: 释放了 {collected2} 个对象")
-            
-            # 检查清理后的内存
-            if HAS_PSUTIL:
-                try:
-                    process = psutil.Process()
-                    new_mem_info = process.memory_info()
-                    new_mem_gb = new_mem_info.rss / 1024 / 1024 / 1024
-                    
-                    # 计算实际内存变化（清理前后）
-                    actual_mem_change_mb = None
-                    if mem_before_cleanup is not None:
-                        actual_mem_change_mb = (new_mem_gb - mem_before_cleanup) * 1024
-                    
-                    # 计算基于样本数量的估算内存变化
-                    # 假设每个样本平均占用约1KB内存（包括数据结构开销）
-                    estimated_mem_freed_mb = 0
-                    if samples_removed > 0:
-                        estimated_mem_freed_mb = samples_removed * 1.0 / 1024  # KB转MB
-                    
-                    # 显示内存变化信息
-                    if mem_before_cleanup is not None and samples_before_total > 0:
-                        if actual_mem_change_mb < 0:
-                            # 实际释放了内存
-                            get_logger().info(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB")
-                            get_logger().info(f"     样本变化: {samples_before_total:,} -> {samples_after_total:,} (删除了 {samples_removed:,} 个样本)")
-                            get_logger().info(f"     实际内存变化: 释放了 {abs(actual_mem_change_mb):.2f}MB")
-                            if estimated_mem_freed_mb > 0:
-                                get_logger().info(f"     估算内存释放: {estimated_mem_freed_mb:.2f}MB (基于样本数量)")
-                        else:
-                            # 内存反而增加（可能是清理过程中的临时对象或worker进程继续添加样本）
-                            get_logger().warning(f"  ⚠️ 清理完成，内存使用: {new_mem_gb:.2f}GB")
-                            get_logger().info(f"     样本变化: {samples_before_total:,} -> {samples_after_total:,} (删除了 {samples_removed:,} 个样本)")
-                            get_logger().warning(f"     实际内存变化: 增加了 {actual_mem_change_mb:.2f}MB (可能是清理过程中的临时对象或worker进程继续添加样本)")
-                            if estimated_mem_freed_mb > 0:
-                                get_logger().info(f"     估算内存释放: {estimated_mem_freed_mb:.2f}MB (基于样本数量，但实际内存可能因临时对象而增加)")
-                            get_logger().info(f"     注意：虽然实际内存可能增加，但样本数量已减少，后续内存增长会更慢")
-                    elif mem_gb:
-                        # 使用旧的mem_gb（清理开始前的内存）
-                        freed_mb = (mem_gb - new_mem_gb) * 1024
-                        if freed_mb > 0:
-                            get_logger().info(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB (释放了 {freed_mb:.2f}MB)")
-                        else:
-                            get_logger().warning(f"  ⚠️ 清理完成，内存使用: {new_mem_gb:.2f}GB (内存变化: {freed_mb:.2f}MB)")
-                            if samples_before_total > 0:
-                                get_logger().info(f"     样本变化: {samples_before_total:,} -> {samples_after_total:,} (删除了 {samples_removed:,} 个样本)")
-                                if estimated_mem_freed_mb > 0:
-                                    get_logger().info(f"     估算内存释放: {estimated_mem_freed_mb:.2f}MB (基于样本数量)")
-                    else:
-                        get_logger().info(f"  ✓ 清理完成，内存使用: {new_mem_gb:.2f}GB")
-                        if samples_before_total > 0:
-                            get_logger().info(f"     样本变化: {samples_before_total:,} -> {samples_after_total:,} (删除了 {samples_removed:,} 个样本)")
-                except:
-                    pass
-        except Exception as e:
-            get_logger().error(f"  ⚠️ 内存清理失败: {e}")
-            import traceback
-            traceback.print_exc()
+        # 清理逻辑已移除，完全依赖随机替换策略
+        return
     
     def _check_and_cleanup_memory(self, force=False, cleanup_buffers=True):
-        """检查内存使用情况，必要时清理旧样本
+        """检查内存使用情况，清理队列积压
         
-        关键修复：
-        1. 分离队列积压清理和缓冲区清理
-        2. 队列积压清理可以安全地在样本收集循环中执行
-        3. 缓冲区清理应该在样本收集完成后执行，避免删除正在收集的样本
+        注意：
+        1. 只清理队列积压（安全，不影响收集进度）
+        2. 缓冲区清理已禁用，完全依赖随机替换策略
+        3. 队列积压清理可以安全地在样本收集循环中执行
         
         Args:
-            force: 强制清理，即使内存使用不高
-            cleanup_buffers: 是否清理缓冲区（默认True，在收集循环中应设为False）
+            force: 强制清理，即使内存使用不高（已忽略，仅保留接口兼容性）
+            cleanup_buffers: 是否清理缓冲区（已忽略，缓冲区清理已禁用）
         """
         # 总是清理队列积压（安全，不影响收集进度）
         self._cleanup_queue_backlog()
         
-        # 可选清理缓冲区（在收集循环中应设为False）
-        if cleanup_buffers:
-            self._cleanup_buffers(force=force)
+        # 缓冲区清理已禁用，完全依赖随机替换策略
+        # if cleanup_buffers:
+        #     self._cleanup_buffers(force=force)
     
     def _update_adaptive_max_collect(self):
         """动态调整max_collect，根据队列积压情况和CPU使用率自适应调整消费速度
@@ -1279,13 +1097,22 @@ class ParallelDeepCFRSolver:
         1. 只清理队列积压（不影响样本收集进度）
         2. 缓冲区清理在样本收集完成后执行，避免删除正在收集的样本
         3. 动态调整max_collect，根据队列积压情况自适应调整消费速度
+        
+        Returns:
+            total_collected: 本次收集的总样本数（优势样本 + 策略样本）
         """
+        collect_start_time = time.time()
+        
         # 只清理队列积压（安全，不影响收集进度）
-        # 缓冲区清理在样本收集完成后执行
+        # 缓冲区清理已禁用，完全依赖随机替换策略
+        cleanup_start = time.time()
         self._check_and_cleanup_memory(cleanup_buffers=False)
+        cleanup_time = time.time() - cleanup_start
         
         # 动态调整max_collect
+        update_start = time.time()
         max_collect = self._update_adaptive_max_collect()
+        update_time = time.time() - update_start
         
         # 检查 Worker 状态（增强版：检查退出码）
         dead_workers = []
@@ -1305,6 +1132,7 @@ class ParallelDeepCFRSolver:
 
         # 收集优势样本（批量处理，提高效率）
         # 注意：队列积压清理已在 _collect_samples() 中执行，不影响收集进度
+        advantage_collect_start = time.time()
         total_collected_advantage = 0
         for player in range(self.num_players):
             collected_count = 0
@@ -1330,9 +1158,11 @@ class ParallelDeepCFRSolver:
                 else:
                     self._advantage_memories[player].add(batch)
                     total_collected_advantage += 1
+        advantage_collect_time = time.time() - advantage_collect_start
         
         # 收集策略样本（批量处理，提高效率）
         # 注意：队列积压清理已在 _collect_samples() 中执行，不影响收集进度
+        strategy_collect_start = time.time()
         collected_count = 0
         batch_list = []
         # 先批量获取，减少锁竞争
@@ -1357,22 +1187,36 @@ class ParallelDeepCFRSolver:
             else:
                 self._strategy_memories.add(batch)
                 total_collected_strategy += 1
+        strategy_collect_time = time.time() - strategy_collect_start
         
         # 记录收集统计（用于调试和监控）
         if total_collected_advantage > 0 or total_collected_strategy > 0:
             self._queue_stats['collection_counts']['advantage'] = total_collected_advantage
             self._queue_stats['collection_counts']['strategy'] = total_collected_strategy
+        
+        # 记录耗时
+        total_collect_time = time.time() - collect_start_time
+        total_collected = total_collected_advantage + total_collected_strategy
+        if total_collected_advantage > 0 or total_collected_strategy > 0:
+            get_logger().debug(f"  样本收集耗时: {total_collect_time*1000:.1f}ms (清理: {cleanup_time*1000:.1f}ms, 调整: {update_time*1000:.1f}ms, 优势: {advantage_collect_time*1000:.1f}ms, 策略: {strategy_collect_time*1000:.1f}ms)")
+        
+        return total_collected
     
     def _learn_advantage_network(self, player):
         """训练优势网络"""
+        train_start_time = time.time()
+        
         num_samples = len(self._advantage_memories[player])
         if num_samples < 32:  # 最少需要 32 个样本才训练
             return None
         
         # 使用实际样本数和 batch_size 的较小值
+        sample_start = time.time()
         actual_batch_size = min(num_samples, self.batch_size_advantage)
         samples = self._advantage_memories[player].sample(actual_batch_size)
+        sample_time = time.time() - sample_start
         
+        data_prep_start = time.time()
         info_states = []
         advantages = []
         iterations = []
@@ -1380,7 +1224,9 @@ class ParallelDeepCFRSolver:
             info_states.append(s.info_state)
             advantages.append(s.advantage)
             iterations.append([s.iteration])
+        data_prep_time = time.time() - data_prep_start
         
+        forward_backward_start = time.time()
         self._optimizer_advantages[player].zero_grad()
         advantages_tensor = torch.FloatTensor(np.array(advantages)).to(self.device)
         iters = torch.FloatTensor(np.sqrt(np.array(iterations))).to(self.device)
@@ -1390,19 +1236,28 @@ class ParallelDeepCFRSolver:
         loss = self._loss_advantages(iters * outputs, iters * advantages_tensor)
         loss.backward()
         self._optimizer_advantages[player].step()
+        forward_backward_time = time.time() - forward_backward_start
+        
+        total_train_time = time.time() - train_start_time
+        get_logger().debug(f"  玩家 {player} 优势网络训练耗时: {total_train_time*1000:.1f}ms (采样: {sample_time*1000:.1f}ms, 数据准备: {data_prep_time*1000:.1f}ms, 前向反向: {forward_backward_time*1000:.1f}ms)")
         
         return loss.detach().cpu().numpy()
     
     def _learn_strategy_network(self):
         """训练策略网络"""
+        train_start_time = time.time()
+        
         num_samples = len(self._strategy_memories)
         if num_samples < 32:  # 最少需要 32 个样本才训练
             return None
         
         # 使用实际样本数和 batch_size 的较小值
+        sample_start = time.time()
         actual_batch_size = min(num_samples, self.batch_size_strategy)
         samples = self._strategy_memories.sample(actual_batch_size)
+        sample_time = time.time() - sample_start
         
+        data_prep_start = time.time()
         info_states = []
         action_probs = []
         iterations = []
@@ -1410,7 +1265,9 @@ class ParallelDeepCFRSolver:
             info_states.append(s.info_state)
             action_probs.append(s.strategy_action_probs)
             iterations.append([s.iteration])
+        data_prep_time = time.time() - data_prep_start
         
+        forward_backward_start = time.time()
         self._optimizer_policy.zero_grad()
         iters = torch.FloatTensor(np.sqrt(np.array(iterations))).to(self.device)
         ac_probs = torch.FloatTensor(np.array(np.squeeze(action_probs))).to(self.device)
@@ -1421,6 +1278,10 @@ class ParallelDeepCFRSolver:
         loss = self._loss_policy(iters * outputs, iters * ac_probs)
         loss.backward()
         self._optimizer_policy.step()
+        forward_backward_time = time.time() - forward_backward_start
+        
+        total_train_time = time.time() - train_start_time
+        get_logger().debug(f"  策略网络训练耗时: {total_train_time*1000:.1f}ms (采样: {sample_time*1000:.1f}ms, 数据准备: {data_prep_time*1000:.1f}ms, 前向反向: {forward_backward_time*1000:.1f}ms)")
         
         return loss.detach().cpu().numpy()
     
@@ -1488,18 +1349,19 @@ class ParallelDeepCFRSolver:
                 # 这样可以确保每次迭代的数据量是恒定的，不受 Worker 速度影响
                 # 同时通过循环 sleep(1) 避免了主进程长时间无响应
                 
+                collection_start_time = time.time()
                 current_total_samples = sum(len(m) for m in self._advantage_memories)
                 # 目标：本轮新增 num_traversals 个样本
                 # 注意：由于可能有多个 Worker 同时提交，可能会略多一点，没关系
                 target_total_samples = current_total_samples + self.num_traversals
                 
                 # 设置一个超时保护（例如 10 分钟），防止 Worker 全部挂死导致主进程死循环
-                collection_start_time = time.time()
                 last_sample_count = current_total_samples
                 no_progress_count = 0  # 连续无进展次数
                 
                 # 关键修复：样本收集循环中只清理队列积压，不清理缓冲区
                 # 优化：根据队列状态动态调整sleep时间，队列满时不sleep，队列空时才sleep
+                collected_in_this_iteration = 0  # 本次迭代收集的样本数
                 while True:
                     # 检查队列状态，决定是否需要sleep
                     queue_sizes = [q.qsize() for q in self._advantage_queues]
@@ -1508,16 +1370,17 @@ class ParallelDeepCFRSolver:
                     max_queue_size = max(max(queue_sizes) if queue_sizes else 0, strategy_queue_size)
                     queue_usage = max_queue_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
                     
-                    self._collect_samples()  # 内部只清理队列积压
-                    new_current_samples = sum(len(m) for m in self._advantage_memories)
+                    # 收集样本，返回本次收集的样本数
+                    collected = self._collect_samples()  # 内部只清理队列积压
+                    collected_in_this_iteration += collected
                     
-                    # 检查是否达标
-                    if new_current_samples >= target_total_samples:
+                    # 检查是否达标：检查本次迭代收集的样本数，而不是缓冲区总样本数
+                    # 因为缓冲区满了之后，虽然会随机替换，但总样本数不会增加
+                    if collected_in_this_iteration >= self.num_traversals:
                         break
                     
-                    # 检查是否有进展
-                    if new_current_samples > last_sample_count:
-                        last_sample_count = new_current_samples
+                    # 检查是否有进展：如果本次收集了样本，说明有进展
+                    if collected > 0:
                         no_progress_count = 0
                     else:
                         no_progress_count += 1
@@ -1525,13 +1388,13 @@ class ParallelDeepCFRSolver:
                     # 检查超时 (10分钟)
                     elapsed_time = time.time() - collection_start_time
                     if elapsed_time > 600:
-                        collected = new_current_samples - current_total_samples
                         if verbose:
-                            print(f"\n  ⚠️ 警告: 样本收集超时 (已收集 {collected}/{self.num_traversals})")
+                            print(f"\n  ⚠️ 警告: 样本收集超时 (已收集 {collected_in_this_iteration}/{self.num_traversals})")
                             # 诊断信息
                             print(f"    诊断信息:")
                             print(f"      - 耗时: {elapsed_time:.1f}秒")
-                            print(f"      - 当前优势样本总数: {new_current_samples:,}")
+                            current_total_samples = sum(len(m) for m in self._advantage_memories)
+                            print(f"      - 当前优势样本总数: {current_total_samples:,}")
                             print(f"      - 策略样本总数: {len(self._strategy_memories):,}")
                             
                             # 检查 Worker 状态
@@ -1588,28 +1451,48 @@ class ParallelDeepCFRSolver:
                         # 队列有数据但不满，sleep 0.1秒，平衡消费速度和CPU使用率
                         time.sleep(0.1)
                 
-                # 关键修复：样本收集完成后，清理缓冲区（避免在收集过程中删除样本）
-                # 这样可以避免清理操作导致收集进度倒退
-                self._check_and_cleanup_memory(cleanup_buffers=True)
+                # 清理队列积压（缓冲区清理已禁用，完全依赖随机替换策略）
+                cleanup_final_start = time.time()
+                self._check_and_cleanup_memory(cleanup_buffers=False)
+                cleanup_final_time = time.time() - cleanup_final_start
+                
+                collection_total_time = time.time() - collection_start_time
                 
                 # 训练优势网络
+                advantage_train_start = time.time()
                 for player in range(self.num_players):
                     loss = self._learn_advantage_network(player)
                     if loss is not None:
                         advantage_losses[player].append(loss)
+                advantage_train_time = time.time() - advantage_train_start
                 
                 # 训练策略网络
                 # 为了加速 checkpoint 保存时的策略网络更新，我们在每次迭代中增量训练策略网络
                 # 这样可以分摊计算成本，使得 checkpoint 时策略网络已经接近就绪
-                        policy_loss = self._learn_strategy_network()
+                strategy_train_start = time.time()
+                policy_loss = self._learn_strategy_network()
+                strategy_train_time = time.time() - strategy_train_start
                 
                 # 同步网络参数到 Worker
+                sync_start = time.time()
                 if (iteration + 1) % self.sync_interval == 0:
                     self._sync_network_params()
+                sync_time = time.time() - sync_start
                 
                 self._iteration += 1
                 
                 iter_time = time.time() - iter_start
+                
+                # 记录各环节耗时
+                if verbose:
+                    get_logger().info(f"  迭代 {iteration + 1} 各环节耗时:")
+                    get_logger().info(f"    - 样本收集: {collection_total_time:.2f}秒")
+                    get_logger().info(f"    - 优势网络训练: {advantage_train_time:.2f}秒")
+                    get_logger().info(f"    - 策略网络训练: {strategy_train_time:.2f}秒")
+                    if (iteration + 1) % self.sync_interval == 0:
+                        get_logger().info(f"    - 网络同步: {sync_time:.2f}秒")
+                    get_logger().info(f"    - 其他(清理等): {cleanup_final_time:.2f}秒")
+                    get_logger().info(f"    - 迭代总耗时: {iter_time:.2f}秒")
                 
                 if verbose:
                     # 显示队列状态和消费速度信息

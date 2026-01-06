@@ -439,7 +439,8 @@ def detect_manual_feature_size_from_state_dict(state_dict, raw_input_size):
                 else:
                     # 如果检测到其他维度，返回None让用户手动指定
                     print(f"⚠️  检测到未知的特征维度: {feature_size} (MLP输入: {mlp_input_size}, 原始输入: {raw_input_size})")
-                    return None
+                    # return None
+                    return feature_size
     
     return None
 

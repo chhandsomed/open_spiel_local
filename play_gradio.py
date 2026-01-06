@@ -43,12 +43,17 @@ def evaluate_hand(hole_cards, board_cards):
         return 0, "牌数不足", ""
         
     # 解析牌
-    # card format: "Ah", "Tc"
+    # card format: "Ah", "Tc", "10h" (支持两种格式)
     parsed_cards = []
     for c in all_cards:
         if len(c) < 2: continue
-        r = c[0]
-        s = c[1]
+        # 处理 "10" 开头的牌（如 "10h", "10s"）
+        if len(c) >= 3 and c[0:2] == "10":
+            r = "T"  # 10点用T表示
+            s = c[2]
+        else:
+            r = c[0]
+            s = c[1]
         parsed_cards.append((RANK_VALUES.get(r, -1), s, c))
         
     parsed_cards.sort(key=lambda x: x[0], reverse=True)

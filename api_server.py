@@ -785,6 +785,7 @@ def load_model(model_dir, device='cpu', num_players=None):
         
         # 先加载权重，检测特征维度
         state_dict = torch.load(policy_path, map_location=device)
+        print(f"state_dict: {state_dict.keys()}")
         new_state_dict = {}
         for k, v in state_dict.items():
             if k.startswith('module.'):
@@ -804,7 +805,7 @@ def load_model(model_dir, device='cpu', num_players=None):
         else:
             # 如果无法检测，默认使用新版本（1维）
             print(f"  ⚠️  无法自动检测特征维度，使用默认值: 1维（新版本）")
-            manual_feature_size = 1
+            manual_feature_size = 23
         
         # 创建 solver（指定特征维度）
         solver = DeepCFRSimpleFeature(
@@ -1193,18 +1194,35 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             
             # 打印原始概率分布（用于调试）
             print(f"📊 模型原始概率分布（前5个动作）: {dict(zip(range(5), probs[:5]))}", flush=True)
+            print(f"📊 模型输出维度: {len(probs)}, 合法动作: {legal_actions}", flush=True)
             
-            # 构建概率字典
+            # 构建概率字典（只考虑在模型输出范围内的合法动作）
             legal_probs = {}
+            max_action_index = len(probs) - 1
+            skipped_actions = []
             for action in legal_actions:
-                legal_probs[action] = float(probs[action])
+                if action <= max_action_index:
+                    legal_probs[action] = float(probs[action])
+                else:
+                    skipped_actions.append(action)
+            
+            if skipped_actions:
+                print(f"⚠️ 警告: 以下合法动作超出模型输出范围，将被忽略: {skipped_actions} (模型最大动作索引: {max_action_index})", flush=True)
             
             # 归一化
-            total_prob = sum(legal_probs.values())
-            if total_prob > 0:
-                for action in legal_probs:
-                    legal_probs[action] /= total_prob
+            if legal_probs:
+                total_prob = sum(legal_probs.values())
+                if total_prob > 0:
+                    for action in legal_probs:
+                        legal_probs[action] /= total_prob
+                else:
+                    # 如果所有概率都是0，均匀分布
+                    uniform_prob = 1.0 / len(legal_probs)
+                    for action in legal_probs:
+                        legal_probs[action] = uniform_prob
             else:
+                # 如果所有合法动作都超出模型输出范围，使用均匀分布
+                print(f"⚠️ 警告: 所有合法动作都超出模型输出范围，使用均匀分布", flush=True)
                 uniform_prob = 1.0 / len(legal_actions)
                 for action in legal_actions:
                     legal_probs[action] = uniform_prob
@@ -1216,7 +1234,7 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             if legal_probs:
                 recommended_action = max(legal_probs.items(), key=lambda x: x[1])[0]
             else:
-                recommended_action = legal_actions[0]
+                recommended_action = legal_actions[0] if legal_actions else None
             
             print(f"🎯 推荐动作: {recommended_action} (概率: {legal_probs.get(recommended_action, 0.0):.4f})", flush=True)
             
@@ -1350,24 +1368,42 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
         logits = model(info_state)  # DataParallel 会自动处理
         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
     
-    # 只保留合法动作的概率
+    # 只保留合法动作的概率（只考虑在模型输出范围内的合法动作）
     legal_probs = {}
+    max_action_index = len(probs) - 1
+    skipped_actions = []
     for action in legal_actions:
-        legal_probs[action] = float(probs[action])
+        if action <= max_action_index:
+            legal_probs[action] = float(probs[action])
+        else:
+            skipped_actions.append(action)
+    
+    if skipped_actions:
+        print(f"⚠️ 警告: 以下合法动作超出模型输出范围，将被忽略: {skipped_actions} (模型最大动作索引: {max_action_index})", flush=True)
     
     # 归一化
-    total_prob = sum(legal_probs.values())
-    if total_prob > 0:
-        for action in legal_probs:
-            legal_probs[action] /= total_prob
+    if legal_probs:
+        total_prob = sum(legal_probs.values())
+        if total_prob > 0:
+            for action in legal_probs:
+                legal_probs[action] /= total_prob
+        else:
+            # 如果所有概率都是0，均匀分布
+            uniform_prob = 1.0 / len(legal_probs)
+            for action in legal_probs:
+                legal_probs[action] = uniform_prob
     else:
-        # 如果所有概率都是0，均匀分布
+        # 如果所有合法动作都超出模型输出范围，使用均匀分布
+        print(f"⚠️ 警告: 所有合法动作都超出模型输出范围，使用均匀分布", flush=True)
         uniform_prob = 1.0 / len(legal_actions)
         for action in legal_actions:
             legal_probs[action] = uniform_prob
     
     # 选择推荐动作（概率最大的）
-    recommended_action = max(legal_probs.items(), key=lambda x: x[1])[0]
+    if legal_probs:
+        recommended_action = max(legal_probs.items(), key=lambda x: x[1])[0]
+    else:
+        recommended_action = legal_actions[0] if legal_actions else None
     
     return recommended_action, legal_probs, legal_actions
 

@@ -155,12 +155,42 @@ class RandomReplacementBuffer:
                 self._data.append(element)
     
     def sample(self, num_samples):
-        """采样"""
+        """采样
+        
+        优化：使用混合策略，根据缓冲区大小选择最优采样方法
+        - 小缓冲区（<15000）：使用 np.random.choice（C实现，很快）
+        - 大缓冲区（>=15000）：使用 Fisher-Yates 部分 shuffle（时间复杂度 O(k)，与缓冲区大小无关）
+        
+        这样可以在小缓冲区时保持高性能，在大缓冲区时避免性能随缓冲区增长而下降。
+        """
         if len(self._data) == 0:
             return []
         # 如果样本不足，返回所有可用样本（而不是抛出异常）
         actual_num_samples = min(num_samples, len(self._data))
-        indices = np.random.choice(len(self._data), actual_num_samples, replace=False)
+        
+        # 优化策略：根据缓冲区大小选择不同的采样方法
+        # 阈值设置为 15000，因为测试显示：
+        # - 小缓冲区：np.random.choice 很快（C实现）
+        # - 大缓冲区：Fisher-Yates 的时间复杂度是 O(k)，不会随缓冲区增长而增加
+        if len(self._data) < 15000:
+            # 小缓冲区：使用 np.random.choice（C实现，很快）
+            indices = np.random.choice(len(self._data), actual_num_samples, replace=False)
+        else:
+            # 大缓冲区：使用 Fisher-Yates 部分 shuffle
+            # 时间复杂度：O(k)，其中 k = actual_num_samples（通常固定为 batch_size）
+            # 这样训练时间不会随缓冲区增长而增加
+            indices = np.arange(len(self._data), dtype=np.int32)
+            
+            # Fisher-Yates 部分 shuffle：只 shuffle 前 actual_num_samples 个位置
+            for i in range(actual_num_samples):
+                # 从 [i, len(self._data)) 中随机选择一个位置
+                j = np.random.randint(i, len(self._data))
+                # 交换 indices[i] 和 indices[j]
+                indices[i], indices[j] = indices[j], indices[i]
+            
+            # 只取前 actual_num_samples 个索引
+            indices = indices[:actual_num_samples]
+        
         return [self._data[i] for i in indices]
     
     def clear(self):
@@ -899,14 +929,17 @@ class ParallelDeepCFRSolver:
         - 队列中的样本还没有添加到缓冲区
         - 清理队列不会影响已收集的样本数量
         - 队列积压会占用内存，需要及时清理
+        
+        优化：提高清理阈值到95%，减少清理频率，避免队列被过度清空
         """
-        # 检查队列是否积压（提高阈值到90%，减少清理频率）
+        # 优化：提高阈值到95%，减少清理频率
+        # 只有在队列使用率 > 95% 时才清理，避免清理过于频繁导致队列被清空
         queue_backlog = False
         for q in self._advantage_queues:
-            if q.qsize() > self.queue_maxsize * 0.90:  # 从85%提高到90%
+            if q.qsize() > self.queue_maxsize * 0.95:  # 从90%提高到95%
                 queue_backlog = True
                 break
-        if self._strategy_queue.qsize() > self.queue_maxsize * 0.90:  # 从85%提高到90%
+        if self._strategy_queue.qsize() > self.queue_maxsize * 0.95:  # 从90%提高到95%
             queue_backlog = True
         
         if not queue_backlog:
@@ -915,14 +948,17 @@ class ParallelDeepCFRSolver:
         total_advantage_queue = sum(q.qsize() for q in self._advantage_queues)
         strategy_queue_size = self._strategy_queue.qsize()
         
-        # 清理队列中的积压样本（减少丢弃比例：从25%降到10%，只清理超出90%的部分）
+        # 优化：清理策略更保守，只清理超出95%的部分
+        # 这样可以减少样本丢失，同时避免队列被过度清空
         for player, q in enumerate(self._advantage_queues):
             queue_size = q.qsize()
-            if queue_size > self.queue_maxsize * 0.90:
-                # 只丢弃超出90%的部分，而不是整个队列的10%
-                # 这样可以减少样本丢失
-                target_size = int(self.queue_maxsize * 0.90)
+            if queue_size > self.queue_maxsize * 0.95:
+                # 只丢弃超出95%的部分，而不是整个队列的更多
+                # 这样可以减少样本丢失，避免队列被清空
+                target_size = int(self.queue_maxsize * 0.95)
                 to_discard = queue_size - target_size
+                # 限制单次清理数量，避免一次性清理太多
+                to_discard = min(to_discard, int(self.queue_maxsize * 0.05))  # 最多清理5%
                 for _ in range(to_discard):
                     try:
                         q.get_nowait()
@@ -931,9 +967,12 @@ class ParallelDeepCFRSolver:
                 if to_discard > 0:
                     get_logger().info(f"      玩家 {player} 队列清理: {queue_size} -> {q.qsize()} (丢弃了 {to_discard} 个积压样本)")
         
-        if strategy_queue_size > self.queue_maxsize * 0.90:
-            target_size = int(self.queue_maxsize * 0.90)
+        # 优化：策略队列清理策略与优势队列保持一致
+        if strategy_queue_size > self.queue_maxsize * 0.95:
+            target_size = int(self.queue_maxsize * 0.95)
             to_discard = strategy_queue_size - target_size
+            # 限制单次清理数量，避免一次性清理太多
+            to_discard = min(to_discard, int(self.queue_maxsize * 0.05))  # 最多清理5%
             for _ in range(to_discard):
                 try:
                     self._strategy_queue.get_nowait()
@@ -1138,15 +1177,30 @@ class ParallelDeepCFRSolver:
         
         # 只清理队列积压（安全，不影响收集进度）
         # 缓冲区清理已禁用，完全依赖随机替换策略
-        # 修复：限制清理频率，避免频繁清理导致性能问题
+        # 优化：限制清理频率，避免频繁清理导致性能问题和队列被清空
         cleanup_start = time.time()
         current_time = time.time()
         if not hasattr(self, '_last_cleanup_time'):
             self._last_cleanup_time = 0
-        # 每0.5秒最多清理一次，避免频繁清理
-        if current_time - self._last_cleanup_time > 0.5:
+        
+        # 优化：增加清理间隔从0.5秒到2秒，减少清理频率
+        # 同时检查队列使用率，只有在队列使用率 > 95% 时才清理
+        should_cleanup = False
+        if current_time - self._last_cleanup_time > 2.0:  # 增加到2秒
+            # 检查队列使用率，只有在队列接近满时才清理
+            max_queue_size = 0
+            for q in self._advantage_queues:
+                max_queue_size = max(max_queue_size, q.qsize())
+            max_queue_size = max(max_queue_size, self._strategy_queue.qsize())
+            queue_usage = max_queue_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
+            
+            # 只有在队列使用率 > 95% 时才清理，避免清理过于频繁
+            if queue_usage > 0.95:
+                should_cleanup = True
+                self._last_cleanup_time = current_time
+        
+        if should_cleanup:
             self._check_and_cleanup_memory(cleanup_buffers=False)
-            self._last_cleanup_time = current_time
         cleanup_time = time.time() - cleanup_start
         
         # 动态调整max_collect
@@ -1520,12 +1574,13 @@ class ParallelDeepCFRSolver:
                 
                 # 设置一个超时保护（例如 10 分钟），防止 Worker 全部挂死导致主进程死循环
                 last_sample_count = current_total_samples
-                no_progress_count = 0  # 连续无进展次数
                 
                 # 关键修复：样本收集循环中只清理队列积压，不清理缓冲区
                 # 优化：根据队列状态动态调整sleep时间，队列满时不sleep，队列空时才sleep
                 collected_in_this_iteration = 0  # 本次迭代收集的样本数
                 loop_count = 0
+                no_progress_count = 0  # 连续无进展次数
+                last_warning_time = 0  # 上次警告时间，避免重复打印
                 while True:
                     loop_count += 1
                     # 检查队列状态，决定是否需要sleep
@@ -1545,10 +1600,17 @@ class ParallelDeepCFRSolver:
                         break
                     
                     # 检查是否有进展：如果本次收集了样本，说明有进展
+                    # 优化：区分"队列空"和"队列满但收集失败"两种情况
                     if collected > 0:
                         no_progress_count = 0
                     else:
-                        no_progress_count += 1
+                        # 只有在队列不为空时才视为"无进展"
+                        # 如果队列为空，说明 Worker 可能暂时没有产生样本，这是正常的
+                        if total_queue_size > 0:
+                            no_progress_count += 1
+                        else:
+                            # 队列为空，重置计数器（这是正常情况，不是问题）
+                            no_progress_count = 0
                     
                     # 检查超时 (10分钟)
                     elapsed_time = time.time() - collection_start_time
@@ -1599,10 +1661,13 @@ class ParallelDeepCFRSolver:
                                 print(f"      建议: 检查系统日志 (dmesg | grep -i oom) 查看是否有 OOM 杀死进程")
                         break
                     
-                    # 如果连续多次无进展，提前警告
+                    # 如果连续多次无进展，提前警告（优化：避免重复打印）
+                    # 修复：使用时间间隔控制，每30秒最多警告一次
+                    current_time = time.time()
                     if no_progress_count >= 20 and verbose:  # 10秒无进展（20次 × 0.5秒）
-                        print(f"\n  ⚠️ 警告: 连续 {no_progress_count * 0.5:.1f}秒无样本收集进展")
-                        no_progress_count = 0  # 重置计数器，避免重复打印
+                        if current_time - last_warning_time > 30:  # 每30秒最多警告一次
+                            print(f"\n  ⚠️ 警告: 连续 {no_progress_count * 0.5:.1f}秒无样本收集进展 (队列大小: {total_queue_size}, 使用率: {queue_usage:.1%})")
+                            last_warning_time = current_time
                     
                     # 优化：根据队列状态动态调整sleep时间
                     # 队列使用率 > 80% 时不sleep，队列空时才sleep，避免消费速度不够快

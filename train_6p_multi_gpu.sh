@@ -3,7 +3,7 @@
 # 使用4张GPU，最大化训练速度
 
 # 设置环境
-export CUDA_VISIBLE_DEVICES=0,1,2,3  # 使用4张GPU
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7  # 使用4张GPU
 
 # 激活conda环境
 source $(conda info --base)/etc/profile.d/conda.sh
@@ -12,11 +12,11 @@ conda activate open_spiel
 # 训练参数配置
 NUM_PLAYERS=6
 NUM_WORKERS=10              # Worker数量（优化：从12降到10，减少样本产生速度，降低内存占用）
-NUM_ITERATIONS=1000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
-NUM_TRAVERSALS=1000          # 每次迭代遍历次数（6人场状态复杂，建议1000-1500）
+NUM_ITERATIONS=20000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
+NUM_TRAVERSALS=1600          # 每次迭代遍历次数（6人场状态复杂，建议1000-1500）
 BATCH_SIZE=4096              # 训练批量大小（减少以加快训练速度，多GPU时4096利用率高但训练慢）
-MEMORY_CAPACITY=10000      # 经验回放缓冲区容量（200万，6人场状态复杂，需要更大缓冲区）
-QUEUE_MAXSIZE=1000         # 队列最大大小（优化：从200,000降到50,000，减少75%内存占用，降低OOM风险）
+MEMORY_CAPACITY=2000000      # 经验回放缓冲区容量（200万，6人场状态复杂，需要更大缓冲区）
+QUEUE_MAXSIZE=20000         # 队列最大大小（优化：从200,000降到50,000，减少75%内存占用，降低OOM风险）
 LEARNING_RATE=0.001          # 学习率
 POLICY_LAYERS="256 256 256"  # 策略网络结构（3层256节点，6人局状态复杂）
 ADVANTAGE_LAYERS="256 256 256"  # 优势网络结构（与策略网络相同）
@@ -46,7 +46,7 @@ nohup python deep_cfr_parallel.py \
     --checkpoint_interval $CHECKPOINT_INTERVAL \
     --num_test_games $NUM_TEST_GAMES \
     --use_gpu \
-    --gpu_ids 0 1 2 3 \
+    --gpu_ids 0 1 2 3 4 5 6 7 \
     --skip_nashconv \
     --eval_with_games \
     --save_prefix $SAVE_PREFIX \

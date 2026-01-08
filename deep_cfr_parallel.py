@@ -154,59 +154,210 @@ class RandomReplacementBuffer:
                 # 如果缓冲区为空但capacity已满（不应该发生），直接添加
                 self._data.append(element)
     
-    def sample(self, num_samples):
+    def sample(self, num_samples, current_iteration=None, new_sample_ratio=0.5):
         """采样
         
-        优化：使用混合策略，根据缓冲区大小选择最优采样方法
-        - 小缓冲区（<15000）：使用 np.random.choice（C实现，很快）
-        - 大缓冲区（>=15000）：使用 Fisher-Yates 部分 shuffle（时间复杂度 O(k)，与缓冲区大小无关）
+        方案7：分层加权采样（Stratified Weighted Sampling）
+        - 新样本：随机采样 batch_size * new_sample_ratio 个（保证新样本占比）
+        - 老样本：加权采样 batch_size * (1-new_sample_ratio) 个（权重基于重要性）
         
-        这样可以在小缓冲区时保持高性能，在大缓冲区时避免性能随缓冲区增长而下降。
+        Args:
+            num_samples: 需要采样的样本数量
+            current_iteration: 当前迭代次数（用于区分新旧样本）
+            new_sample_ratio: 新样本占比（默认0.5，即50%）
+        
+        如果没有提供 current_iteration，则使用随机采样（向后兼容）。
         """
         if len(self._data) == 0:
             return []
+        
         # 如果样本不足，返回所有可用样本（而不是抛出异常）
         actual_num_samples = min(num_samples, len(self._data))
         
-        # 优化策略：根据缓冲区大小选择不同的采样方法
-        # 阈值设置为 15000，因为测试显示：
-        # - 小缓冲区：np.random.choice 很快（C实现）
-        # - 大缓冲区：Fisher-Yates 的时间复杂度是 O(k)，不会随缓冲区增长而增加
+        # 如果没有提供 current_iteration，使用随机采样（向后兼容）
+        if current_iteration is None:
+            return self._random_sample(actual_num_samples)
+        
+        # 分层加权采样
+        return self._stratified_weighted_sample(actual_num_samples, current_iteration, new_sample_ratio)
+    
+    def _random_sample(self, num_samples):
+        """随机采样（向后兼容）"""
         if len(self._data) < 15000:
             # 小缓冲区：使用 np.random.choice（C实现，很快）
-            indices = np.random.choice(len(self._data), actual_num_samples, replace=False)
+            indices = np.random.choice(len(self._data), num_samples, replace=False)
         else:
             # 大缓冲区：使用优化的采样方法
-            # 时间复杂度：O(k)，其中 k = actual_num_samples（通常固定为 batch_size）
-            # 不需要创建整个数组，真正实现O(k)复杂度
-            # 这样训练时间不会随缓冲区增长而增加
-            
             buffer_size = len(self._data)
-            
-            # 如果k接近n，直接使用np.random.choice更高效
-            if actual_num_samples > buffer_size * 0.5:
-                # k接近n时，使用np.random.choice（虽然可能慢，但至少不会创建大数组）
-                indices = np.random.choice(buffer_size, actual_num_samples, replace=False)
+            if num_samples > buffer_size * 0.5:
+                indices = np.random.choice(buffer_size, num_samples, replace=False)
             else:
-                # k远小于n时，使用set记录已选索引（平均O(k)时间复杂度）
-                # 虽然可能有重复选择，但当k远小于n时，重复概率很低
-                # 平均时间复杂度：O(k)，最坏情况：O(k*log(k))（当k接近n时）
                 selected_indices = set()
-                max_attempts = actual_num_samples * 10  # 防止无限循环
+                max_attempts = num_samples * 10
                 attempts = 0
-                
-                while len(selected_indices) < actual_num_samples and attempts < max_attempts:
+                while len(selected_indices) < num_samples and attempts < max_attempts:
                     idx = np.random.randint(0, buffer_size)
                     selected_indices.add(idx)
                     attempts += 1
-                
-                if len(selected_indices) < actual_num_samples:
-                    # 如果尝试次数过多，回退到np.random.choice
-                    indices = np.random.choice(buffer_size, actual_num_samples, replace=False)
+                if len(selected_indices) < num_samples:
+                    indices = np.random.choice(buffer_size, num_samples, replace=False)
                 else:
                     indices = np.array(list(selected_indices), dtype=np.int32)
-        
         return [self._data[i] for i in indices]
+    
+    def _stratified_weighted_sample(self, num_samples, current_iteration, new_sample_ratio):
+        """分层加权采样
+        
+        1. 分离新旧样本
+        2. 新样本：随机采样 batch_size * new_sample_ratio 个
+        3. 老样本：加权采样 batch_size * (1-new_sample_ratio) 个（权重 = max(|regret|) 或 entropy）
+        """
+        # 1. 分离新旧样本
+        new_samples = []
+        old_samples = []
+        # 调试：记录样本的iteration分布
+        iteration_distribution = {}
+        for sample in self._data:
+            if hasattr(sample, 'iteration'):
+                iter_val = sample.iteration
+                iteration_distribution[iter_val] = iteration_distribution.get(iter_val, 0) + 1
+                # 新样本定义：sample.iteration == current_iteration
+                # 关键修复：现在样本的iteration字段由主进程在收集时标记，不再依赖Worker进程读取iteration_counter
+                # 所以可以严格判断：sample.iteration == current_iteration 就是新样本
+                # 旧样本：sample.iteration < current_iteration（原本就在缓冲区中的样本）
+                # 新样本：sample.iteration == current_iteration（本次迭代新进入缓冲区的样本）
+                if iter_val == current_iteration:
+                    new_samples.append(sample)
+                else:
+                    old_samples.append(sample)
+            else:
+                old_samples.append(sample)
+        
+        # 调试：打印样本的iteration分布（仅在前10次迭代时打印，避免日志过多）
+        if not hasattr(self, '_debug_iteration_count'):
+            self._debug_iteration_count = 0
+        if self._debug_iteration_count < 10:
+            import logging
+            logger = logging.getLogger(__name__)
+            # logger.info(f"    调试：样本iteration分布: {dict(sorted(iteration_distribution.items()))}, current_iteration={current_iteration}, 新样本数={len(new_samples)}, 老样本数={len(old_samples)}")
+            self._debug_iteration_count += 1
+        
+        # 2. 计算采样数量
+        num_new = min(len(new_samples), int(num_samples * new_sample_ratio))
+        num_old = num_samples - num_new
+        
+        # 如果新样本不足，用老样本补充
+        if num_new < num_samples * new_sample_ratio and len(old_samples) > 0:
+            num_old = min(len(old_samples), num_samples - num_new)
+        
+        # 3. 新样本：随机采样
+        sampled_new = []
+        if num_new > 0 and len(new_samples) > 0:
+            if num_new >= len(new_samples):
+                sampled_new = new_samples
+            else:
+                indices = np.random.choice(len(new_samples), num_new, replace=False)
+                sampled_new = [new_samples[i] for i in indices]
+        
+        # 4. 老样本：加权采样
+        sampled_old = []
+        if num_old > 0 and len(old_samples) > 0:
+            if num_old >= len(old_samples):
+                sampled_old = old_samples
+            else:
+                # 计算权重
+                weights = self._calculate_importance_weights(old_samples)
+                
+                # 归一化权重
+                weights_sum = sum(weights)
+                if weights_sum > 0:
+                    weights = np.array(weights) / weights_sum
+                    
+                    # 检查非零权重数量
+                    non_zero_mask = weights > 0
+                    non_zero_count = np.sum(non_zero_mask)
+                    
+                    if non_zero_count >= num_old:
+                        # 非零权重数量足够，只从非零权重样本中采样
+                        non_zero_indices = np.where(non_zero_mask)[0]
+                        non_zero_weights = weights[non_zero_mask]
+                        # 重新归一化非零权重
+                        non_zero_weights = non_zero_weights / np.sum(non_zero_weights)
+                        # 从非零权重样本中采样
+                        sampled_non_zero_indices = np.random.choice(
+                            len(non_zero_indices), num_old, replace=False, p=non_zero_weights
+                        )
+                        indices = non_zero_indices[sampled_non_zero_indices]
+                        sampled_old = [old_samples[i] for i in indices]
+                    else:
+                        # 非零权重数量不足，先采样所有非零权重样本，然后从零权重样本中随机采样剩余数量
+                        non_zero_indices = np.where(non_zero_mask)[0]
+                        zero_indices = np.where(~non_zero_mask)[0]
+                        
+                        # 先采样所有非零权重样本
+                        sampled_old = [old_samples[i] for i in non_zero_indices]
+                        remaining = num_old - len(sampled_old)
+                        
+                        if remaining > 0 and len(zero_indices) > 0:
+                            # 从零权重样本中随机采样剩余数量
+                            if remaining >= len(zero_indices):
+                                sampled_old.extend([old_samples[i] for i in zero_indices])
+                            else:
+                                sampled_zero_indices = np.random.choice(
+                                    len(zero_indices), remaining, replace=False
+                                )
+                                sampled_old.extend([old_samples[zero_indices[i]] for i in sampled_zero_indices])
+                else:
+                    # 如果所有权重为0，使用随机采样
+                    indices = np.random.choice(len(old_samples), num_old, replace=False)
+                    sampled_old = [old_samples[i] for i in indices]
+        
+        # 5. 合并样本
+        return sampled_new + sampled_old
+    
+    def _calculate_importance_weights(self, samples):
+        """计算样本的重要性权重
+        
+        对于优势样本：权重 = max(|advantage|)
+        对于策略样本：权重 = entropy(strategy_action_probs)
+        """
+        weights = []
+        for sample in samples:
+            if hasattr(sample, 'advantage'):
+                # 优势样本：使用 max(|advantage|) 作为权重
+                advantage = sample.advantage
+                if isinstance(advantage, (list, np.ndarray)):
+                    importance = float(np.max(np.abs(advantage)))
+                else:
+                    importance = float(abs(advantage))
+                weights.append(importance)
+            elif hasattr(sample, 'strategy_action_probs'):
+                # 策略样本：使用熵（entropy）作为权重
+                probs = sample.strategy_action_probs
+                if isinstance(probs, (list, np.ndarray)):
+                    probs = np.array(probs)
+                    # 过滤掉0值，避免log(0)
+                    probs = probs[probs > 0]
+                    if len(probs) > 0:
+                        entropy = -np.sum(probs * np.log(probs + 1e-10))
+                        importance = float(entropy)
+                    else:
+                        importance = 0.0
+                else:
+                    importance = 0.0
+                weights.append(importance)
+            else:
+                # 未知类型，使用默认权重
+                weights.append(1.0)
+        
+        # 确保所有权重 >= 0
+        weights = [max(0.0, w) for w in weights]
+        
+        # 如果所有权重为0，设置为均匀权重
+        if sum(weights) == 0:
+            weights = [1.0] * len(samples)
+        
+        return weights
     
     def clear(self):
         """清空缓冲区"""
@@ -452,7 +603,20 @@ def worker_process(
                         advantage_queues[player].put(local_advantage_batches[player], timeout=0.01)
                         local_advantage_batches[player] = []  # 清空批次
                     except queue.Full:
-                        pass  # 队列满了就丢弃整个批次
+                        # 队列满了，实现FIFO替换：先丢弃最旧的样本，再添加新样本
+                        try:
+                            # 尝试丢弃一个旧样本（FIFO）
+                            advantage_queues[player].get_nowait()
+                            # 丢弃成功后，再尝试put新样本
+                            try:
+                                advantage_queues[player].put(local_advantage_batches[player], timeout=0.01)
+                                local_advantage_batches[player] = []  # 清空批次
+                            except queue.Full:
+                                # 如果还是满了，说明队列大小可能有问题，直接丢弃新样本
+                                pass
+                        except queue.Empty:
+                            # 队列为空（不应该发生，但处理一下）
+                            pass
 
 
                 return cfv
@@ -480,7 +644,20 @@ def worker_process(
                         strategy_queue.put(local_strategy_batch, timeout=0.01)
                         local_strategy_batch = []  # 清空批次
                     except queue.Full:
-                        pass
+                        # 队列满了，实现FIFO替换：先丢弃最旧的样本，再添加新样本
+                        try:
+                            # 尝试丢弃一个旧样本（FIFO）
+                            strategy_queue.get_nowait()
+                            # 丢弃成功后，再尝试put新样本
+                            try:
+                                strategy_queue.put(local_strategy_batch, timeout=0.01)
+                                local_strategy_batch = []  # 清空批次
+                            except queue.Full:
+                                # 如果还是满了，说明队列大小可能有问题，直接丢弃新样本
+                                pass
+                        except queue.Empty:
+                            # 队列为空（不应该发生，但处理一下）
+                            pass
                 
                 return traverse_game_tree(state.child(sampled_action), player, iteration, exploration_rate)
         
@@ -579,7 +756,19 @@ def worker_process(
                     try:
                         advantage_queues[p].put(batch, timeout=0.01)
                     except queue.Full:
-                        pass # 队列满就算了
+                        # 队列满了，实现FIFO替换：先丢弃最旧的样本，再添加新样本
+                        try:
+                            # 尝试丢弃一个旧样本（FIFO）
+                            advantage_queues[p].get_nowait()
+                            # 丢弃成功后，再尝试put新样本
+                            try:
+                                advantage_queues[p].put(batch, timeout=0.01)
+                            except queue.Full:
+                                # 如果还是满了，说明队列大小可能有问题，直接丢弃新样本
+                                pass
+                        except queue.Empty:
+                            # 队列为空（不应该发生，但处理一下）
+                            pass
                 # 清空该玩家的缓冲区
                 local_advantage_batches[p] = []
             
@@ -588,7 +777,20 @@ def worker_process(
                     strategy_queue.put(local_strategy_batch, timeout=0.01)
                     local_strategy_batch = []
                 except queue.Full:
-                    pass
+                    # 队列满了，实现FIFO替换：先丢弃最旧的样本，再添加新样本
+                    try:
+                        # 尝试丢弃一个旧样本（FIFO）
+                        strategy_queue.get_nowait()
+                        # 丢弃成功后，再尝试put新样本
+                        try:
+                            strategy_queue.put(local_strategy_batch, timeout=0.01)
+                            local_strategy_batch = []
+                        except queue.Full:
+                            # 如果还是满了，说明队列大小可能有问题，直接丢弃新样本
+                            pass
+                    except queue.Empty:
+                        # 队列为空（不应该发生，但处理一下）
+                        pass
         
     except KeyboardInterrupt:
         print(f"\n[Worker {worker_id}] 收到中断信号，退出...")
@@ -620,11 +822,13 @@ class ParallelDeepCFRSolver:
         batch_size_advantage=2048,
         batch_size_strategy=2048,
         memory_capacity=1000000,
+        strategy_memory_capacity=None,  # 策略网络缓冲区容量（None表示使用memory_capacity）
         device='cuda',
         gpu_ids=None,  # 多 GPU 支持
         sync_interval=1,  # 每多少次迭代同步一次网络参数
         max_memory_gb=None,  # 最大内存限制（GB），None 表示不限制
         queue_maxsize=50000,  # 队列最大大小（降低以减少内存占用）
+        new_sample_ratio=0.5,  # 新样本占比（分层加权采样，默认0.5即50%）
         # 切换条件参数
         switch_threshold_win_rate_strict=0.25,  # 严格胜率阈值（25%）
         switch_threshold_win_rate_relaxed=0.20,  # 宽松胜率阈值（20%）
@@ -644,9 +848,12 @@ class ParallelDeepCFRSolver:
         self.batch_size_advantage = batch_size_advantage
         self.batch_size_strategy = batch_size_strategy
         self.memory_capacity = memory_capacity
+        # 策略网络缓冲区容量（如果未指定，使用memory_capacity）
+        self.strategy_memory_capacity = strategy_memory_capacity if strategy_memory_capacity is not None else memory_capacity
         self.sync_interval = sync_interval
         self.max_memory_gb = max_memory_gb
         self.queue_maxsize = queue_maxsize
+        self.new_sample_ratio = new_sample_ratio  # 新样本占比（分层加权采样）
         
         # 内存监控
         self._last_memory_check = 0
@@ -712,7 +919,7 @@ class ParallelDeepCFRSolver:
         self._advantage_memories = [
             RandomReplacementBuffer(memory_capacity) for _ in range(self.num_players)
         ]
-        self._strategy_memories = RandomReplacementBuffer(memory_capacity)
+        self._strategy_memories = RandomReplacementBuffer(self.strategy_memory_capacity)
 
         self._iteration = 1
         
@@ -916,18 +1123,18 @@ class ParallelDeepCFRSolver:
                 # 保守估算：每个样本约 5-10KB（包括 Python 对象开销）
                 # 对于6人局，memory_capacity=1,000,000：
                 #   - 优势样本：6 × 1,000,000 × 5KB = 30GB
-                #   - 策略样本：1 × 1,000,000 × 5KB = 5GB
+                #   - 策略样本：1 × strategy_memory_capacity × 5KB
                 #   - 总计：约 35GB（不包括队列和 Worker）
                 sample_size_kb = 5  # 保守估算，实际可能更大
                 estimated_memory_gb = (
                     self.memory_capacity * self.num_players * sample_size_kb +  # 优势样本
-                    self.memory_capacity * sample_size_kb +  # 策略样本
+                    self.strategy_memory_capacity * sample_size_kb +  # 策略样本
                     self.queue_maxsize * (self.num_players + 1) * sample_size_kb +  # 队列积压（最坏情况）
                     self.num_workers * 500  # Worker 进程开销（每个 Worker 约 500MB）
                 ) / 1024 / 1024
                 print(f"  估算总内存需求: {estimated_memory_gb:.2f}GB")
                 print(f"    - 优势样本缓冲区: {self.memory_capacity * self.num_players * sample_size_kb / 1024 / 1024:.2f}GB")
-                print(f"    - 策略样本缓冲区: {self.memory_capacity * sample_size_kb / 1024 / 1024:.2f}GB")
+                print(f"    - 策略样本缓冲区: {self.strategy_memory_capacity * sample_size_kb / 1024 / 1024:.2f}GB")
                 print(f"    - 队列积压（最坏情况）: {self.queue_maxsize * (self.num_players + 1) * sample_size_kb / 1024 / 1024:.2f}GB")
                 print(f"    - Worker 进程: {self.num_workers * 500 / 1024 / 1024:.2f}GB")
                 
@@ -1006,65 +1213,6 @@ class ParallelDeepCFRSolver:
         total_sync_time = time.time() - sync_start_time
         get_logger().info(f"  网络参数同步耗时: {total_sync_time*1000:.1f}ms (参数提取: {params_time*1000:.1f}ms, 队列发送: {queue_time*1000:.1f}ms)")
     
-    def _cleanup_queue_backlog(self):
-        """清理队列积压（安全，不影响样本收集进度）
-        
-        队列积压清理可以安全地在样本收集循环中执行，因为：
-        - 队列中的样本还没有添加到缓冲区
-        - 清理队列不会影响已收集的样本数量
-        - 队列积压会占用内存，需要及时清理
-        
-        优化：提高清理阈值到95%，减少清理频率，避免队列被过度清空
-        """
-        # 优化：提高阈值到95%，减少清理频率
-        # 只有在队列使用率 > 95% 时才清理，避免清理过于频繁导致队列被清空
-        queue_backlog = False
-        for q in self._advantage_queues:
-            if q.qsize() > self.queue_maxsize * 0.95:  # 从90%提高到95%
-                queue_backlog = True
-                break
-        if self._strategy_queue.qsize() > self.queue_maxsize * 0.95:  # 从90%提高到95%
-            queue_backlog = True
-        
-        if not queue_backlog:
-            return
-        
-        total_advantage_queue = sum(q.qsize() for q in self._advantage_queues)
-        strategy_queue_size = self._strategy_queue.qsize()
-        
-        # 优化：清理策略更保守，只清理超出95%的部分
-        # 这样可以减少样本丢失，同时避免队列被过度清空
-        for player, q in enumerate(self._advantage_queues):
-            queue_size = q.qsize()
-            if queue_size > self.queue_maxsize * 0.95:
-                # 只丢弃超出95%的部分，而不是整个队列的更多
-                # 这样可以减少样本丢失，避免队列被清空
-                target_size = int(self.queue_maxsize * 0.95)
-                to_discard = queue_size - target_size
-                # 限制单次清理数量，避免一次性清理太多
-                to_discard = min(to_discard, int(self.queue_maxsize * 0.05))  # 最多清理5%
-                for _ in range(to_discard):
-                    try:
-                        q.get_nowait()
-                    except queue.Empty:
-                        break
-                if to_discard > 0:
-                    get_logger().info(f"      玩家 {player} 队列清理: {queue_size} -> {q.qsize()} (丢弃了 {to_discard} 个积压样本)")
-        
-        # 优化：策略队列清理策略与优势队列保持一致
-        if strategy_queue_size > self.queue_maxsize * 0.95:
-            target_size = int(self.queue_maxsize * 0.95)
-            to_discard = strategy_queue_size - target_size
-            # 限制单次清理数量，避免一次性清理太多
-            to_discard = min(to_discard, int(self.queue_maxsize * 0.05))  # 最多清理5%
-            for _ in range(to_discard):
-                try:
-                    self._strategy_queue.get_nowait()
-                except queue.Empty:
-                    break
-            if to_discard > 0:
-                get_logger().info(f"      策略队列清理: {strategy_queue_size} -> {self._strategy_queue.qsize()} (丢弃了 {to_discard} 个积压样本)")
-    
     def _cleanup_buffers(self, force=False):
         """清理缓冲区（已禁用）
         
@@ -1078,19 +1226,21 @@ class ParallelDeepCFRSolver:
         return
     
     def _check_and_cleanup_memory(self, force=False, cleanup_buffers=True):
-        """检查内存使用情况，清理队列积压
+        """检查内存使用情况（队列清理已移除）
         
         注意：
-        1. 只清理队列积压（安全，不影响收集进度）
-        2. 缓冲区清理已禁用，完全依赖随机替换策略
-        3. 队列积压清理可以安全地在样本收集循环中执行
+        1. 队列清理已完全移除，因为Worker进程已经实现了FIFO替换
+        2. FIFO替换：当队列满了时，Worker进程会先get一个旧样本（丢弃），再put新样本
+        3. 队列大小保持稳定（maxsize），不需要主进程清理
+        4. 缓冲区清理已禁用，完全依赖随机替换策略
         
         Args:
             force: 强制清理，即使内存使用不高（已忽略，仅保留接口兼容性）
             cleanup_buffers: 是否清理缓冲区（已忽略，缓冲区清理已禁用）
         """
-        # 总是清理队列积压（安全，不影响收集进度）
-        self._cleanup_queue_backlog()
+        # 队列清理已完全移除，因为Worker进程已经实现了FIFO替换
+        # FIFO替换：当队列满了时，Worker进程会先get一个旧样本（丢弃），再put新样本
+        # 队列大小保持稳定（maxsize），不需要主进程清理
         
         # 缓冲区清理已禁用，完全依赖随机替换策略
         # if cleanup_buffers:
@@ -1246,46 +1396,28 @@ class ParallelDeepCFRSolver:
         
         return new_max_collect
     
-    def _collect_samples(self, timeout=0.1):
+    def _collect_samples(self, timeout=0.1, current_iteration=None):
         """从队列收集样本
         
         关键修复：
         1. 只清理队列积压（不影响样本收集进度）
         2. 缓冲区清理在样本收集完成后执行，避免删除正在收集的样本
         3. 动态调整max_collect，根据队列积压情况自适应调整消费速度
+        4. 在样本添加到缓冲区时，由主进程标记样本的迭代次数（不依赖Worker进程读取iteration_counter）
+        
+        Args:
+            timeout: 超时时间（未使用，保留兼容性）
+            current_iteration: 当前迭代次数（用于标记新样本）
         
         Returns:
             total_collected: 本次收集的总样本数（优势样本 + 策略样本）
         """
         collect_start_time = time.time()
         
-        # 只清理队列积压（安全，不影响收集进度）
-        # 缓冲区清理已禁用，完全依赖随机替换策略
-        # 优化：限制清理频率，避免频繁清理导致性能问题和队列被清空
-        cleanup_start = time.time()
-        current_time = time.time()
-        if not hasattr(self, '_last_cleanup_time'):
-            self._last_cleanup_time = 0
-        
-        # 优化：增加清理间隔从0.5秒到2秒，减少清理频率
-        # 同时检查队列使用率，只有在队列使用率 > 95% 时才清理
-        should_cleanup = False
-        if current_time - self._last_cleanup_time > 2.0:  # 增加到2秒
-            # 检查队列使用率，只有在队列接近满时才清理
-            max_queue_size = 0
-            for q in self._advantage_queues:
-                max_queue_size = max(max_queue_size, q.qsize())
-            max_queue_size = max(max_queue_size, self._strategy_queue.qsize())
-            queue_usage = max_queue_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
-            
-            # 只有在队列使用率 > 95% 时才清理，避免清理过于频繁
-            if queue_usage > 0.95:
-                should_cleanup = True
-                self._last_cleanup_time = current_time
-        
-        if should_cleanup:
-            self._check_and_cleanup_memory(cleanup_buffers=False)
-        cleanup_time = time.time() - cleanup_start
+        # 队列清理已完全移除，因为Worker进程已经实现了FIFO替换
+        # FIFO替换：当队列满了时，Worker进程会先get一个旧样本（丢弃），再put新样本
+        # 队列大小保持稳定（maxsize），不需要主进程清理
+        cleanup_time = 0.0
         
         # 动态调整max_collect
         update_start = time.time()
@@ -1309,7 +1441,7 @@ class ParallelDeepCFRSolver:
             raise RuntimeError(error_msg)
 
         # 收集优势样本（批量处理，提高效率）
-        # 注意：队列积压清理已在 _collect_samples() 中执行，不影响收集进度
+        # 注意：队列清理已完全移除，因为Worker进程已经实现了FIFO替换
         advantage_collect_start = time.time()
         total_collected_advantage = 0
         for player in range(self.num_players):
@@ -1328,20 +1460,43 @@ class ParallelDeepCFRSolver:
                     break
             
             # 批量添加到缓冲区（优化：减少方法调用开销）
+            # 关键修复：在样本添加到缓冲区时，由主进程标记样本的迭代次数
+            # 这样就不依赖Worker进程读取iteration_counter的值了
             memory = self._advantage_memories[player]
             for batch in batch_list:
                 if isinstance(batch, list):
                     # 批量添加，减少方法调用次数
                     for sample in batch:
-                        memory.add(sample)
+                        # 如果提供了current_iteration，更新样本的iteration字段
+                        if current_iteration is not None:
+                            # 创建新的样本对象，更新iteration字段
+                            updated_sample = AdvantageMemory(
+                                sample.info_state,
+                                current_iteration,  # 使用主进程的current_iteration
+                                sample.advantage,
+                                sample.action
+                            )
+                            memory.add(updated_sample)
+                        else:
+                            memory.add(sample)
                     total_collected_advantage += len(batch)
                 else:
-                    memory.add(batch)
+                    # 单个样本
+                    if current_iteration is not None:
+                        updated_sample = AdvantageMemory(
+                            batch.info_state,
+                            current_iteration,  # 使用主进程的current_iteration
+                            batch.advantage,
+                            batch.action
+                        )
+                        memory.add(updated_sample)
+                    else:
+                        memory.add(batch)
                     total_collected_advantage += 1
         advantage_collect_time = time.time() - advantage_collect_start
         
         # 收集策略样本（批量处理，提高效率）
-        # 注意：队列积压清理已在 _collect_samples() 中执行，不影响收集进度
+        # 注意：队列清理已完全移除，因为Worker进程已经实现了FIFO替换
         strategy_collect_start = time.time()
         collected_count = 0
         batch_list = []
@@ -1358,16 +1513,37 @@ class ParallelDeepCFRSolver:
                 break
         
         # 批量添加到缓冲区（优化：减少方法调用开销）
+        # 关键修复：在样本添加到缓冲区时，由主进程标记样本的迭代次数
+        # 这样就不依赖Worker进程读取iteration_counter的值了
         total_collected_strategy = 0
         memory = self._strategy_memories
         for batch in batch_list:
             if isinstance(batch, list):
                 # 批量添加，减少方法调用次数
                 for sample in batch:
-                    memory.add(sample)
+                    # 如果提供了current_iteration，更新样本的iteration字段
+                    if current_iteration is not None:
+                        # 创建新的样本对象，更新iteration字段
+                        updated_sample = StrategyMemory(
+                            sample.info_state,
+                            current_iteration,  # 使用主进程的current_iteration
+                            sample.strategy_action_probs
+                        )
+                        memory.add(updated_sample)
+                    else:
+                        memory.add(sample)
                 total_collected_strategy += len(batch)
             else:
-                memory.add(batch)
+                # 单个样本
+                if current_iteration is not None:
+                    updated_sample = StrategyMemory(
+                        batch.info_state,
+                        current_iteration,  # 使用主进程的current_iteration
+                        batch.strategy_action_probs
+                    )
+                    memory.add(updated_sample)
+                else:
+                    memory.add(batch)
                 total_collected_strategy += 1
         strategy_collect_time = time.time() - strategy_collect_start
         
@@ -1379,8 +1555,8 @@ class ParallelDeepCFRSolver:
         # 记录耗时
         total_collect_time = time.time() - collect_start_time
         total_collected = total_collected_advantage + total_collected_strategy
-        if total_collected_advantage > 0 or total_collected_strategy > 0:
-            get_logger().info(f"  样本收集耗时: {total_collect_time*1000:.1f}ms (清理: {cleanup_time*1000:.1f}ms, 调整: {update_time*1000:.1f}ms, 优势: {advantage_collect_time*1000:.1f}ms, 策略: {strategy_collect_time*1000:.1f}ms)")
+        # if total_collected_advantage > 0 or total_collected_strategy > 0:
+        #     get_logger().info(f"  样本收集耗时: {total_collect_time*1000:.1f}ms (清理: {cleanup_time*1000:.1f}ms, 调整: {update_time*1000:.1f}ms, 优势: {advantage_collect_time*1000:.1f}ms, 策略: {strategy_collect_time*1000:.1f}ms)")
         
         return total_collected
     
@@ -1400,12 +1576,18 @@ class ParallelDeepCFRSolver:
         # 使用实际样本数和 batch_size 的较小值
         sample_start = time.time()
         actual_batch_size = min(num_samples, self.batch_size_advantage)
-        samples = self._advantage_memories[player].sample(actual_batch_size)
+        samples = self._advantage_memories[player].sample(
+            actual_batch_size, 
+            current_iteration=current_iteration,
+            new_sample_ratio=self.new_sample_ratio
+        )
         sample_time = time.time() - sample_start
         
         # 统计新样本和老样本比例
+        # 注意：打印逻辑必须和采样逻辑一致（sample.iteration == current_iteration）
+        # 关键修复：现在样本的iteration字段由主进程在收集时标记，所以可以严格判断
         if current_iteration is not None and len(samples) > 0:
-            new_samples = sum(1 for s in samples if s.iteration == current_iteration)
+            new_samples = sum(1 for s in samples if hasattr(s, 'iteration') and s.iteration == current_iteration)
             old_samples = len(samples) - new_samples
             new_ratio = new_samples / len(samples) * 100 if len(samples) > 0 else 0
             get_logger().info(f"    玩家 {player} 优势网络训练样本: 新样本 {new_samples}/{len(samples)} ({new_ratio:.1f}%), 老样本 {old_samples}/{len(samples)} ({100-new_ratio:.1f}%)")
@@ -1516,12 +1698,18 @@ class ParallelDeepCFRSolver:
         # 使用实际样本数和 batch_size 的较小值
         sample_start = time.time()
         actual_batch_size = min(num_samples, self.batch_size_strategy)
-        samples = self._strategy_memories.sample(actual_batch_size)
+        samples = self._strategy_memories.sample(
+            actual_batch_size,
+            current_iteration=current_iteration,
+            new_sample_ratio=self.new_sample_ratio
+        )
         sample_time = time.time() - sample_start
         
         # 统计新样本和老样本比例
+        # 注意：打印逻辑必须和采样逻辑一致（sample.iteration == current_iteration）
+        # 关键修复：现在样本的iteration字段由主进程在收集时标记，所以可以严格判断
         if current_iteration is not None and len(samples) > 0:
-            new_samples = sum(1 for s in samples if s.iteration == current_iteration)
+            new_samples = sum(1 for s in samples if hasattr(s, 'iteration') and s.iteration == current_iteration)
             old_samples = len(samples) - new_samples
             new_ratio = new_samples / len(samples) * 100 if len(samples) > 0 else 0
             get_logger().info(f"    策略网络训练样本: 新样本 {new_samples}/{len(samples)} ({new_ratio:.1f}%), 老样本 {old_samples}/{len(samples)} ({100-new_ratio:.1f}%)")
@@ -1764,6 +1952,7 @@ class ParallelDeepCFRSolver:
         self._start_workers()
         
         advantage_losses = {p: [] for p in range(self.num_players)}
+        policy_losses = []  # 策略网络损失历史
         start_time = time.time()
         
         try:
@@ -1781,7 +1970,7 @@ class ParallelDeepCFRSolver:
                 
                 time.sleep(1)
                 warmup_time += 1
-                collected = self._collect_samples()
+                collected = self._collect_samples(current_iteration=None)  # warmup阶段不需要标记迭代次数
                 total_samples = sum(len(m) for m in self._advantage_memories)
                 if total_samples > 0:
                     print(f" 就绪 (耗时 {warmup_time} 秒，已收集 {total_samples} 个样本)")
@@ -1839,7 +2028,8 @@ class ParallelDeepCFRSolver:
                     queue_usage = max_queue_size / self.queue_maxsize if self.queue_maxsize > 0 else 0
                     
                     # 收集样本，返回本次收集的样本数
-                    collected = self._collect_samples()  # 内部只清理队列积压
+                    # 关键修复：传递current_iteration，让主进程标记样本的迭代次数
+                    collected = self._collect_samples(current_iteration=self._iteration_counter.value)  # 内部只清理队列积压
                     collected_in_this_iteration += collected
                     
                     # 检查是否达标：检查本次迭代收集的样本数，而不是缓冲区总样本数
@@ -1855,7 +2045,18 @@ class ParallelDeepCFRSolver:
                         # 只有在队列不为空时才视为"无进展"
                         # 如果队列为空，说明 Worker 可能暂时没有产生样本，这是正常的
                         if total_queue_size > 0:
-                            no_progress_count += 1
+                            # 修复：如果队列使用率较高（>=80%），不应该触发警告
+                            # 因为队列中有样本，只是收集速度慢，这是正常情况
+                            # 队列使用率 >= 99%：队列满了，Worker无法继续添加样本，队列大小不会增加
+                            # 队列使用率 >= 80%：队列中有样本，只是收集速度慢，不应该触发警告
+                            if queue_usage >= 0.80:
+                                # 队列使用率较高，重置计数器（这是正常情况，不是问题）
+                                # 队列中有样本，只是收集速度慢，不应该触发警告
+                                no_progress_count = 0
+                            else:
+                                # 队列使用率较低，但队列中有样本，可能是收集速度慢
+                                # 增加计数器，但阈值可以适当放宽
+                                no_progress_count += 1
                         else:
                             # 队列为空，重置计数器（这是正常情况，不是问题）
                             no_progress_count = 0
@@ -1911,10 +2112,20 @@ class ParallelDeepCFRSolver:
                     
                     # 如果连续多次无进展，提前警告（优化：避免重复打印）
                     # 修复：使用时间间隔控制，每30秒最多警告一次
+                    # 修复：增加诊断信息，记录max_collect和实际收集的样本数
                     current_time = time.time()
                     if no_progress_count >= 20 and verbose:  # 10秒无进展（20次 × 0.5秒）
                         if current_time - last_warning_time > 30:  # 每30秒最多警告一次
-                            print(f"\n  ⚠️ 警告: 连续 {no_progress_count * 0.5:.1f}秒无样本收集进展 (队列大小: {total_queue_size}, 使用率: {queue_usage:.1%})")
+                            # 获取当前的max_collect值
+                            current_max_collect = self._adaptive_max_collect.get('current', 'N/A')
+                            print(f"\n  ⚠️ 警告: 连续 {no_progress_count * 0.5:.1f}秒无样本收集进展")
+                            print(f"    诊断信息:")
+                            print(f"      - 队列大小: {total_queue_size:,}")
+                            print(f"      - 队列使用率: {queue_usage:.1%}")
+                            print(f"      - max_collect: {current_max_collect}")
+                            print(f"      - 本次收集样本数: {collected}")
+                            print(f"      - 本次迭代已收集: {collected_in_this_iteration}/{self.num_traversals}")
+                            print(f"      - 耗时: {time.time() - collection_start_time:.1f}秒")
                             last_warning_time = current_time
                     
                     # 优化：根据队列状态动态调整sleep时间
@@ -1956,10 +2167,10 @@ class ParallelDeepCFRSolver:
                     player_start_time = time.time()
                     try:
                         # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
-                        # 在iteration=N时，iteration_counter.value = N+1
-                        # 样本收集时，Worker读取iteration_counter.value = N+1，样本记录的iteration = N+1
-                        # 训练时，应该使用iteration+1来匹配样本的iteration字段
-                        result = self._learn_advantage_network(player, current_iteration=iteration + 1)
+                        # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
+                        # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
+                        # 使用self._iteration_counter.value而不是iteration+1，确保与样本的iteration字段匹配
+                        result = self._learn_advantage_network(player, current_iteration=self._iteration_counter.value)
                         player_train_time = time.time() - player_start_time
                         player_train_times[player] = player_train_time
                         return result, player_train_time
@@ -2051,10 +2262,10 @@ class ParallelDeepCFRSolver:
                     # 使用线程池并行执行优势网络训练（如果还没完成）和策略网络训练
                     def train_strategy():
                         # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
-                        # 在iteration=N时，iteration_counter.value = N+1
-                        # 样本收集时，Worker读取iteration_counter.value = N+1，样本记录的iteration = N+1
-                        # 训练时，应该使用iteration+1来匹配样本的iteration字段
-                        return self._learn_strategy_network(current_iteration=iteration + 1)
+                        # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
+                        # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
+                        # 使用self._iteration_counter.value而不是iteration+1，确保与样本的iteration字段匹配
+                        return self._learn_strategy_network(current_iteration=self._iteration_counter.value)
                     
                     # 策略网络已经在初始化时分配到GPU，可以直接并行训练
                     # 注意：这里策略网络训练会与优势网络训练并行（如果优势网络训练还没完成）
@@ -2062,10 +2273,15 @@ class ParallelDeepCFRSolver:
                 else:
                     # 单GPU或GPU数量不足，串行训练
                     # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
-                    # 在iteration=N时，iteration_counter.value = N+1
-                    # 样本收集时，Worker读取iteration_counter.value = N+1，样本记录的iteration = N+1
-                    # 训练时，应该使用iteration+1来匹配样本的iteration字段
-                    policy_loss = self._learn_strategy_network(current_iteration=iteration + 1)
+                    # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
+                    # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
+                    # 使用self._iteration_counter.value而不是iteration+1，确保与样本的iteration字段匹配
+                    policy_loss = self._learn_strategy_network(current_iteration=self._iteration_counter.value)
+                
+                # 保存策略损失
+                if policy_loss is not None:
+                    policy_losses.append(policy_loss)
+                
                 strategy_train_time = time.time() - strategy_train_start
                 
                 # 同步网络参数到 Worker
@@ -2135,9 +2351,23 @@ class ParallelDeepCFRSolver:
                 
                 if (iteration + 1) % eval_interval == 0:
                     print()
+                    # 打印归一化的优势网络损失（除以iteration得到MSE）
+                    current_iter = iteration + 1
                     for player, losses in advantage_losses.items():
                         if losses:
-                            print(f"    玩家 {player} 损失: {losses[-1]:.6f}")
+                            raw_loss = losses[-1]
+                            # 归一化：除以iteration（因为损失值 = iteration * MSE）
+                            # 归一化后的值就是MSE本身
+                            mse = raw_loss / current_iter if current_iter > 0 else raw_loss
+                            print(f"    玩家 {player} 优势网络损失: MSE={mse:.2f} (原始: {raw_loss:.2f})")
+                    
+                    # 打印归一化的策略网络损失（除以iteration得到MSE）
+                    if policy_losses:
+                        raw_policy_loss = policy_losses[-1]
+                        # 归一化：除以iteration（因为损失值 = iteration * MSE）
+                        # 归一化后的值就是MSE本身
+                        mse = raw_policy_loss / current_iter if current_iter > 0 else raw_policy_loss
+                        print(f"    策略网络损失: MSE={mse:.6f} (原始: {raw_policy_loss:.2f})")
                     
                     # 运行评估
                     if game is not None:
@@ -2189,6 +2419,26 @@ class ParallelDeepCFRSolver:
                                                 print(f"      玩家{i}: 平均回报 {avg_return:.2f} ({bb_value:+.2f} BB), 胜率 {win_rate:.1f}%")
                                             else:
                                                 print(f"      玩家{i}: 平均回报 {avg_return:.2f}, 胜率 {win_rate:.1f}%")
+                                        
+                                        # 打印测试对局中的动作平均占比（自对弈模式）
+                                        if test_results.get('action_statistics'):
+                                            from training_evaluator import _get_action_name
+                                            action_stats = test_results['action_statistics']
+                                            total_count = sum(s['count'] for s in action_stats.values())
+                                            if total_count > 0:
+                                                print(f"    动作统计 (测试对局):")
+                                                # 按占比排序
+                                                sorted_actions = sorted(action_stats.items(), 
+                                                                      key=lambda x: x[1]['percentage'], 
+                                                                      reverse=True)
+                                                action_info = []
+                                                for action, stats in sorted_actions:
+                                                    count = stats['count']
+                                                    percentage = stats['percentage']
+                                                    avg_prob = stats['avg_probability']
+                                                    action_name = _get_action_name(action, game)
+                                                    action_info.append(f"{action_name}: {percentage:.1f}% (平均概率: {avg_prob:.3f})")
+                                                print(f"      {' | '.join(action_info)}")
                                     else:
                                         # vs_random模式：显示所有位置使用训练策略时的表现
                                         print(f"    测试对局: {num_games} 局 (vs Random, 随机位置)")
@@ -2217,6 +2467,26 @@ class ParallelDeepCFRSolver:
                                         else:
                                             print(f"      总体: 平均回报 {overall_avg_return:.2f}, 胜率 {overall_win_rate:.1f}%")
                                         
+                                        # 打印测试对局中的动作平均占比
+                                        if test_results.get('action_statistics'):
+                                            from training_evaluator import _get_action_name
+                                            action_stats = test_results['action_statistics']
+                                            total_count = sum(s['count'] for s in action_stats.values())
+                                            if total_count > 0:
+                                                print(f"    动作统计 (测试对局):")
+                                                # 按占比排序
+                                                sorted_actions = sorted(action_stats.items(), 
+                                                                      key=lambda x: x[1]['percentage'], 
+                                                                      reverse=True)
+                                                action_info = []
+                                                for action, stats in sorted_actions:
+                                                    count = stats['count']
+                                                    percentage = stats['percentage']
+                                                    avg_prob = stats['avg_probability']
+                                                    action_name = _get_action_name(action, game)
+                                                    action_info.append(f"{action_name}: {percentage:.1f}% (平均概率: {avg_prob:.3f})")
+                                                print(f"      {' | '.join(action_info)}")
+                                        
                                         # 检查是否应该开始过渡阶段
                                         win_rate = test_results.get('player0_win_rate', None)
                                         avg_return = test_results.get('player0_avg_return', None)
@@ -2242,12 +2512,17 @@ class ParallelDeepCFRSolver:
                                 # 优化：checkpoint时只训练1次，提升保存速度
                                 get_logger().info("    正在训练策略网络 (用于 Checkpoint)...")
                                 # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
-                                # 在iteration=N时，iteration_counter.value = N+1
-                                # 样本收集时，Worker读取iteration_counter.value = N+1，样本记录的iteration = N+1
-                                # 训练时，应该使用iteration+1来匹配样本的iteration字段
-                                policy_loss = self._learn_strategy_network(current_iteration=iteration + 1)
+                                # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
+                                # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
+                                # 使用self._iteration_counter.value而不是iteration+1，确保与样本的iteration字段匹配
+                                policy_loss = self._learn_strategy_network(current_iteration=self._iteration_counter.value)
                                 if policy_loss is not None:
-                                    get_logger().info(f"    完成 (Loss: {policy_loss:.6f})")
+                                    # 保存策略损失
+                                    policy_losses.append(policy_loss)
+                                    # 打印归一化的损失值（MSE）
+                                    current_iter = iteration + 1
+                                    mse = policy_loss / current_iter if current_iter > 0 else policy_loss
+                                    get_logger().info(f"    完成 (MSE: {mse:.6f}, 原始: {policy_loss:.2f})")
                                 else:
                                     get_logger().info("    完成 (无足够样本训练)")
                                 
@@ -2279,7 +2554,9 @@ class ParallelDeepCFRSolver:
             # 停止 Worker
             self._stop_workers()
         
-        return self._policy_network, advantage_losses, policy_loss
+        # 返回策略网络、优势网络损失历史和策略网络损失历史
+        final_policy_loss = policy_losses[-1] if policy_losses else None
+        return self._policy_network, advantage_losses, final_policy_loss
     
     def action_probabilities(self, state, player_id=None):
         """计算动作概率（用于推理）"""
@@ -2526,11 +2803,15 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=2048)
     parser.add_argument("--memory_capacity", type=int, default=1000000,
-                        help="经验回放缓冲区容量（默认: 1000000）")
+                        help="优势网络经验回放缓冲区容量（每个玩家，默认: 1000000）")
+    parser.add_argument("--strategy_memory_capacity", type=int, default=None,
+                        help="策略网络经验回放缓冲区容量（所有玩家共享，默认: 使用memory_capacity）")
     parser.add_argument("--max_memory_gb", type=float, default=None,
                         help="最大内存限制（GB），超过此限制会自动清理旧样本（默认: 不限制）")
     parser.add_argument("--queue_maxsize", type=int, default=50000,
                         help="队列最大大小，降低可减少内存占用（默认: 50000）")
+    parser.add_argument("--new_sample_ratio", type=float, default=0.5,
+                        help="新样本占比（分层加权采样，默认0.5即50%）")
     parser.add_argument("--betting_abstraction", type=str, default="fcpa")
     parser.add_argument("--save_prefix", type=str, default="deepcfr_parallel")
     parser.add_argument("--save_dir", type=str, default="models")
@@ -2593,6 +2874,8 @@ def main():
                 args.blinds = resume_config['blinds']
             if 'stack_size' in resume_config and args.stack_size is None:
                 args.stack_size = resume_config['stack_size']
+            if 'strategy_memory_capacity' in resume_config and args.strategy_memory_capacity is None:
+                args.strategy_memory_capacity = resume_config['strategy_memory_capacity']
                 
             print(f"  自动加载配置: {args.num_players}人局, 策略层{args.policy_layers}, 优势层{args.advantage_layers}")
             print(f"  save_prefix: {args.save_prefix}")
@@ -2690,10 +2973,12 @@ def main():
         batch_size_advantage=args.batch_size,
         batch_size_strategy=args.batch_size,
         memory_capacity=args.memory_capacity,
+        strategy_memory_capacity=args.strategy_memory_capacity,
         device=device,
         gpu_ids=gpu_ids,
         max_memory_gb=args.max_memory_gb,
         queue_maxsize=args.queue_maxsize,
+        new_sample_ratio=args.new_sample_ratio,
     )
     
     # 显示内存配置
@@ -2715,6 +3000,7 @@ def main():
             'learning_rate': args.learning_rate,
             'batch_size': args.batch_size,
             'memory_capacity': args.memory_capacity,
+            'strategy_memory_capacity': args.strategy_memory_capacity,
             'max_memory_gb': args.max_memory_gb,
             'queue_maxsize': args.queue_maxsize,
             'betting_abstraction': args.betting_abstraction,

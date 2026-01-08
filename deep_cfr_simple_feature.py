@@ -473,6 +473,9 @@ class SimpleFeatureMLP(nn.Module):
         self.num_players = num_players
         self.max_game_length = max_game_length
         self.max_stack = float(max_stack)  # 保留用于兼容性
+        # 预计算log归一化的分母，避免重复计算
+        import numpy as np
+        self.log_max_stack = np.log1p(self.max_stack)
         
         # 如果未指定，默认使用增强版本（23维）
         if manual_feature_size is None:
@@ -552,8 +555,10 @@ class SimpleFeatureMLP(nn.Module):
             
             total_bet = torch.sum(action_sizings, dim=1, keepdim=True)
             max_bet = torch.max(action_sizings, dim=1, keepdim=True)[0]
-            max_bet_norm = max_bet / self.max_stack
-            total_bet_norm = total_bet / self.max_stack
+            # 使用log归一化：log(1 + amount) / log(1 + max_stack)
+            # 优点：小注值会更大，更接近其他特征，避免被稀释
+            max_bet_norm = torch.log1p(max_bet) / self.log_max_stack
+            total_bet_norm = torch.log1p(total_bet) / self.log_max_stack
             features.extend([max_bet_norm, total_bet_norm])
             
             # 9. 是否有人加注/全押（2维）
@@ -715,8 +720,10 @@ class SimpleFeatureMLP(nn.Module):
         action_sizings_start = self.num_players + 52 + 52 + self.max_game_length * 2
         
         # 对 sizings 部分进行归一化
+        # 使用log归一化：log(1 + amount) / log(1 + max_stack)
+        # 优点：小注值会更大（0.43-0.57），更接近其他特征（0.0-2.0），避免被稀释
         if action_sizings_start < x.shape[1]:
-            x_norm[:, action_sizings_start:] = x_norm[:, action_sizings_start:] / self.max_stack
+            x_norm[:, action_sizings_start:] = torch.log1p(x_norm[:, action_sizings_start:]) / self.log_max_stack
              
             # #打印归一化后的 Sizings (Debug)
             # if self._print_counter <= 3:

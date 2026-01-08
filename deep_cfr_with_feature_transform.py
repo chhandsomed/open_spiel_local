@@ -508,7 +508,7 @@ class HybridFeatureTransform(nn.Module):
     """
     
     def __init__(self, raw_input_size, transformed_size, num_players=6, max_game_length=52, 
-                 use_normalization=True):
+                 use_normalization=True, max_stack=2000):
         """
         Args:
             raw_input_size: 原始信息状态大小（自动检测，通常为266-281，取决于游戏配置）
@@ -516,6 +516,7 @@ class HybridFeatureTransform(nn.Module):
             num_players: 玩家数量
             max_game_length: 最大游戏长度
             use_normalization: 是否使用特征归一化
+            max_stack: 单个玩家的最大筹码量（用于归一化下注统计特征，默认2000）
         
         维度流程：
         - 输入：raw_input_size维（例如281维，保留全部）
@@ -528,6 +529,7 @@ class HybridFeatureTransform(nn.Module):
         self.num_players = num_players
         self.max_game_length = max_game_length
         self.use_normalization = use_normalization
+        self.max_stack = float(max_stack)  # 用于归一化下注统计特征
         
         # 手动特征维度：
         # - 位置优势特征: 4维（position_advantage, is_early, is_late, is_blind，不包含distance_to_btn）
@@ -615,10 +617,10 @@ class HybridFeatureTransform(nn.Module):
         max_bet = torch.max(action_sizings, dim=1, keepdim=True)[0]
         avg_bet = total_bet / (num_actions + 1e-8)  # 避免除零
         
-        # 归一化到合理范围（假设最大下注为20000）
-        max_bet_norm = max_bet / 20000.0
-        total_bet_norm = total_bet / 20000.0
-        avg_bet_norm = avg_bet / 20000.0
+        # 归一化到合理范围（使用max_stack，与训练配置保持一致）
+        max_bet_norm = max_bet / self.max_stack
+        total_bet_norm = total_bet / self.max_stack
+        avg_bet_norm = avg_bet / self.max_stack
         
         # 动作类型统计（简化：fold, call, raise, all-in）
         # 注意：
@@ -789,6 +791,20 @@ class DeepCFRWithFeatureTransform(deep_cfr.DeepCFRSolver):
         else:
             self._device = device
         
+        # 从游戏配置中解析max_stack（用于归一化下注统计特征）
+        import re
+        game_string = str(game)
+        match = re.search(r'stack=([\d\s]+)', game_string)
+        max_stack = 2000  # 默认值
+        if match:
+            stack_str = match.group(1).strip()
+            stack_values = stack_str.split()
+            if stack_values:
+                try:
+                    max_stack = int(stack_values[0])
+                except ValueError:
+                    pass
+        
         # 创建带转换层的策略网络
         self._strategy_memories = deep_cfr.ReservoirBuffer(memory_capacity)
         
@@ -798,7 +814,8 @@ class DeepCFRWithFeatureTransform(deep_cfr.DeepCFRSolver):
                 self._embedding_size,
                 transformed_size,
                 num_players=self._num_players,
-                max_game_length=game.max_game_length()
+                max_game_length=game.max_game_length(),
+                max_stack=max_stack  # 传递max_stack参数
             )
             # 创建 MLP（使用转换后的尺寸）
             mlp = deep_cfr.MLP(transformed_size, list(policy_network_layers), self._num_actions)
@@ -836,7 +853,8 @@ class DeepCFRWithFeatureTransform(deep_cfr.DeepCFRSolver):
                     self._embedding_size,
                     transformed_size,
                     num_players=self._num_players,
-                    max_game_length=game.max_game_length()
+                    max_game_length=game.max_game_length(),
+                    max_stack=max_stack  # 传递max_stack参数
                 )
                 mlp = deep_cfr.MLP(transformed_size, list(advantage_network_layers), self._num_actions)
                 adv_net = nn.Sequential(transform_layer, mlp)

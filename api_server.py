@@ -273,10 +273,16 @@ def normalize_info_state_action_sizings(info_state, game, max_stack=None):
             max_stack = 2000  # 默认值
     
     # 归一化action_sizings部分
+    # 使用log归一化：log(1 + amount) / log(1 + max_stack)
+    # 与训练时保持一致（deep_cfr_simple_feature.py）
     if action_sizings_start < len(info_state_np):
         action_sizings_end = action_sizings_start + max_game_length
         if action_sizings_end <= len(info_state_np):
-            info_state_np[action_sizings_start:action_sizings_end] /= max_stack
+            # 使用log归一化，避免小注值太小被其他特征稀释
+            log_max_stack = np.log1p(max_stack)
+            info_state_np[action_sizings_start:action_sizings_end] = np.log1p(
+                np.maximum(info_state_np[action_sizings_start:action_sizings_end], 0)
+            ) / log_max_stack
     
     return info_state_np
 
@@ -488,28 +494,53 @@ def build_state_from_cards(
     
     # 应用历史动作（只包含玩家动作，不包含发牌动作）
     # 注意：如果历史动作中包含chance节点，说明公共牌还没发完，需要先发完公共牌
-    for action in action_history:
+    action_history_debug = []  # 记录调试信息
+    for i, action in enumerate(action_history):
         if state.is_terminal():
             break
         
         # 如果遇到chance节点，说明需要发公共牌（Turn或River）
         # 这种情况不应该出现在action_history中，因为后端只传玩家动作
         # 但为了健壮性，我们处理一下
+        chance_actions_applied = 0
         while state.is_chance_node():
             legal_actions = state.legal_actions()
             if not legal_actions:
                 break
             # 随机发牌（这些牌不影响当前玩家的信息状态）
-            state.apply_action(random.choice(legal_actions))
+            chance_action = random.choice(legal_actions)
+            state.apply_action(chance_action)
+            chance_actions_applied += 1
         
         if state.is_terminal():
             break
         
         # 应用玩家动作
+        current_player_before = state.current_player()
         legal_actions = state.legal_actions()
+        
+        # 记录调试信息
+        action_str = {0: 'Fold', 1: 'Call/Check', 2: 'Pot', 3: 'All-in', 4: 'Half-Pot'}.get(action, f'Unknown({action})')
+        action_history_debug.append({
+            'step': i,
+            'action': action,
+            'action_str': action_str,
+            'current_player': current_player_before,
+            'legal_actions': legal_actions,
+            'chance_actions_applied': chance_actions_applied
+        })
+        
         if action not in legal_actions:
-            raise ValueError(f"Illegal action {action} at current state. Legal actions: {legal_actions}")
+            error_msg = f"Illegal action {action} ({action_str}) at step {i}, current player {current_player_before}. Legal actions: {legal_actions}"
+            print(f"❌ {error_msg}", flush=True)
+            print(f"   动作历史调试信息: {action_history_debug}", flush=True)
+            raise ValueError(error_msg)
+        
         state.apply_action(action)
+        
+        # 记录应用后的状态
+        action_history_debug[-1]['current_player_after'] = state.current_player()
+        action_history_debug[-1]['is_terminal'] = state.is_terminal()
     
     # 如果还有chance节点（说明需要发Turn或River），随机发完
     while state.is_chance_node():
@@ -517,6 +548,73 @@ def build_state_from_cards(
         if not legal_actions:
             break
         state.apply_action(random.choice(legal_actions))
+    
+    # 验证状态重建：检查信息状态中的动作序列
+    if len(action_history) > 0:
+        try:
+            info_state = state.information_state_tensor(current_player_id)
+            num_players = game.num_players()
+            max_game_length = game.max_game_length()
+            
+            # 解析信息状态中的动作序列
+            header_size = num_players + 52 + 52
+            action_seq_start = header_size
+            action_seq_end = action_seq_start + max_game_length * 2
+            action_seq_bits = info_state[action_seq_start:action_seq_end]
+            
+            # 解析动作序列
+            action_seq_parsed = []
+            for i in range(max_game_length):
+                bit0 = action_seq_bits[2*i]
+                bit1 = action_seq_bits[2*i+1]
+                if bit0 > 0.5 and bit1 < 0.5:
+                    action_seq_parsed.append('c')  # call
+                elif bit0 < 0.5 and bit1 > 0.5:
+                    action_seq_parsed.append('p')  # raise
+                elif bit0 > 0.5 and bit1 > 0.5:
+                    action_seq_parsed.append('a')  # all-in
+                elif bit0 < 0.5 and bit1 < 0.5:
+                    action_seq_parsed.append('f')  # fold/deal
+                else:
+                    action_seq_parsed.append('?')
+            
+            # 找出非'f'的动作（实际玩家动作）
+            actual_player_actions = []
+            for i, act in enumerate(action_seq_parsed):
+                if act != 'f':
+                    actual_player_actions.append((i, act))
+            
+            # 将输入的action_history转换为动作字符
+            action_map = {0: 'f', 1: 'c', 2: 'p', 3: 'a', 4: 'h'}  # h for half-pot
+            input_action_chars = [action_map.get(a, '?') for a in action_history]
+            
+            # 打印验证信息
+            print(f"\n🔍 状态重建验证 (Player {current_player_id}):", flush=True)
+            print(f"   输入的action_history: {action_history} -> {input_action_chars}", flush=True)
+            print(f"   信息状态中的动作序列(前20个): {action_seq_parsed[:20]}", flush=True)
+            print(f"   实际玩家动作位置: {actual_player_actions[:10]}", flush=True)
+            
+            # 验证是否有加注动作
+            has_raise_in_input = 2 in action_history  # action 2 = Pot
+            has_raise_in_state = any(act == 'p' for _, act in actual_player_actions)
+            
+            if has_raise_in_input and not has_raise_in_state:
+                print(f"⚠️ 警告: 输入包含加注动作(action=2)，但信息状态中未找到加注动作！", flush=True)
+            elif has_raise_in_input and has_raise_in_state:
+                print(f"✅ 验证通过: 输入包含加注动作，信息状态中也包含加注动作", flush=True)
+            
+            # 打印动作应用详情
+            if action_history_debug:
+                print(f"   动作应用详情:", flush=True)
+                for debug_info in action_history_debug:
+                    print(f"     步骤{debug_info['step']}: Player {debug_info['current_player']} -> {debug_info['action_str']} ({debug_info['action']})", flush=True)
+                    if debug_info['chance_actions_applied'] > 0:
+                        print(f"        (应用了{debug_info['chance_actions_applied']}个chance动作)", flush=True)
+            
+        except Exception as e:
+            print(f"⚠️ 状态重建验证失败: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
     
     # 验证action_sizings（如果提供）
     # 注意：前端可能传入增量格式的action_sizings，而OpenSpiel存储的是"bet to"格式

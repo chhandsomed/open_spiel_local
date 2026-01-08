@@ -3,7 +3,7 @@
 # 使用4张GPU，最大化训练速度
 
 # 设置环境
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,  # 使用4张GPU
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5  # 使用6张GPU
 
 # 激活conda环境
 source $(conda info --base)/etc/profile.d/conda.sh
@@ -11,12 +11,12 @@ conda activate open_spiel
 
 # 训练参数配置
 NUM_PLAYERS=6
-NUM_WORKERS=10              # Worker数量（优化：从12降到10，减少样本产生速度，降低内存占用）
+NUM_WORKERS=8               # Worker数量（优化：从10降到8，减少内存占用，基于实际观察每个样本约35KB）
 NUM_ITERATIONS=20000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
 NUM_TRAVERSALS=1600          # 每次迭代遍历次数（6人场状态复杂，建议1000-1500）
 BATCH_SIZE=4096              # 训练批量大小（减少以加快训练速度，多GPU时4096利用率高但训练慢）
-MEMORY_CAPACITY=2000000      # 经验回放缓冲区容量（200万，6人场状态复杂，需要更大缓冲区）
-QUEUE_MAXSIZE=50000         # 队列最大大小（优化：从200,000降到50,000，减少75%内存占用，降低OOM风险）
+MEMORY_CAPACITY=600000      # 经验回放缓冲区容量（60万，基于实际观察每个样本约35KB，减少内存占用）
+QUEUE_MAXSIZE=50000         # 队列最大大小（优化：从100,000降到50,000，减少内存占用，降低OOM风险）
 LEARNING_RATE=0.001          # 学习率
 POLICY_LAYERS="256 256 256"  # 策略网络结构（3层256节点，6人局状态复杂）
 ADVANTAGE_LAYERS="256 256 256"  # 优势网络结构（与策略网络相同）
@@ -29,15 +29,18 @@ MAX_MEMORY_GB=4              # Worker内存限制（每个Worker最多4GB，防�
 betting_abstraction="fchpa"
 blinds="100 200 0 0 0 0"
 stack_size=50000
+resume_model_dir="models/deepcfr_6p_multi_20260107_180305"
 
-# 保存前缀
-SAVE_PREFIX="deepcfr_6p_multi_$(date +%Y%m%d_%H%M%S)"
+# 续训时不需要设置新的save_prefix，代码会自动从config.json读取
+# 如果需要设置新的save_prefix，可以取消下面的注释
+# SAVE_PREFIX="deepcfr_6p_multi_$(date +%Y%m%d_%H%M%S)"
 
 # 运行训练（后台运行，输出到日志文件）
 nohup python deep_cfr_parallel.py \
     --num_players $NUM_PLAYERS \
     --stack_size $stack_size \
     --blinds "$blinds" \
+    --resume $resume_model_dir \
     --num_workers $NUM_WORKERS \
     --num_iterations $NUM_ITERATIONS \
     --num_traversals $NUM_TRAVERSALS \
@@ -55,15 +58,15 @@ nohup python deep_cfr_parallel.py \
     --skip_nashconv \
     --eval_with_games \
     --betting_abstraction $betting_abstraction \
-    --save_prefix $SAVE_PREFIX \
-    > train_6p_${SAVE_PREFIX}.log 2>&1 &
+    > train_6p_resume_$(basename $resume_model_dir).log 2>&1 &
 
 # 获取进程ID
 PID=$!
+LOG_FILE="train_6p_resume_$(basename $resume_model_dir).log"
 echo "训练已启动，进程ID: $PID"
-echo "日志文件: train_6p_${SAVE_PREFIX}.log"
-echo "模型保存目录: models/$SAVE_PREFIX"
+echo "日志文件: $LOG_FILE"
+echo "续训目录: $resume_model_dir"
 echo ""
-echo "查看训练进度: tail -1000f train_6p_${SAVE_PREFIX}.log"
+echo "查看训练进度: tail -f $LOG_FILE"
 echo "停止训练: kill $PID"
 

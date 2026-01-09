@@ -26,6 +26,10 @@ from open_spiel.python.games import pokerkit_wrapper  # noqa: F401
 sys.path.append(os.getcwd())
 
 # 尝试导入自定义特征类（基于 play_gradio.py）
+# 始终导入MLP，因为Standard MLP模型需要它
+from open_spiel.python.pytorch import deep_cfr
+MLP = deep_cfr.MLP
+
 try:
     from deep_cfr_simple_feature import DeepCFRSimpleFeature, SimpleFeatureMLP
     try:
@@ -35,7 +39,6 @@ try:
     HAVE_CUSTOM_FEATURES = True
 except ImportError:
     HAVE_CUSTOM_FEATURES = False
-    from open_spiel.python.pytorch.deep_cfr import MLP
 
 app = Flask(__name__)
 
@@ -288,8 +291,8 @@ def normalize_info_state_action_sizings(info_state, game, max_stack=None):
 
 def create_game_with_config(
     num_players: int,
-    blinds: list,  # 盲注列表，如 [50, 100, 0, 0, 0, 0]
-    stacks: list,  # 筹码列表，如 [2000, 2000, 2000, 2000, 2000, 2000]
+    blinds: list,  # 盲注列表，如 [100, 200, 0, 0, 0, 0] (默认与训练配置一致)
+    stacks: list,  # 筹码列表，如 [50000, 50000, 50000, 50000, 50000, 50000] (默认与训练配置一致)
     betting_abstraction: str = "fchpa",
     dealer_pos: int = None  # Dealer位置（必需，0-5）
 ) -> pyspiel.Game:
@@ -743,30 +746,25 @@ def load_model(model_dir, device='cpu', num_players=None):
     MODEL_DIR = model_dir
     print(f"Loading model from: {model_dir}")
     
-    # 读取配置文件（基于 play_gradio.py 的逻辑）
+    # 读取配置文件：只在checkpoint目录中查找config.json
     config_path = os.path.join(model_dir, 'config.json')
     config = {}
-    
-    if not os.path.exists(config_path):
-        if "checkpoints" in model_dir:
-            parent_dir = os.path.dirname(model_dir)
-            if "checkpoints" in parent_dir:
-                main_dir = os.path.dirname(parent_dir)
-            else:
-                main_dir = parent_dir
-            config_path = os.path.join(main_dir, 'config.json')
     
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             config = json.load(f)
+        print(f"✅ 成功加载config.json: {config_path}", flush=True)
+        print(f"   配置内容: stack_size={config.get('stack_size', 'N/A')}, blinds={config.get('blinds', 'N/A')}", flush=True)
     else:
-        # 兼容老模型：如果没有 config.json，使用默认配置（标准MLP）
-        print(f"⚠️  Config file not found: {config_path}, using default config for legacy model")
+        # 如果没有找到config.json，使用默认配置
+        print(f"⚠️  Config file not found in checkpoint directory: {config_path}, using default config", flush=True)
         config = {
             'use_simple_feature': False,
             'use_feature_transform': False,
             'policy_layers': [64, 64],  # 默认层数，老模型常用
-            'betting_abstraction': 'fchpa'
+            'betting_abstraction': 'fchpa',
+            'stack_size': 50000,  # 默认筹码
+            'blinds': '100 200 0 0 0 0'  # 默认盲注（6人局）
         }
     
     # 如果num_players未指定，从config读取
@@ -784,6 +782,10 @@ def load_model(model_dir, device='cpu', num_players=None):
     betting_abstraction = config.get('betting_abstraction', 'fchpa')
     game_string = config.get('game_string', None)
     
+    # 从config.json读取筹码和盲注配置（如果存在）
+    stack_size = config.get('stack_size', 50000)  # 默认50000，与训练配置一致
+    blinds_str_from_config = config.get('blinds', None)  # 例如 "100 200 0 0 0 0"
+    
     # 创建游戏
     game = None
     if game_string:
@@ -795,18 +797,40 @@ def load_model(model_dir, device='cpu', num_players=None):
     
     if game is None:
         # Fallback: 手动创建游戏
-        if num_players == 6:
-            blinds_str = "50 100 0 0 0 0"
-            first_player_str = "3 1 1 1"
-        elif num_players == 2:
-            blinds_str = "100 50"
-            first_player_str = "2 1 1 1"
+        # 优先使用config.json中的配置，如果没有则使用默认值
+        if blinds_str_from_config:
+            # 从config.json读取盲注配置
+            blinds_str = blinds_str_from_config
+            # 解析盲注字符串，计算first_player
+            blinds_list = blinds_str.split()
+            if len(blinds_list) >= 2:
+                # 找到SB和BB的位置
+                sb_value = int(blinds_list[0]) if blinds_list[0] else 0
+                bb_value = int(blinds_list[1]) if blinds_list[1] else 0
+                # 计算位置（假设dealer_pos=0，实际位置会在API请求时确定）
+                # 这里只是创建默认游戏，实际位置在API请求时通过dealer_pos参数设置
+                if num_players == 2:
+                    first_player_str = "2 1 1 1"
+                else:
+                    first_player_str = "3 1 1 1"  # UTG starts preflop
+            else:
+                first_player_str = "3 1 1 1"
         else:
-            blinds_list = ["50", "100"] + ["0"] * (num_players - 2)
-            blinds_str = " ".join(blinds_list)
-            first_player_str = " ".join(["3"] + ["1"] * 3)
+            # 使用默认盲注配置
+            if num_players == 6:
+                blinds_str = "100 200 0 0 0 0"
+                first_player_str = "3 1 1 1"
+            elif num_players == 2:
+                blinds_str = "100 50"
+                first_player_str = "2 1 1 1"
+            else:
+                blinds_list = ["100", "200"] + ["0"] * (num_players - 2)
+                blinds_str = " ".join(blinds_list)
+                first_player_str = " ".join(["3"] + ["1"] * 3)
         
-        stacks_str = " ".join(["2000"] * num_players)
+        # 使用config.json中的stack_size
+        stacks_str = " ".join([str(stack_size)] * num_players)
+        print(f"📋 从config.json读取配置: stack_size={stack_size}, blinds={blinds_str}", flush=True)
         game_string = (
             f"universal_poker("
             f"betting=nolimit,"
@@ -976,14 +1000,7 @@ def load_model(model_dir, device='cpu', num_players=None):
             pass
 
     # Standard MLP（老模型或默认模型）
-    print(f"Using Standard MLP (num_players={num_players})")
-    state = game.new_initial_state()
-    embedding_size = len(state.information_state_tensor(0))
-    num_actions = game.num_distinct_actions()
-    network = MLP(embedding_size, list(policy_layers), num_actions)
-    network = network.to(device)
-    
-    # 处理 DataParallel（老模型可能也有）
+    # 先加载state_dict检查模型类型
     state_dict = torch.load(policy_path, map_location=device)
     new_state_dict = {}
     for k, v in state_dict.items():
@@ -991,6 +1008,96 @@ def load_model(model_dir, device='cpu', num_players=None):
             new_state_dict[k[7:]] = v
         else:
             new_state_dict[k] = v
+    
+    # 检查是否是SimpleFeatureMLP（通过state_dict键判断）
+    is_simple_feature = any('mlp.model' in k for k in new_state_dict.keys())
+    
+    if is_simple_feature and HAVE_CUSTOM_FEATURES:
+        # 实际上是SimpleFeatureMLP，但config中没有标记，尝试自动检测并加载
+        print(f"⚠️  检测到SimpleFeatureMLP结构（state_dict包含mlp.model），尝试作为SimpleFeature模型加载 (num_players={num_players})")
+        state = game.new_initial_state()
+        embedding_size = len(state.information_state_tensor(0))
+        num_actions = game.num_distinct_actions()
+        
+        # 自动检测手动特征维度
+        from deep_cfr_simple_feature import detect_manual_feature_size_from_state_dict
+        detected_feature_size = detect_manual_feature_size_from_state_dict(
+            new_state_dict, embedding_size
+        )
+        
+        if detected_feature_size is not None:
+            print(f"  ✓ 自动检测到特征维度: {detected_feature_size}维")
+            manual_feature_size = detected_feature_size
+        else:
+            # 如果无法检测，默认使用23维（增强版本）
+            print(f"  ⚠️  无法自动检测特征维度，使用默认值: 23维")
+            manual_feature_size = 23
+        
+        # 从state_dict推断网络层大小
+        # 查找所有mlp.model.*._weight键，提取隐藏层大小
+        inferred_layers = []
+        layer_indices = []
+        for k in new_state_dict.keys():
+            if 'mlp.model' in k and '_weight' in k:
+                # 提取层索引，例如 mlp.model.0._weight -> 0
+                import re
+                match = re.search(r'mlp\.model\.(\d+)\._weight', k)
+                if match:
+                    layer_idx = int(match.group(1))
+                    if layer_idx not in layer_indices:
+                        layer_indices.append(layer_idx)
+        
+        # 按索引排序，提取每层的输出大小
+        layer_indices.sort()
+        for idx in layer_indices:
+            weight_key = f'mlp.model.{idx}._weight'
+            if weight_key in new_state_dict:
+                # 权重形状: [output_size, input_size]
+                output_size = new_state_dict[weight_key].shape[0]
+                # 最后一层是输出层，不加入隐藏层
+                if idx < len(layer_indices) - 1:
+                    inferred_layers.append(output_size)
+        
+        if inferred_layers:
+            print(f"  ✓ 从state_dict推断网络层大小: {inferred_layers}")
+            policy_layers = inferred_layers
+        else:
+            print(f"  ⚠️  无法推断网络层大小，使用config中的默认值: {policy_layers}")
+        
+        # 创建SimpleFeatureMLP
+        solver = DeepCFRSimpleFeature(
+            game,
+            policy_network_layers=policy_layers,
+            advantage_network_layers=(32, 32),
+            num_iterations=1,
+            num_traversals=1,
+            learning_rate=1e-4,
+            device=device,
+            manual_feature_size=manual_feature_size
+        )
+        
+        solver._policy_network.load_state_dict(new_state_dict)
+        solver._policy_network.eval()
+        
+        # 存储模型到字典中
+        MODELS[num_players] = solver
+        
+        # 向后兼容：如果是第一个模型，设置为默认
+        if MODEL is None:
+            MODEL = solver
+            GAME = game
+            CONFIG = config
+        
+        print(f"Model loaded successfully (num_players={num_players})")
+        return game, solver, config
+    
+    # 真正的Standard MLP
+    print(f"Using Standard MLP (num_players={num_players})")
+    state = game.new_initial_state()
+    embedding_size = len(state.information_state_tensor(0))
+    num_actions = game.num_distinct_actions()
+    network = MLP(embedding_size, list(policy_layers), num_actions)
+    network = network.to(device)
     
     network.load_state_dict(new_state_dict)
     network.eval()
@@ -1532,8 +1639,8 @@ def recommend_action():
         "board_cards": ["2d", "3c", "4h"],
         "action_history": [0, 1, 2, ...],  // 只包含玩家动作，不包含发牌动作
         "action_sizings": [0, 0, 100, ...],  // 每次动作的下注金额，与action_history一一对应
-        "blinds": [50, 100, 0, 0, 0, 0],  // 可选，如果不传则使用模型默认配置
-        "stacks": [2000, 2000, 2000, 2000, 2000, 2000],  // 可选，如果不传则使用模型默认配置
+        "blinds": [100, 200, 0, 0, 0, 0],  // 可选，如果不传则使用模型默认配置（与训练配置一致：SB=100, BB=200）
+        "stacks": [50000, 50000, 50000, 50000, 50000, 50000],  // 可选，如果不传则使用模型默认配置（与训练配置一致：stack_size=50000）
         "seed": 12345  // 可选，用于随机分配其他玩家的手牌
     }
     

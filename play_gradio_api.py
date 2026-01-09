@@ -338,9 +338,9 @@ def load_model(model_dir, num_players=None, device='cpu'):
 
 # 全局变量来管理锦标赛状态
 TOURNAMENT_STATE = {
-    "stacks": None,  # [50000, 50000, ...] for 5p, [2000, 2000, ...] for 6p
+    "stacks": None,  # [50000, 50000, ...] for all players (与训练配置一致)
     "dealer_pos": 4, # 默认 Dealer=4 (5人场: P0=SB, P1=BB, P2=UTG, P3=MP, P4=BTN)
-    "blinds": [100, 200],  # 5人场盲注
+    "blinds": [100, 200],  # 默认盲注（与训练配置一致：SB=100, BB=200）
     "game_config": None
 }
 
@@ -354,14 +354,18 @@ def load_game_with_config(stacks=None, dealer_pos=5):
         
     num_players = CONFIG.get('num_players', 5)
     
-    # 默认筹码（根据玩家数量）
+    # 默认筹码（优先从CONFIG读取，否则根据玩家数量）
     if stacks is None:
-        if num_players == 5:
+        if CONFIG and 'stack_size' in CONFIG:
+            # 从模型配置读取stack_size
+            stack_size = CONFIG.get('stack_size', 2000)
+            stacks = [stack_size] * num_players
+        elif num_players == 5:
             stacks = [50000] * 5
         elif num_players == 6:
-            stacks = [2000] * 6
+            stacks = [50000] * 6  # 6人场也使用50000（与训练配置一致）
         else:
-            stacks = [2000] * num_players
+            stacks = [50000] * num_players
         
     # 构造 blind 字符串
     blinds = [0] * num_players
@@ -386,13 +390,33 @@ def load_game_with_config(stacks=None, dealer_pos=5):
         bb_pos = (dealer_pos + 2) % num_players
         utg_pos = (dealer_pos + 3) % num_players
         
-        # 根据玩家数量设置盲注
-        if num_players == 5:
+        # 根据玩家数量设置盲注（优先从CONFIG读取）
+        if CONFIG and 'blinds' in CONFIG:
+            # 从模型配置读取blinds字符串，例如 "100 200 0 0 0 0"
+            blinds_str = CONFIG.get('blinds', '')
+            blinds_list = [int(x) for x in blinds_str.split() if x]
+            if len(blinds_list) >= num_players:
+                # 找到SB和BB的位置，设置对应的盲注
+                for i, blind_val in enumerate(blinds_list[:num_players]):
+                    if blind_val > 0:
+                        if i == sb_pos:
+                            blinds[sb_pos] = blind_val
+                        elif i == bb_pos:
+                            blinds[bb_pos] = blind_val
+            else:
+                # 如果配置不完整，使用默认值
+                if num_players == 5:
+                    blinds[sb_pos] = 100
+                    blinds[bb_pos] = 200
+                else:
+                    blinds[sb_pos] = 100
+                    blinds[bb_pos] = 200  # 6人场也使用100/200（与训练配置一致）
+        elif num_players == 5:
             blinds[sb_pos] = 100
             blinds[bb_pos] = 200
         else:
-            blinds[sb_pos] = 50
-            blinds[bb_pos] = 100
+            blinds[sb_pos] = 100
+            blinds[bb_pos] = 200  # 6人场也使用100/200（与训练配置一致）
         
         # Preflop: UTG starts. Postflop: SB starts.
         first_players = [utg_pos + 1] + [sb_pos + 1] * 3
@@ -648,44 +672,85 @@ def extract_state_info_for_api(state, player_id):
         state_struct = state.to_struct()
         num_players = GAME.num_players()
         
-        # 根据玩家数量设置默认盲注和筹码
-        if num_players == 5:
-            default_blinds = [100, 200, 0, 0, 0]
+        # 根据玩家数量设置默认盲注和筹码（优先从CONFIG读取）
+        if CONFIG and 'stack_size' in CONFIG:
+            stack_size = CONFIG.get('stack_size', 50000)
+            default_stacks = [stack_size] * num_players
+        elif num_players == 5:
             default_stacks = [50000] * 5
         elif num_players == 6:
-            default_blinds = [50, 100, 0, 0, 0, 0]
-            default_stacks = [2000] * 6
+            default_stacks = [50000] * 6  # 6人场也使用50000（与训练配置一致）
         else:
-            default_blinds = [50, 100] + [0] * (num_players - 2)
-            default_stacks = [2000] * num_players
+            default_stacks = [50000] * num_players
+        
+        if CONFIG and 'blinds' in CONFIG:
+            # 从模型配置读取blinds字符串
+            blinds_str = CONFIG.get('blinds', '')
+            blinds_list = [int(x) for x in blinds_str.split() if x]
+            if len(blinds_list) >= num_players:
+                default_blinds = blinds_list[:num_players]
+            else:
+                # 如果配置不完整，使用默认值
+                if num_players == 5:
+                    default_blinds = [100, 200, 0, 0, 0]
+                elif num_players == 6:
+                    default_blinds = [100, 200, 0, 0, 0, 0]  # 6人场也使用100/200（与训练配置一致）
+                else:
+                    default_blinds = [100, 200] + [0] * (num_players - 2)
+        elif num_players == 5:
+            default_blinds = [100, 200, 0, 0, 0]
+        elif num_players == 6:
+            default_blinds = [100, 200, 0, 0, 0, 0]  # 6人场也使用100/200（与训练配置一致）
+        else:
+            default_blinds = [100, 200] + [0] * (num_players - 2)
         
         blinds = list(getattr(state_struct, 'blinds', default_blinds))
         
-        # 直接从state字符串解析Money字段（这是当前剩余筹码）
-        # Money: 1950 2000 1900 ...
-        money_match = re.search(r'Money:\s*([\d\s]+)', state_str)
-        if money_match:
-            stacks = [int(x) for x in money_match.group(1).strip().split()]
-        else:
-            # Fallback: 使用starting_stacks
-            starting_stacks = list(getattr(state_struct, 'starting_stacks', default_stacks))
+        # 优先使用starting_stacks（初始筹码），而不是Money（当前剩余筹码）
+        # 因为API需要的是初始筹码配置，而不是当前剩余筹码
+        starting_stacks = list(getattr(state_struct, 'starting_stacks', default_stacks))
+        if starting_stacks and len(starting_stacks) == num_players:
             stacks = list(starting_stacks)
+        else:
+            # Fallback: 从state字符串解析Money字段（这是当前剩余筹码）
+            # Money: 1950 2000 1900 ...
+            money_match = re.search(r'Money:\s*([\d\s]+)', state_str)
+            if money_match:
+                stacks = [int(x) for x in money_match.group(1).strip().split()]
+            else:
+                # 最后fallback: 使用default_stacks
+                stacks = list(default_stacks)
         
-        # 确保长度正确
+        # 确保长度正确（优先从CONFIG读取）
         if len(blinds) != num_players:
-            if num_players == 5:
+            if CONFIG and 'blinds' in CONFIG:
+                blinds_str = CONFIG.get('blinds', '')
+                blinds_list = [int(x) for x in blinds_str.split() if x]
+                if len(blinds_list) >= num_players:
+                    blinds = blinds_list[:num_players]
+                else:
+                    if num_players == 5:
+                        blinds = [100, 200, 0, 0, 0]
+                    elif num_players == 6:
+                        blinds = [100, 200, 0, 0, 0, 0]
+                    else:
+                        blinds = [100, 200] + [0] * (num_players - 2)
+            elif num_players == 5:
                 blinds = [100, 200, 0, 0, 0]
             elif num_players == 6:
-                blinds = [50, 100, 0, 0, 0, 0]
+                blinds = [100, 200, 0, 0, 0, 0]
             else:
-                blinds = [50, 100] + [0] * (num_players - 2)
+                blinds = [100, 200] + [0] * (num_players - 2)
         if len(stacks) != num_players:
-            if num_players == 5:
+            if CONFIG and 'stack_size' in CONFIG:
+                stack_size = CONFIG.get('stack_size', 50000)
+                stacks = [stack_size] * num_players
+            elif num_players == 5:
                 stacks = [50000] * 5
             elif num_players == 6:
-                stacks = [2000] * 6
+                stacks = [50000] * 6
             else:
-                stacks = [2000] * num_players
+                stacks = [50000] * num_players
     except Exception as e:
         print(f"Error extracting blinds/stacks: {e}")
         import traceback
@@ -695,11 +760,11 @@ def extract_state_info_for_api(state, player_id):
             blinds = [100, 200, 0, 0, 0]
             stacks = [50000] * 5
         elif num_players == 6:
-            blinds = [50, 100, 0, 0, 0, 0]
-            stacks = [2000] * 6
+            blinds = [100, 200, 0, 0, 0, 0]  # 使用训练配置
+            stacks = [50000] * 6  # 使用训练配置
         else:
-            blinds = [50, 100] + [0] * (num_players - 2)
-            stacks = [2000] * num_players
+            blinds = [100, 200] + [0] * (num_players - 2)  # 使用训练配置
+            stacks = [50000] * num_players  # 使用训练配置
     
     # 从TOURNAMENT_STATE获取Dealer位置（不再推断）
     dealer_pos = TOURNAMENT_STATE.get('dealer_pos', 4)  # 默认值4 (5人场)
@@ -1970,7 +2035,7 @@ def start_new_game():
         TOURNAMENT_STATE["stacks"] = [50000] * 5
         TOURNAMENT_STATE["dealer_pos"] = 4  # 5人场: P0=SB, P1=BB, P2=UTG, P3=MP, P4=BTN
     else:
-        TOURNAMENT_STATE["stacks"] = [2000] * num_players
+        TOURNAMENT_STATE["stacks"] = [50000] * num_players  # 使用训练配置
         TOURNAMENT_STATE["dealer_pos"] = 5  # 6人场: P0=SB, P1=BB, P2=UTG, P3=MP, P4=CO, P5=BTN
     
     # 重新加载游戏
@@ -1979,7 +2044,7 @@ def start_new_game():
     history = []
     new_history, state, logs, is_user_turn, folded_players, action_probs = run_game_step(history, user_action=None, user_seat=0)
     
-    stack_str = f"{TOURNAMENT_STATE['stacks'][0]}" if TOURNAMENT_STATE['stacks'] else "2000"
+    stack_str = f"{TOURNAMENT_STATE['stacks'][0]}" if TOURNAMENT_STATE['stacks'] else "50000"
     logs.insert(0, f"🏁 新锦标赛开始 (Stacks: {stack_str})")
     log_text = "\n".join(logs)
     
@@ -2044,13 +2109,18 @@ def continue_next_hand(history):
         bb_pos = (next_dealer + 2) % CONFIG['num_players']
         
         needed = 0
-        if i == sb_pos: needed = 50
-        elif i == bb_pos: needed = 100
+        if i == sb_pos: needed = 100  # 使用训练配置的SB
+        elif i == bb_pos: needed = 200  # 使用训练配置的BB
             
-        if s <= needed or s < 50: 
-            s = 2000
+        # 获取默认筹码大小（优先从CONFIG读取）
+        default_stack = 50000
+        if CONFIG and 'stack_size' in CONFIG:
+            default_stack = CONFIG.get('stack_size', 50000)
+        
+        if s <= needed or s < 100: 
+            s = default_stack
             p_name = "您" if i == 0 else f"AI {i}"
-            rebuy_logs.append(f"💰 {p_name} 筹码耗尽，自动补充至 2000")
+            rebuy_logs.append(f"💰 {p_name} 筹码耗尽，自动补充至 {default_stack}")
         new_stacks.append(s)
     
     TOURNAMENT_STATE["stacks"] = new_stacks
@@ -2242,15 +2312,15 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
         # 更新CONFIG
         CONFIG = {'num_players': num_players, 'betting_abstraction': 'fchpa'}
         
-        # 更新TOURNAMENT_STATE
+        # 更新TOURNAMENT_STATE（使用训练配置：stack_size=50000, blinds=100/200）
         if num_players == 5:
             TOURNAMENT_STATE["stacks"] = [50000] * 5
             TOURNAMENT_STATE["dealer_pos"] = 4
             TOURNAMENT_STATE["blinds"] = [100, 200]
         else:
-            TOURNAMENT_STATE["stacks"] = [2000] * 6
+            TOURNAMENT_STATE["stacks"] = [50000] * 6  # 6人场也使用50000（与训练配置一致）
             TOURNAMENT_STATE["dealer_pos"] = 5
-            TOURNAMENT_STATE["blinds"] = [50, 100]
+            TOURNAMENT_STATE["blinds"] = [100, 200]  # 6人场也使用100/200（与训练配置一致）
         
         # 重新加载游戏
         load_game_with_config(TOURNAMENT_STATE["stacks"], TOURNAMENT_STATE["dealer_pos"])

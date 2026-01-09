@@ -15,8 +15,8 @@ NUM_WORKERS=10               # Worker数量（平衡样本产生速度和内存�
 NUM_ITERATIONS=20000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
 NUM_TRAVERSALS=2000          # 每次迭代遍历次数（适配batch_size=4096，增加样本产生速度，保证新样本充足）
 BATCH_SIZE=4096              # 训练批量大小（多GPU时4096利用率高，适配其他参数）
-MEMORY_CAPACITY=500000      # 优势网络经验回放缓冲区容量（50万，每个玩家，适配batch_size=4096，建议至少100x batch_size，总内存约105GB）
-STRATEGY_MEMORY_CAPACITY=1600000  # 策略网络经验回放缓冲区容量（160万，所有玩家共享，适配策略样本产生速度16K/迭代，建议100x新增样本）
+MEMORY_CAPACITY=360000      # 优势网络经验回放缓冲区容量（50万，每个玩家，适配batch_size=4096，建议至少100x batch_size，总内存约105GB）
+STRATEGY_MEMORY_CAPACITY=360000  # 策略网络经验回放缓冲区容量（50万，所有玩家共享，与单个玩家优势网络相同，符合原始open_spiel设计）
 QUEUE_MAXSIZE=50000         # 队列最大大小（平衡内存和性能，总内存约12GB）
 NEW_SAMPLE_RATIO=0.5        # 新样本占比（分层加权采样，50%新样本+50%重要性加权老样本）
 LEARNING_RATE=0.001          # 学习率

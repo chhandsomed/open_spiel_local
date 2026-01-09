@@ -407,8 +407,7 @@ def worker_process(
     num_traversals_per_batch,
     device='cpu',
     max_memory_gb=None,  # Worker 内存限制
-    parent_pid=None,  # 主进程PID，用于检查主进程是否存活
-    exploration_rate_queue=None  # 探索率队列（可选）
+    parent_pid=None  # 主进程PID，用于检查主进程是否存活
 ):
     """Worker 进程：并行遍历游戏树
     
@@ -501,15 +500,15 @@ def worker_process(
             print(f"[Worker {worker_id}] ❌ 创建优势网络失败: {e}")
             raise
         
-        def sample_action_from_advantage(state, player, exploration_rate=1.0):
-            """使用优势网络采样动作
+        def sample_action_from_advantage(state, player):
+            """使用优势网络采样动作（Regret Matching）
+            
+            注意：总是使用优势网络和regret matching，即使网络权重是随机初始化的。
+            这与原始open_spiel的实现一致。
             
             Args:
                 state: 游戏状态
                 player: 玩家ID
-                exploration_rate: 探索率（随机策略的比例）
-                    - 1.0: 完全随机策略
-                    - 0.0: 完全使用训练后的策略
             
             Returns:
                 advantages: 优势值列表
@@ -518,17 +517,8 @@ def worker_process(
             info_state = state.information_state_tensor(player)
             legal_actions = state.legal_actions(player)
             
-            # 根据探索率决定使用随机策略还是训练后的策略
-            if np.random.random() < exploration_rate:
-                # 使用随机策略
-                advantages = [0.] * num_actions
-                matched_regrets = np.array([0.] * num_actions)
-                # 均匀分布
-                for action in legal_actions:
-                    matched_regrets[action] = 1.0 / len(legal_actions)
-                return advantages, matched_regrets
-            
-            # 使用训练后的策略（Regret Matching）
+            # 总是使用优势网络（即使权重是随机初始化的）
+            # 这与原始open_spiel的实现一致
             with torch.no_grad():
                 state_tensor = torch.FloatTensor(np.expand_dims(info_state, axis=0)).to(device)
                 raw_advantages = advantage_networks[player](state_tensor)[0].cpu().numpy()
@@ -545,14 +535,13 @@ def worker_process(
             
             return advantages, matched_regrets
         
-        def traverse_game_tree(state, player, iteration, exploration_rate=1.0):
+        def traverse_game_tree(state, player, iteration):
             """遍历游戏树，收集样本
             
             Args:
                 state: 游戏状态
                 player: 玩家ID
                 iteration: 当前迭代次数
-                exploration_rate: 探索率（随机策略的比例）
             """
             nonlocal local_strategy_batch
             if state.is_terminal():
@@ -561,17 +550,17 @@ def worker_process(
             if state.is_chance_node():
                 chance_outcome, chance_proba = zip(*state.chance_outcomes())
                 action = np.random.choice(chance_outcome, p=chance_proba)
-                return traverse_game_tree(state.child(action), player, iteration, exploration_rate)
+                return traverse_game_tree(state.child(action), player, iteration)
             
             if state.current_player() == player:
                 expected_payoff = {}
                 sampled_regret = {}
                 
-                _, strategy = sample_action_from_advantage(state, player, exploration_rate)
+                _, strategy = sample_action_from_advantage(state, player)
                 
                 for action in state.legal_actions():
                     expected_payoff[action] = traverse_game_tree(
-                        state.child(action), player, iteration, exploration_rate
+                        state.child(action), player, iteration
                     )
                 
                 cfv = sum(strategy[a] * expected_payoff[a] for a in state.legal_actions())
@@ -622,7 +611,7 @@ def worker_process(
                 return cfv
             else:
                 other_player = state.current_player()
-                _, strategy = sample_action_from_advantage(state, other_player, exploration_rate)
+                _, strategy = sample_action_from_advantage(state, other_player)
                 
                 probs = np.array(strategy)
                 probs /= probs.sum()
@@ -659,7 +648,7 @@ def worker_process(
                             # 队列为空（不应该发生，但处理一下）
                             pass
                 
-                return traverse_game_tree(state.child(sampled_action), player, iteration, exploration_rate)
+                return traverse_game_tree(state.child(sampled_action), player, iteration)
         
         # 主循环
         last_sync_iteration = 0
@@ -703,9 +692,6 @@ def worker_process(
                 # 检查失败，假设存活（避免误杀）
                 return True
         
-        # 初始化探索率（默认完全随机）
-        exploration_rate = 1.0
-        
         while not stop_event.is_set():
             # 定期检查主进程是否存活
             parent_check_counter += 1
@@ -715,13 +701,6 @@ def worker_process(
                     print(f"\n[Worker {worker_id}] 检测到主进程已退出，自动退出...")
                     stop_event.set()  # 设置停止事件
                     break
-            
-            # 获取探索率（如果可用）
-            if exploration_rate_queue is not None:
-                try:
-                    exploration_rate = exploration_rate_queue.get_nowait()
-                except queue.Empty:
-                    pass  # 使用上次的探索率
             
             # 关键修复：先同步网络参数，再读取迭代计数器
             # 这样可以确保Worker使用的网络参数和迭代标记是匹配的
@@ -746,7 +725,7 @@ def worker_process(
                     if stop_event.is_set():
                         break
                     current_iteration = iteration_counter.value
-                    traverse_game_tree(root_node.clone(), player, current_iteration, exploration_rate)
+                    traverse_game_tree(root_node.clone(), player, current_iteration)
                 
             # 强制刷新缓冲区：无论是否达到 batch_limit，都将手中的样本发送出去
             # 这防止了在多玩家游戏中，某些玩家的样本积累太慢导致的主进程饥饿
@@ -911,7 +890,6 @@ class ParallelDeepCFRSolver:
         self._advantage_queues = []
         self._strategy_queue = None
         self._network_params_queues = []
-        self._exploration_rate_queues = []  # 探索率队列
         self._stop_event = None
         self._iteration_counter = None
         
@@ -1059,7 +1037,6 @@ class ParallelDeepCFRSolver:
         self._advantage_queues = [Queue(maxsize=self.queue_maxsize) for _ in range(self.num_players)]
         self._strategy_queue = Queue(maxsize=self.queue_maxsize)
         self._network_params_queues = [Queue(maxsize=10) for _ in range(self.num_workers)]
-        self._exploration_rate_queues = [Queue(maxsize=1) for _ in range(self.num_workers)]  # 探索率队列（每个worker一个）
         
         # 计算每个 Worker 的遍历次数
         # 关键修正：不再一次性分配 huge number，而是分配一个小批次，让 Worker 快速响应
@@ -1091,7 +1068,6 @@ class ParallelDeepCFRSolver:
                     'cpu',  # Worker 在 CPU 上运行
                     self.max_memory_gb,  # Worker 内存限制
                     main_process_pid,  # 主进程PID，用于检查主进程是否存活
-                    self._exploration_rate_queues[i],  # 探索率队列
                 ),
                 daemon=True  # 设置为守护进程，主进程退出时自动杀死
             )
@@ -1790,30 +1766,6 @@ class ParallelDeepCFRSolver:
         loss_value = loss.detach().cpu().numpy()
         return float(loss_value) if np.isscalar(loss_value) else float(loss_value.item())
     
-    def get_exploration_rate(self, iteration):
-        """计算探索率（随机策略的比例）
-        
-        Args:
-            iteration: 当前迭代次数
-        
-        Returns:
-            float: 探索率，范围 [0.0, 1.0]
-                - 1.0: 完全随机策略
-                - 0.0: 完全自博弈（使用训练后的策略）
-        """
-        if self.switch_start_iteration is None:
-            return 1.0  # 完全随机
-        
-        # 计算过渡进度
-        progress = (iteration - self.switch_start_iteration) / self.transition_iterations
-        
-        if progress < 0:
-            return 1.0  # 完全随机
-        elif progress < 1.0:
-            return 1.0 - progress  # 从1.0逐渐减少到0.0
-        else:
-            return 0.0  # 完全自博弈
-    
     def should_start_transition(self, iteration, advantage_losses, win_rate=None, avg_return=None):
         """判断是否应该开始过渡阶段
         
@@ -1942,8 +1894,11 @@ class ParallelDeepCFRSolver:
                     print(f"    - switch_start_iteration: {self.switch_start_iteration}")
                     print(f"    - win_rate_history长度: {len(self.win_rate_history)}")
                     print(f"    - avg_return_history长度: {len(self.avg_return_history)}")
-                    exploration_rate = self.get_exploration_rate(start_iteration)
-                    print(f"    - 当前exploration_rate: {exploration_rate:.2f}")
+                    # 第一阶段和第二阶段通过switch_start_iteration区分
+                    if self.switch_start_iteration is None:
+                        print(f"    - 当前阶段：第一阶段（网络权重随机初始化）")
+                    else:
+                        print(f"    - 当前阶段：第二阶段（自博弈，switch_start_iteration={self.switch_start_iteration}）")
                 else:
                     print(f"  ✓ 恢复多阶段训练状态: 仍在第一阶段（完全随机策略）")
                 print()
@@ -1984,20 +1939,6 @@ class ParallelDeepCFRSolver:
                 
                 # 更新迭代计数器
                 self._iteration_counter.value = iteration + 1
-                
-                # 获取探索率并发送给所有worker进程
-                exploration_rate = self.get_exploration_rate(iteration)
-                for exploration_rate_queue in self._exploration_rate_queues:
-                    try:
-                        # 如果队列满了，先清空再放入
-                        try:
-                            exploration_rate_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        exploration_rate_queue.put_nowait(exploration_rate)
-                    except queue.Full:
-                        # 如果还是满了，跳过（使用上次的探索率）
-                        pass
                 
                 # 动态收集样本：直到收集到足够数量的新样本
                 # 这样可以确保每次迭代的数据量是恒定的，不受 Worker 速度影响
@@ -2285,16 +2226,17 @@ class ParallelDeepCFRSolver:
                 strategy_train_time = time.time() - strategy_train_start
                 
                 # 同步网络参数到 Worker
-                # 关键修复：第一阶段（完全随机策略）训练网络但不同步到Worker
-                # 只有当exploration_rate < 1.0时才开始同步网络参数，让Worker使用训练后的策略
+                # 关键修复：第一阶段（网络权重随机初始化）训练网络但不同步到Worker
+                # 只有当满足切换条件（能打赢随机策略）时才开始同步网络参数，让Worker使用训练后的策略
                 sync_start = time.time()
-                should_sync_to_workers = exploration_rate < 1.0  # 只有第二阶段才同步到Worker
+                # 判断是否应该同步：如果switch_start_iteration已设置，说明已切换到第二阶段
+                should_sync_to_workers = self.switch_start_iteration is not None
                 if should_sync_to_workers and (iteration + 1) % self.sync_interval == 0:
                     self._sync_network_params()
                 elif not should_sync_to_workers:
-                    # 第一阶段：训练网络但不同步到Worker，Worker继续使用随机策略
+                    # 第一阶段：训练网络但不同步到Worker，Worker继续使用随机初始化的网络
                     if verbose and (iteration + 1) % self.sync_interval == 0:
-                        get_logger().info(f"    跳过网络参数同步到Worker（exploration_rate={exploration_rate:.2f}，完全随机策略阶段，Worker继续使用随机策略）")
+                        get_logger().info(f"    跳过网络参数同步到Worker（第一阶段，Worker使用随机初始化的网络权重）")
                 sync_time = time.time() - sync_start
                 
                 self._iteration += 1

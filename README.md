@@ -555,7 +555,7 @@ python api_server.py --model_dir models/deepcfr_parallel_6p --host 0.0.0.0 --por
 # 同时加载5人场和6人场模型
 nohup python api_server.py \
   --model_5p models/deepcfr_parallel_5p_custom/checkpoints/iter_4100 \
-  --model_6p models/deepcfr_6p_multi_20260108_230414/checkpoints/iter_600  \
+  --model_6p models/deepcfr_6p_multi_20260109_161331/checkpoints/iter_1800  \
   --host 0.0.0.0 \
   --port 8826 \
   --device cpu > api_server_multi_model_8826.log 2>&1 &

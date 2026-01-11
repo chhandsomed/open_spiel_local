@@ -817,6 +817,7 @@ class ParallelDeepCFRSolver:
         switch_win_rate_std=0.05,  # 胜率标准差阈值（5%）
         switch_avg_return_std=10.0,  # 平均收益标准差阈值（10 BB）
         transition_iterations=1000,  # 过渡阶段的迭代次数
+        reinitialize_advantage_networks=True,  # 是否重新初始化优势网络（默认启用，与单进程一致）
     ):
         self.game = game
         self.num_workers = num_workers
@@ -912,10 +913,13 @@ class ParallelDeepCFRSolver:
         self.switch_avg_return_std = switch_avg_return_std
         self.transition_iterations = transition_iterations
         
-        # 切换状态
+        # 切换状态（已废弃，保留用于兼容性）
         self.switch_start_iteration = None
         self.win_rate_history = []
         self.avg_return_history = []
+        
+        # 优势网络重新初始化（与单进程一致）
+        self._reinitialize_advantage_networks = reinitialize_advantage_networks
     
     def _parse_max_stack_from_game_string(self, game_string):
         """从游戏字符串中解析max_stack值
@@ -1158,8 +1162,22 @@ class ParallelDeepCFRSolver:
         self._workers = []
         print("所有 Worker 已停止")
     
+    def reinitialize_advantage_network(self, player):
+        """重新初始化优势网络（与单进程一致）"""
+        net = self._advantage_networks[player]
+        # 处理 DataParallel 包装
+        if isinstance(net, nn.DataParallel):
+            # DataParallel包装的网络，调用reset方法
+            net.module.reset()
+        else:
+            # 直接调用reset方法（SimpleFeatureMLP有reset方法）
+            net.reset()
+        # 重新创建优化器
+        self._optimizer_advantages[player] = torch.optim.Adam(
+            self._advantage_networks[player].parameters(), lr=self.learning_rate)
+    
     def _sync_network_params(self):
-        """同步网络参数到所有 Worker"""
+        """同步网络参数到所有 Worker（始终同步，移除两阶段机制）"""
         sync_start_time = time.time()
         
         params_start = time.time()
@@ -2107,6 +2125,10 @@ class ParallelDeepCFRSolver:
                     """训练单个玩家的优势网络"""
                     player_start_time = time.time()
                     try:
+                        # 重新初始化优势网络（如果启用，与单进程一致）
+                        if self._reinitialize_advantage_networks:
+                            self.reinitialize_advantage_network(player)
+                        
                         # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
                         # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
                         # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
@@ -2225,18 +2247,11 @@ class ParallelDeepCFRSolver:
                 
                 strategy_train_time = time.time() - strategy_train_start
                 
-                # 同步网络参数到 Worker
-                # 关键修复：第一阶段（网络权重随机初始化）训练网络但不同步到Worker
-                # 只有当满足切换条件（能打赢随机策略）时才开始同步网络参数，让Worker使用训练后的策略
+                # 同步网络参数到 Worker（始终同步，移除两阶段机制）
+                # 修改：像单进程训练一样，始终使用训练后的网络，避免两阶段问题
                 sync_start = time.time()
-                # 判断是否应该同步：如果switch_start_iteration已设置，说明已切换到第二阶段
-                should_sync_to_workers = self.switch_start_iteration is not None
-                if should_sync_to_workers and (iteration + 1) % self.sync_interval == 0:
+                if (iteration + 1) % self.sync_interval == 0:
                     self._sync_network_params()
-                elif not should_sync_to_workers:
-                    # 第一阶段：训练网络但不同步到Worker，Worker继续使用随机初始化的网络
-                    if verbose and (iteration + 1) % self.sync_interval == 0:
-                        get_logger().info(f"    跳过网络参数同步到Worker（第一阶段，Worker使用随机初始化的网络权重）")
                 sync_time = time.time() - sync_start
                 
                 self._iteration += 1

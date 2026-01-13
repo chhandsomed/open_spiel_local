@@ -15,15 +15,15 @@ NUM_WORKERS=10               # Worker数量（平衡样本产生速度和内存�
 NUM_ITERATIONS=20000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
 NUM_TRAVERSALS=2000          # 每次迭代遍历次数（适配batch_size=4096，增加样本产生速度，保证新样本充足）
 BATCH_SIZE=4096              # 训练批量大小（多GPU时4096利用率高，适配其他参数）
-MEMORY_CAPACITY=360000      # 优势网络经验回放缓冲区容量（50万，每个玩家，适配batch_size=4096，建议至少100x batch_size，总内存约105GB）
-STRATEGY_MEMORY_CAPACITY=360000  # 策略网络经验回放缓冲区容量（50万，所有玩家共享，与单个玩家优势网络相同，符合原始open_spiel设计）
+MEMORY_CAPACITY=360000      # 优势网络经验回放缓冲区容量（每个玩家，适配batch_size=4096）
+STRATEGY_MEMORY_CAPACITY=720000  # 策略网络经验回放缓冲区容量（增加到72万，保证新样本有足够保存时间）
 QUEUE_MAXSIZE=50000         # 队列最大大小（平衡内存和性能，总内存约12GB）
-NEW_SAMPLE_RATIO=0.5        # 新样本占比（分层加权采样，50%新样本+50%重要性加权老样本）
+NEW_SAMPLE_RATIO=0.9        # 新样本占比（提高到70%，确保策略网络更多学习新样本）
 LEARNING_RATE=0.001          # 学习率
 POLICY_LAYERS="256 256 256"  # 策略网络结构（3层256节点，6人局状态复杂）
 ADVANTAGE_LAYERS="256 256 256"  # 优势网络结构（与策略网络相同）
-ADVANTAGE_TRAIN_STEPS=1      # 优势网络训练步骤数（每次迭代训练1次，大幅减少以加快迭代速度）
-POLICY_TRAIN_STEPS=2         # 策略网络训练步骤数（每次迭代训练2次，减少以加快迭代速度）
+ADVANTAGE_TRAIN_STEPS=3      # 优势网络训练步骤数（从1增加到3，平衡效果和耗时，这是最关键的修改！）
+POLICY_TRAIN_STEPS=2         # 策略网络训练步骤数（从1增加到2，平衡效果和耗时）
 EVAL_INTERVAL=10            # 每N次迭代进行一次评估
 CHECKPOINT_INTERVAL=100       # Checkpoint保存间隔
 NUM_TEST_GAMES=200            # 评估时的测试对局数量（推荐200局，平衡速度和准确性）
@@ -48,6 +48,8 @@ nohup python deep_cfr_parallel.py \
     --strategy_memory_capacity $STRATEGY_MEMORY_CAPACITY \
     --queue_maxsize $QUEUE_MAXSIZE \
     --new_sample_ratio $NEW_SAMPLE_RATIO \
+    --advantage_train_steps $ADVANTAGE_TRAIN_STEPS \
+    --policy_train_steps $POLICY_TRAIN_STEPS \
     --learning_rate $LEARNING_RATE \
     --policy_layers $POLICY_LAYERS \
     --advantage_layers $ADVANTAGE_LAYERS \

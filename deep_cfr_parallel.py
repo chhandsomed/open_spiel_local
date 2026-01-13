@@ -119,18 +119,19 @@ class SharedBuffer:
 
 
 class RandomReplacementBuffer:
-    """随机替换缓冲区
+    """Reservoir Sampling 缓冲区（与原始OpenSpiel一致）
     
-    当缓冲区满时，随机选择一个位置替换，而不是使用Reservoir Sampling。
-    这样可以确保每次添加样本时都有固定的替换概率。
+    使用Reservoir Sampling算法，保证样本保留概率公平。
+    参见：https://en.wikipedia.org/wiki/Reservoir_sampling
     """
     
     def __init__(self, capacity):
         self._capacity = capacity
         self._data = []
+        self._add_calls = 0  # 添加计数器（Reservoir Sampling必需）
     
     def add(self, element):
-        """添加样本（随机替换）"""
+        """添加样本（Reservoir Sampling）"""
         # 如果容量为0，直接返回（不添加任何样本）
         if self._capacity == 0:
             return
@@ -138,21 +139,11 @@ class RandomReplacementBuffer:
         if len(self._data) < self._capacity:
             self._data.append(element)
         else:
-            # 缓冲区满时，随机选择一个位置替换
-            # 如果缓冲区大小超过容量（不应该发生，但作为边界情况保护），先随机截断
-            if len(self._data) > self._capacity:
-                # 随机选择保留 capacity 个样本（保持随机替换的随机性）
-                # 确保 capacity > 0（已经在开头检查过）
-                keep_indices = set(np.random.choice(len(self._data), self._capacity, replace=False))
-                self._data = [self._data[idx] for idx in sorted(keep_indices)]
-            
-            # 随机选择一个位置替换
-            if len(self._data) > 0:
-                idx = np.random.randint(0, len(self._data))
+            # Reservoir Sampling: 以 capacity/(add_calls+1) 的概率替换随机位置
+            idx = np.random.randint(0, self._add_calls + 1)
+            if idx < self._capacity:
                 self._data[idx] = element
-            else:
-                # 如果缓冲区为空但capacity已满（不应该发生），直接添加
-                self._data.append(element)
+        self._add_calls += 1  # 关键：每次添加都要增加计数器
     
     def sample(self, num_samples, current_iteration=None, new_sample_ratio=0.5):
         """采样
@@ -362,6 +353,7 @@ class RandomReplacementBuffer:
     def clear(self):
         """清空缓冲区"""
         self._data = []
+        self._add_calls = 0  # 重置计数器
     
     def __len__(self):
         return len(self._data)
@@ -818,6 +810,8 @@ class ParallelDeepCFRSolver:
         switch_avg_return_std=10.0,  # 平均收益标准差阈值（10 BB）
         transition_iterations=1000,  # 过渡阶段的迭代次数
         reinitialize_advantage_networks=True,  # 是否重新初始化优势网络（默认启用，与单进程一致）
+        advantage_network_train_steps=1,  # 优势网络训练步数（每次迭代）
+        policy_network_train_steps=1,  # 策略网络训练步数（每次迭代）
     ):
         self.game = game
         self.num_workers = num_workers
@@ -920,6 +914,10 @@ class ParallelDeepCFRSolver:
         
         # 优势网络重新初始化（与单进程一致）
         self._reinitialize_advantage_networks = reinitialize_advantage_networks
+        
+        # 网络训练步数
+        self._advantage_network_train_steps = advantage_network_train_steps
+        self._policy_network_train_steps = policy_network_train_steps
     
     def _parse_max_stack_from_game_string(self, game_string):
         """从游戏字符串中解析max_stack值
@@ -1629,8 +1627,6 @@ class ParallelDeepCFRSolver:
         if len(samples) == 0:
             return None
         
-        forward_backward_start = time.time()
-        self._optimizer_advantages[player].zero_grad()
         # 优化：获取网络所在的设备（支持多GPU分配）
         network = self._advantage_networks[player]
         if isinstance(network, nn.DataParallel):
@@ -1644,25 +1640,32 @@ class ParallelDeepCFRSolver:
         advantages_tensor = torch.from_numpy(advantages).to(device)
         iters = torch.from_numpy(iterations).to(device)
         info_states_tensor = torch.from_numpy(info_states).to(device)
-        try:
-            # 修复：DataParallel在多线程环境下可能死锁，需要设置环境变量
-            # 或者使用torch.set_num_threads(1)来避免死锁
-            import os
-            os.environ['OMP_NUM_THREADS'] = '1'
-            os.environ['MKL_NUM_THREADS'] = '1'
-            
-            # 如果使用DataParallel，可能需要设置torch.set_num_threads
-            if isinstance(network, nn.DataParallel):
-                torch.set_num_threads(1)
-            
-            outputs = network(info_states_tensor)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            raise
-        loss = self._loss_advantages(iters * outputs, iters * advantages_tensor)
-        loss.backward()
-        self._optimizer_advantages[player].step()
+        
+        # 修复：DataParallel在多线程环境下可能死锁，需要设置环境变量
+        import os
+        os.environ['OMP_NUM_THREADS'] = '1'
+        os.environ['MKL_NUM_THREADS'] = '1'
+        
+        # 如果使用DataParallel，可能需要设置torch.set_num_threads
+        if isinstance(network, nn.DataParallel):
+            torch.set_num_threads(1)
+        
+        forward_backward_start = time.time()
+        # 多次训练（与原始OpenSpiel一致）
+        final_loss = None
+        for step in range(self._advantage_network_train_steps):
+            self._optimizer_advantages[player].zero_grad()
+            try:
+                outputs = network(info_states_tensor)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                raise
+            loss = self._loss_advantages(iters * outputs, iters * advantages_tensor)
+            loss.backward()
+            self._optimizer_advantages[player].step()
+            final_loss = loss  # 保存最后一次训练的损失
+        
         # 优化：确保CUDA操作完成，避免多线程竞争
         # 注意：synchronize不接受device对象，需要获取设备索引
         if device.type == 'cuda':
@@ -1674,8 +1677,10 @@ class ParallelDeepCFRSolver:
         # get_logger().info(f"  玩家 {player} 优势网络训练耗时: {total_train_time*1000:.1f}ms (采样: {sample_time*1000:.1f}ms, 数据准备: {data_prep_time*1000:.1f}ms, 前向反向: {forward_backward_time*1000:.1f}ms)")
         
         # 修复：确保返回标量（MSELoss返回标量tensor，.numpy()可能返回0维数组）
-        loss_value = loss.detach().cpu().numpy()
-        return float(loss_value) if np.isscalar(loss_value) else float(loss_value.item())
+        if final_loss is not None:
+            loss_value = final_loss.detach().cpu().numpy()
+            return float(loss_value) if np.isscalar(loss_value) else float(loss_value.item())
+        return None
     
     def _learn_strategy_network(self, current_iteration=None):
         """训练策略网络
@@ -1750,8 +1755,6 @@ class ParallelDeepCFRSolver:
         if len(samples) == 0:
             return None
         
-        forward_backward_start = time.time()
-        self._optimizer_policy.zero_grad()
         # 优化：获取策略网络所在的设备（支持多GPU分配）
         network = self._policy_network
         if isinstance(network, nn.DataParallel):
@@ -1765,11 +1768,19 @@ class ParallelDeepCFRSolver:
         iters = torch.from_numpy(iterations).to(device)
         ac_probs = torch.from_numpy(action_probs).to(device)
         info_states_tensor = torch.from_numpy(info_states).to(device)
-        logits = network(info_states_tensor)
-        outputs = self._policy_sm(logits)
-        loss = self._loss_policy(iters * outputs, iters * ac_probs)
-        loss.backward()
-        self._optimizer_policy.step()
+        
+        forward_backward_start = time.time()
+        # 多次训练（与原始OpenSpiel一致）
+        final_loss = None
+        for step in range(self._policy_network_train_steps):
+            self._optimizer_policy.zero_grad()
+            logits = network(info_states_tensor)
+            outputs = self._policy_sm(logits)
+            loss = self._loss_policy(iters * outputs, iters * ac_probs)
+            loss.backward()
+            self._optimizer_policy.step()
+            final_loss = loss  # 保存最后一次训练的损失
+        
         # 优化：确保CUDA操作完成，避免多线程竞争
         # 注意：synchronize不接受device对象，需要获取设备索引
         if device.type == 'cuda':
@@ -1781,8 +1792,10 @@ class ParallelDeepCFRSolver:
         get_logger().info(f"  策略网络训练耗时: {total_train_time*1000:.1f}ms (采样: {sample_time*1000:.1f}ms, 数据准备: {data_prep_time*1000:.1f}ms, 前向反向: {forward_backward_time*1000:.1f}ms)")
         
         # 修复：确保返回标量（MSELoss返回标量tensor，.numpy()可能返回0维数组）
-        loss_value = loss.detach().cpu().numpy()
-        return float(loss_value) if np.isscalar(loss_value) else float(loss_value.item())
+        if final_loss is not None:
+            loss_value = final_loss.detach().cpu().numpy()
+            return float(loss_value) if np.isscalar(loss_value) else float(loss_value.item())
+        return None
     
     def should_start_transition(self, iteration, advantage_losses, win_rate=None, avg_return=None):
         """判断是否应该开始过渡阶段
@@ -2146,18 +2159,32 @@ class ParallelDeepCFRSolver:
                 # 如果GPU数量 >= 玩家数量，每个玩家已经在不同GPU上，可以完全并行
                 # 否则使用多线程并行训练（CUDA操作是异步的，可以并行执行）
                 if self.use_multi_gpu:
-                    max_workers = min(self.num_players, len(self.gpu_ids))
+                    max_workers = min(self.num_players + 1, len(self.gpu_ids))  # +1 为策略网络预留
                 else:
-                    max_workers = min(self.num_players, 6)
+                    max_workers = min(self.num_players + 1, 6)  # +1 为策略网络预留
+                
+                # 定义策略网络训练函数（用于并行训练）
+                def train_strategy():
+                    return self._learn_strategy_network(current_iteration=self._iteration_counter.value)
                 
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = {executor.submit(train_advantage, player): player 
-                              for player in range(self.num_players)}
+                    # 提交优势网络训练任务
+                    advantage_futures = {executor.submit(train_advantage, player): player 
+                                       for player in range(self.num_players)}
+                    
+                    # 优化：同时提交策略网络训练任务，与优势网络并行训练
+                    # 策略网络和优势网络使用不同的GPU和缓冲区，可以完全并行
+                    strategy_future = None
+                    if self.use_multi_gpu and len(self.gpu_ids) > self.num_players:
+                        # GPU数量充足，策略网络可以分配到额外的GPU，与优势网络并行训练
+                        strategy_future = executor.submit(train_strategy)
+                    
+                    # 等待优势网络训练完成
                     completed_count = 0
                     pending_players = set(range(self.num_players))
                     try:
-                        for future in as_completed(futures, timeout=300):  # 添加总超时，避免无限等待
-                            player = futures[future]
+                        for future in as_completed(advantage_futures, timeout=300):  # 添加总超时，避免无限等待
+                            player = advantage_futures[future]
                             completed_count += 1
                             pending_players.discard(player)
                             try:
@@ -2176,12 +2203,27 @@ class ParallelDeepCFRSolver:
                                 get_logger().warning(f"玩家 {player} 优势网络训练失败: {e}")
                     except TimeoutError:
                         # 取消剩余任务
-                        for future in futures:
+                        for future in advantage_futures:
                             if not future.done():
                                 future.cancel()
+                        if strategy_future and not strategy_future.done():
+                            strategy_future.cancel()
                         raise RuntimeError(f"优势网络训练超时，已完成 {completed_count}/{self.num_players} 个玩家")
                 
                 advantage_train_time = time.time() - advantage_train_start
+                
+                # 如果策略网络训练已经提交，等待其完成
+                if strategy_future is not None:
+                    try:
+                        policy_loss = strategy_future.result(timeout=300)
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        get_logger().warning(f"策略网络训练失败: {e}")
+                        policy_loss = None
+                else:
+                    # 如果策略网络训练没有并行提交（GPU不足），串行训练
+                    policy_loss = None
                 
                 # 输出每个玩家的训练时间（用于验证并行训练是否生效）
                 if verbose and player_train_times:
@@ -2212,29 +2254,15 @@ class ParallelDeepCFRSolver:
                         elif speedup_efficiency < 70:
                             get_logger().warning(f"    ⚠️ 加速比效率较低 ({speedup_efficiency:.1f}%)，可能并行训练未完全生效")
                 
-                # 训练策略网络（并行优化：如果有多GPU，可以与优势网络并行训练）
+                # 训练策略网络（如果还没有并行训练，则串行训练）
                 # 关键修复：第一阶段（完全随机策略）仍然训练策略网络（用于checkpoint和学习样本）
                 # 但不同步到Worker，让Worker继续使用随机策略，避免自博弈
                 # 为了加速 checkpoint 保存时的策略网络更新，我们在每次迭代中增量训练策略网络
                 # 这样可以分摊计算成本，使得 checkpoint 时策略网络已经接近就绪
                 strategy_train_start = time.time()
-                # 优化：如果有多GPU且GPU数量充足，策略网络可以与优势网络并行训练
-                # 因为策略网络和优势网络使用不同的缓冲区和网络，相互独立
-                if self.use_multi_gpu and len(self.gpu_ids) > self.num_players:
-                    # GPU数量充足，策略网络可以分配到额外的GPU，与优势网络并行训练
-                    # 使用线程池并行执行优势网络训练（如果还没完成）和策略网络训练
-                    def train_strategy():
-                        # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
-                        # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
-                        # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
-                        # 使用self._iteration_counter.value而不是iteration+1，确保与样本的iteration字段匹配
-                        return self._learn_strategy_network(current_iteration=self._iteration_counter.value)
-                    
-                    # 策略网络已经在初始化时分配到GPU，可以直接并行训练
-                    # 注意：这里策略网络训练会与优势网络训练并行（如果优势网络训练还没完成）
-                    policy_loss = train_strategy()
-                else:
-                    # 单GPU或GPU数量不足，串行训练
+                
+                # 如果策略网络训练还没有完成（没有并行提交），则串行训练
+                if policy_loss is None:
                     # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
                     # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
                     # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
@@ -2791,6 +2819,10 @@ def main():
                         help="盲注配置，格式：'小盲 大盲' 或 '50 100 0 0 0 0'（多人场完整配置）。如果不指定，将根据玩家数量自动生成")
     parser.add_argument("--stack_size", type=int, default=None,
                         help="每个玩家的初始筹码（默认: 2000）。如果不指定，将使用默认值2000")
+    parser.add_argument("--advantage_train_steps", type=int, default=1,
+                        help="优势网络训练步数（每次迭代，默认: 1）")
+    parser.add_argument("--policy_train_steps", type=int, default=1,
+                        help="策略网络训练步数（每次迭代，默认: 1）")
     
     args = parser.parse_args()
     
@@ -2833,9 +2865,16 @@ def main():
                 args.stack_size = resume_config['stack_size']
             if 'strategy_memory_capacity' in resume_config and args.strategy_memory_capacity is None:
                 args.strategy_memory_capacity = resume_config['strategy_memory_capacity']
+            if 'advantage_train_steps' in resume_config:
+                args.advantage_train_steps = resume_config['advantage_train_steps']
+            if 'policy_train_steps' in resume_config:
+                args.policy_train_steps = resume_config['policy_train_steps']
+            if 'new_sample_ratio' in resume_config:
+                args.new_sample_ratio = resume_config['new_sample_ratio']
                 
             print(f"  自动加载配置: {args.num_players}人局, 策略层{args.policy_layers}, 优势层{args.advantage_layers}")
             print(f"  save_prefix: {args.save_prefix}")
+            print(f"  优势网络训练步数: {args.advantage_train_steps}, 策略网络训练步数: {args.policy_train_steps}")
         else:
             print(f"⚠️ 未找到 config.json，使用命令行参数")
 
@@ -2936,6 +2975,8 @@ def main():
         max_memory_gb=args.max_memory_gb,
         queue_maxsize=args.queue_maxsize,
         new_sample_ratio=args.new_sample_ratio,
+        advantage_network_train_steps=args.advantage_train_steps,
+        policy_network_train_steps=args.policy_train_steps,
     )
     
     # 显示内存配置
@@ -2960,6 +3001,9 @@ def main():
             'strategy_memory_capacity': args.strategy_memory_capacity,
             'max_memory_gb': args.max_memory_gb,
             'queue_maxsize': args.queue_maxsize,
+            'new_sample_ratio': args.new_sample_ratio,
+            'advantage_train_steps': args.advantage_train_steps,
+            'policy_train_steps': args.policy_train_steps,
             'betting_abstraction': args.betting_abstraction,
             'blinds': blinds_str,
             'stack_size': stack_size,
@@ -3024,6 +3068,10 @@ def main():
         'memory_capacity': args.memory_capacity,
         'max_memory_gb': args.max_memory_gb,
         'queue_maxsize': args.queue_maxsize,
+        'new_sample_ratio': args.new_sample_ratio,
+        'advantage_train_steps': args.advantage_train_steps,
+        'policy_train_steps': args.policy_train_steps,
+        'strategy_memory_capacity': args.strategy_memory_capacity,
         'betting_abstraction': args.betting_abstraction,
         'device': device,
         'gpu_ids': gpu_ids,

@@ -809,7 +809,7 @@ class ParallelDeepCFRSolver:
         switch_win_rate_std=0.05,  # 胜率标准差阈值（5%）
         switch_avg_return_std=10.0,  # 平均收益标准差阈值（10 BB）
         transition_iterations=1000,  # 过渡阶段的迭代次数
-        reinitialize_advantage_networks=True,  # 是否重新初始化优势网络（默认启用，与单进程一致）
+        reinitialize_advantage_networks=False,  # 是否重新初始化优势网络（默认关闭，避免每次迭代重置导致学习不稳定）
         advantage_network_train_steps=1,  # 优势网络训练步数（每次迭代）
         policy_network_train_steps=1,  # 策略网络训练步数（每次迭代）
     ):
@@ -1881,7 +1881,7 @@ class ParallelDeepCFRSolver:
     
     def solve(self, verbose=True, eval_interval=10, checkpoint_interval=0, 
               model_dir=None, save_prefix=None, game=None, start_iteration=0,
-              eval_with_games=False, num_test_games=50, training_state=None):
+              eval_with_games=False, num_test_games=1000, training_state=None):
         """运行并行 DeepCFR 训练
         
         Args:
@@ -2138,7 +2138,11 @@ class ParallelDeepCFRSolver:
                     """训练单个玩家的优势网络"""
                     player_start_time = time.time()
                     try:
-                        # 重新初始化优势网络（如果启用，与单进程一致）
+                        # 重新初始化优势网络（如果启用）
+                        # 注意：默认关闭重新初始化，因为每次迭代重置会导致：
+                        # 1. 优势网络无法持续学习，生成的策略样本质量差
+                        # 2. 策略网络学习差的策略样本，形成恶性循环
+                        # 3. Fold概率接近0，All-In概率过高，策略不稳定
                         if self._reinitialize_advantage_networks:
                             self.reinitialize_advantage_network(player)
                         
@@ -2159,25 +2163,15 @@ class ParallelDeepCFRSolver:
                 # 如果GPU数量 >= 玩家数量，每个玩家已经在不同GPU上，可以完全并行
                 # 否则使用多线程并行训练（CUDA操作是异步的，可以并行执行）
                 if self.use_multi_gpu:
-                    max_workers = min(self.num_players + 1, len(self.gpu_ids))  # +1 为策略网络预留
+                    max_workers = min(self.num_players, len(self.gpu_ids))
                 else:
-                    max_workers = min(self.num_players + 1, 6)  # +1 为策略网络预留
+                    max_workers = min(self.num_players, 6)
                 
-                # 定义策略网络训练函数（用于并行训练）
-                def train_strategy():
-                    return self._learn_strategy_network(current_iteration=self._iteration_counter.value)
-                
+                # 策略网络训练已移到checkpoint部分，这里只训练优势网络
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     # 提交优势网络训练任务
                     advantage_futures = {executor.submit(train_advantage, player): player 
                                        for player in range(self.num_players)}
-                    
-                    # 优化：同时提交策略网络训练任务，与优势网络并行训练
-                    # 策略网络和优势网络使用不同的GPU和缓冲区，可以完全并行
-                    strategy_future = None
-                    if self.use_multi_gpu and len(self.gpu_ids) > self.num_players:
-                        # GPU数量充足，策略网络可以分配到额外的GPU，与优势网络并行训练
-                        strategy_future = executor.submit(train_strategy)
                     
                     # 等待优势网络训练完成
                     completed_count = 0
@@ -2206,24 +2200,9 @@ class ParallelDeepCFRSolver:
                         for future in advantage_futures:
                             if not future.done():
                                 future.cancel()
-                        if strategy_future and not strategy_future.done():
-                            strategy_future.cancel()
                         raise RuntimeError(f"优势网络训练超时，已完成 {completed_count}/{self.num_players} 个玩家")
                 
                 advantage_train_time = time.time() - advantage_train_start
-                
-                # 如果策略网络训练已经提交，等待其完成
-                if strategy_future is not None:
-                    try:
-                        policy_loss = strategy_future.result(timeout=300)
-                    except Exception as e:
-                        import traceback
-                        traceback.print_exc()
-                        get_logger().warning(f"策略网络训练失败: {e}")
-                        policy_loss = None
-                else:
-                    # 如果策略网络训练没有并行提交（GPU不足），串行训练
-                    policy_loss = None
                 
                 # 输出每个玩家的训练时间（用于验证并行训练是否生效）
                 if verbose and player_train_times:
@@ -2254,26 +2233,9 @@ class ParallelDeepCFRSolver:
                         elif speedup_efficiency < 70:
                             get_logger().warning(f"    ⚠️ 加速比效率较低 ({speedup_efficiency:.1f}%)，可能并行训练未完全生效")
                 
-                # 训练策略网络（如果还没有并行训练，则串行训练）
-                # 关键修复：第一阶段（完全随机策略）仍然训练策略网络（用于checkpoint和学习样本）
-                # 但不同步到Worker，让Worker继续使用随机策略，避免自博弈
-                # 为了加速 checkpoint 保存时的策略网络更新，我们在每次迭代中增量训练策略网络
-                # 这样可以分摊计算成本，使得 checkpoint 时策略网络已经接近就绪
-                strategy_train_start = time.time()
-                
-                # 如果策略网络训练还没有完成（没有并行提交），则串行训练
-                if policy_loss is None:
-                    # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
-                    # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
-                    # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
-                    # 使用self._iteration_counter.value而不是iteration+1，确保与样本的iteration字段匹配
-                    policy_loss = self._learn_strategy_network(current_iteration=self._iteration_counter.value)
-                
-                # 保存策略损失
-                if policy_loss is not None:
-                    policy_losses.append(policy_loss)
-                
-                strategy_train_time = time.time() - strategy_train_start
+                # 策略网络训练：只在checkpoint时训练（优化：减少训练时间）
+                # 策略网络训练已移到checkpoint部分，这里不再训练
+                strategy_train_time = 0.0
                 
                 # 同步网络参数到 Worker（始终同步，移除两阶段机制）
                 # 修改：像单进程训练一样，始终使用训练后的网络，避免两阶段问题
@@ -2334,167 +2296,15 @@ class ParallelDeepCFRSolver:
                           f"优势样本: {sum(len(m) for m in self._advantage_memories):,} | "
                           f"策略样本: {len(self._strategy_memories):,}{queue_status}")
                 
-                if (iteration + 1) % eval_interval == 0:
-                    print()
-                    # 打印归一化的优势网络损失（除以iteration得到MSE）
-                    current_iter = iteration + 1
-                    for player, losses in advantage_losses.items():
-                        if losses:
-                            raw_loss = losses[-1]
-                            # 归一化：除以iteration（因为损失值 = iteration * MSE）
-                            # 归一化后的值就是MSE本身
-                            mse = raw_loss / current_iter if current_iter > 0 else raw_loss
-                            print(f"    玩家 {player} 优势网络损失: MSE={mse:.2f} (原始: {raw_loss:.2f})")
-                    
-                    # 打印归一化的策略网络损失（除以iteration得到MSE）
-                    if policy_losses:
-                        raw_policy_loss = policy_losses[-1]
-                        # 归一化：除以iteration（因为损失值 = iteration * MSE）
-                        # 归一化后的值就是MSE本身
-                        mse = raw_policy_loss / current_iter if current_iter > 0 else raw_policy_loss
-                        print(f"    策略网络损失: MSE={mse:.6f} (原始: {raw_policy_loss:.2f})")
-                    
-                    # 运行评估
-                    if game is not None:
-                        try:
-                            from training_evaluator import quick_evaluate
-                            print(f"  评估训练效果...", end="", flush=True)
-                            eval_result = quick_evaluate(
-                                game,
-                                self,
-                                include_test_games=eval_with_games,
-                                num_test_games=num_test_games,
-                                max_depth=None,
-                                verbose=True  # 启用详细输出以查看错误
-                            )
-                            get_logger().info(" 完成")
-                            
-                            # 打印简要评估信息
-                            metrics = eval_result['metrics']
-                            print(f"    策略熵: {metrics.get('avg_entropy', 0):.4f} | "
-                                  f"策略缓冲区: {len(self._strategy_memories):,} | "
-                                  f"优势样本: {sum(len(m) for m in self._advantage_memories):,}")
-                            
-                            if eval_with_games and eval_result.get('test_results'):
-                                test_results = eval_result['test_results']
-                                num_games = test_results.get('games_played', 0)
-                                mode = test_results.get('mode', 'unknown')
-                                num_players = test_results.get('num_players', 0)
-                                
-                                # 获取大盲注值
-                                bb = None
-                                try:
-                                    game_string = str(game)
-                                    blind_match = re.search(r'blind=([\d\s]+)', game_string)
-                                    if blind_match:
-                                        blinds = [int(x) for x in blind_match.group(1).strip().split()]
-                                        bb = max([b for b in blinds if b > 0], default=None)
-                                except:
-                                    pass
-                                
-                                if num_games > 0:
-                                    if mode == "self_play":
-                                        # 自对弈模式：显示所有位置
-                                        print(f"    测试对局: {num_games} 局 (自对弈)")
-                                        for i in range(num_players):
-                                            avg_return = test_results.get(f'player{i}_avg_return', 0)
-                                            win_rate = test_results.get(f'player{i}_win_rate', 0) * 100
-                                            if bb is not None and bb > 0:
-                                                bb_value = avg_return / bb
-                                                print(f"      玩家{i}: 平均回报 {avg_return:.2f} ({bb_value:+.2f} BB), 胜率 {win_rate:.1f}%")
-                                            else:
-                                                print(f"      玩家{i}: 平均回报 {avg_return:.2f}, 胜率 {win_rate:.1f}%")
-                                        
-                                        # 打印测试对局中的动作平均占比（自对弈模式）
-                                        if test_results.get('action_statistics'):
-                                            from training_evaluator import _get_action_name
-                                            action_stats = test_results['action_statistics']
-                                            total_count = sum(s['count'] for s in action_stats.values())
-                                            if total_count > 0:
-                                                print(f"    动作统计 (测试对局):")
-                                                # 按占比排序
-                                                sorted_actions = sorted(action_stats.items(), 
-                                                                      key=lambda x: x[1]['percentage'], 
-                                                                      reverse=True)
-                                                action_info = []
-                                                for action, stats in sorted_actions:
-                                                    count = stats['count']
-                                                    percentage = stats['percentage']
-                                                    avg_prob = stats['avg_probability']
-                                                    action_name = _get_action_name(action, game)
-                                                    action_info.append(f"{action_name}: {percentage:.1f}% (平均概率: {avg_prob:.3f})")
-                                                print(f"      {' | '.join(action_info)}")
-                                    else:
-                                        # vs_random模式：显示所有位置使用训练策略时的表现
-                                        print(f"    测试对局: {num_games} 局 (vs Random, 随机位置)")
-                                        # 显示各位置的表现
-                                        position_stats = []
-                                        for i in range(num_players):
-                                            trained_count = test_results.get(f'player{i}_trained_count', 0)
-                                            if trained_count > 0:
-                                                avg_return = test_results.get(f'player{i}_trained_avg_return', 0)
-                                                win_rate = test_results.get(f'player{i}_trained_win_rate', 0) * 100
-                                                if bb is not None and bb > 0:
-                                                    bb_value = avg_return / bb
-                                                    position_stats.append(f"玩家{i}: {trained_count}局, 回报{avg_return:.0f} ({bb_value:+.2f}BB), 胜率{win_rate:.0f}%")
-                                                else:
-                                                    position_stats.append(f"玩家{i}: {trained_count}局, 回报{avg_return:.0f}, 胜率{win_rate:.0f}%")
-                                        
-                                        if position_stats:
-                                            print(f"      {' | '.join(position_stats)}")
-                                        
-                                        # 显示总体统计
-                                        overall_avg_return = test_results.get('player0_avg_return', 0)
-                                        overall_win_rate = test_results.get('player0_win_rate', 0) * 100
-                                        if bb is not None and bb > 0:
-                                            bb_value = overall_avg_return / bb
-                                            print(f"      总体: 平均回报 {overall_avg_return:.2f} ({bb_value:+.2f} BB), 胜率 {overall_win_rate:.1f}%")
-                                        else:
-                                            print(f"      总体: 平均回报 {overall_avg_return:.2f}, 胜率 {overall_win_rate:.1f}%")
-                                        
-                                        # 打印测试对局中的动作平均占比
-                                        if test_results.get('action_statistics'):
-                                            from training_evaluator import _get_action_name
-                                            action_stats = test_results['action_statistics']
-                                            total_count = sum(s['count'] for s in action_stats.values())
-                                            if total_count > 0:
-                                                print(f"    动作统计 (测试对局):")
-                                                # 按占比排序
-                                                sorted_actions = sorted(action_stats.items(), 
-                                                                      key=lambda x: x[1]['percentage'], 
-                                                                      reverse=True)
-                                                action_info = []
-                                                for action, stats in sorted_actions:
-                                                    count = stats['count']
-                                                    percentage = stats['percentage']
-                                                    avg_prob = stats['avg_probability']
-                                                    action_name = _get_action_name(action, game)
-                                                    action_info.append(f"{action_name}: {percentage:.1f}% (平均概率: {avg_prob:.3f})")
-                                                print(f"      {' | '.join(action_info)}")
-                                        
-                                        # 检查是否应该开始过渡阶段
-                                        win_rate = test_results.get('player0_win_rate', None)
-                                        avg_return = test_results.get('player0_avg_return', None)
-                                        
-                                        # 转换为BB单位（如果需要）
-                                        if avg_return is not None and bb is not None and bb > 0:
-                                            avg_return_bb = avg_return / bb
-                                        else:
-                                            avg_return_bb = avg_return
-                                        
-                                        # 检查是否应该开始过渡阶段
-                                        self.should_start_transition(iteration, advantage_losses, win_rate, avg_return_bb)
-                        except ImportError:
-                            pass  # training_evaluator 不可用
-                        except Exception as e:
-                            print(f" 评估失败: {e}")
+                # 评估：只在checkpoint时评估（优化：减少评估时间）
+                # 评估逻辑已移到checkpoint部分
                 
-                    # 保存 checkpoint
-                    if checkpoint_interval > 0 and (iteration + 1) % checkpoint_interval == 0:
+                # 保存 checkpoint（同时训练策略网络和评估）
+                if checkpoint_interval > 0 and (iteration + 1) % checkpoint_interval == 0:
                         if model_dir and save_prefix and game:
                             get_logger().info(f"\n  💾 保存 checkpoint (迭代 {iteration + 1})...")
                             try:
-                                # 优化：checkpoint时只训练1次，提升保存速度
+                                # 1. 训练策略网络
                                 get_logger().info("    正在训练策略网络 (用于 Checkpoint)...")
                                 # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
                                 # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
@@ -2511,6 +2321,162 @@ class ParallelDeepCFRSolver:
                                 else:
                                     get_logger().info("    完成 (无足够样本训练)")
                                 
+                                # 2. 运行评估（checkpoint时评估）
+                                print()
+                                # 打印归一化的优势网络损失（除以iteration得到MSE）
+                                current_iter = iteration + 1
+                                for player, losses in advantage_losses.items():
+                                    if losses:
+                                        raw_loss = losses[-1]
+                                        # 归一化：除以iteration（因为损失值 = iteration * MSE）
+                                        # 归一化后的值就是MSE本身
+                                        mse = raw_loss / current_iter if current_iter > 0 else raw_loss
+                                        print(f"    玩家 {player} 优势网络损失: MSE={mse:.2f} (原始: {raw_loss:.2f})")
+                                
+                                # 打印归一化的策略网络损失（除以iteration得到MSE）
+                                if policy_losses:
+                                    raw_policy_loss = policy_losses[-1]
+                                    # 归一化：除以iteration（因为损失值 = iteration * MSE）
+                                    # 归一化后的值就是MSE本身
+                                    mse = raw_policy_loss / current_iter if current_iter > 0 else raw_policy_loss
+                                    print(f"    策略网络损失: MSE={mse:.6f} (原始: {raw_policy_loss:.2f})")
+                                
+                                # 运行评估
+                                if game is not None:
+                                    try:
+                                        from training_evaluator import quick_evaluate
+                                        print(f"  评估训练效果...", end="", flush=True)
+                                        eval_result = quick_evaluate(
+                                            game,
+                                            self,
+                                            include_test_games=eval_with_games,
+                                            num_test_games=num_test_games,
+                                            max_depth=None,
+                                            verbose=True  # 启用详细输出以查看错误
+                                        )
+                                        get_logger().info(" 完成")
+                                        
+                                        # 打印简要评估信息
+                                        metrics = eval_result['metrics']
+                                        print(f"    策略熵: {metrics.get('avg_entropy', 0):.4f} | "
+                                              f"策略缓冲区: {len(self._strategy_memories):,} | "
+                                              f"优势样本: {sum(len(m) for m in self._advantage_memories):,}")
+                                        
+                                        if eval_with_games and eval_result.get('test_results'):
+                                            test_results = eval_result['test_results']
+                                            num_games = test_results.get('games_played', 0)
+                                            mode = test_results.get('mode', 'unknown')
+                                            num_players = test_results.get('num_players', 0)
+                                            
+                                            # 获取大盲注值
+                                            bb = None
+                                            try:
+                                                game_string = str(game)
+                                                blind_match = re.search(r'blind=([\d\s]+)', game_string)
+                                                if blind_match:
+                                                    blinds = [int(x) for x in blind_match.group(1).strip().split()]
+                                                    bb = max([b for b in blinds if b > 0], default=None)
+                                            except:
+                                                pass
+                                            
+                                            if num_games > 0:
+                                                if mode == "self_play":
+                                                    # 自对弈模式：显示所有位置
+                                                    print(f"    测试对局: {num_games} 局 (自对弈)")
+                                                    for i in range(num_players):
+                                                        avg_return = test_results.get(f'player{i}_avg_return', 0)
+                                                        win_rate = test_results.get(f'player{i}_win_rate', 0) * 100
+                                                        if bb is not None and bb > 0:
+                                                            bb_value = avg_return / bb
+                                                            print(f"      玩家{i}: 平均回报 {avg_return:.2f} ({bb_value:+.2f} BB), 胜率 {win_rate:.1f}%")
+                                                        else:
+                                                            print(f"      玩家{i}: 平均回报 {avg_return:.2f}, 胜率 {win_rate:.1f}%")
+                                                    
+                                                    # 打印测试对局中的动作平均占比（自对弈模式）
+                                                    if test_results.get('action_statistics'):
+                                                        from training_evaluator import _get_action_name
+                                                        action_stats = test_results['action_statistics']
+                                                        total_count = sum(s['count'] for s in action_stats.values())
+                                                        if total_count > 0:
+                                                            print(f"    动作统计 (测试对局):")
+                                                            # 按占比排序
+                                                            sorted_actions = sorted(action_stats.items(), 
+                                                                                  key=lambda x: x[1]['percentage'], 
+                                                                                  reverse=True)
+                                                            action_info = []
+                                                            for action, stats in sorted_actions:
+                                                                count = stats['count']
+                                                                percentage = stats['percentage']
+                                                                avg_prob = stats['avg_probability']
+                                                                action_name = _get_action_name(action, game)
+                                                                action_info.append(f"{action_name}: {percentage:.1f}% (平均概率: {avg_prob:.3f})")
+                                                            print(f"      {' | '.join(action_info)}")
+                                                else:
+                                                    # vs_random模式：显示所有位置使用训练策略时的表现
+                                                    print(f"    测试对局: {num_games} 局 (vs Random, 随机位置)")
+                                                    # 显示各位置的表现
+                                                    position_stats = []
+                                                    for i in range(num_players):
+                                                        trained_count = test_results.get(f'player{i}_trained_count', 0)
+                                                        if trained_count > 0:
+                                                            avg_return = test_results.get(f'player{i}_trained_avg_return', 0)
+                                                            win_rate = test_results.get(f'player{i}_trained_win_rate', 0) * 100
+                                                            if bb is not None and bb > 0:
+                                                                bb_value = avg_return / bb
+                                                                position_stats.append(f"玩家{i}: {trained_count}局, 回报{avg_return:.0f} ({bb_value:+.2f}BB), 胜率{win_rate:.0f}%")
+                                                            else:
+                                                                position_stats.append(f"玩家{i}: {trained_count}局, 回报{avg_return:.0f}, 胜率{win_rate:.0f}%")
+                                                    
+                                                    if position_stats:
+                                                        print(f"      {' | '.join(position_stats)}")
+                                                    
+                                                    # 显示总体统计
+                                                    overall_avg_return = test_results.get('player0_avg_return', 0)
+                                                    overall_win_rate = test_results.get('player0_win_rate', 0) * 100
+                                                    if bb is not None and bb > 0:
+                                                        bb_value = overall_avg_return / bb
+                                                        print(f"      总体: 平均回报 {overall_avg_return:.2f} ({bb_value:+.2f} BB), 胜率 {overall_win_rate:.1f}%")
+                                                    else:
+                                                        print(f"      总体: 平均回报 {overall_avg_return:.2f}, 胜率 {overall_win_rate:.1f}%")
+                                                    
+                                                    # 打印测试对局中的动作平均占比
+                                                    if test_results.get('action_statistics'):
+                                                        from training_evaluator import _get_action_name
+                                                        action_stats = test_results['action_statistics']
+                                                        total_count = sum(s['count'] for s in action_stats.values())
+                                                        if total_count > 0:
+                                                            print(f"    动作统计 (测试对局):")
+                                                            # 按占比排序
+                                                            sorted_actions = sorted(action_stats.items(), 
+                                                                                  key=lambda x: x[1]['percentage'], 
+                                                                                  reverse=True)
+                                                            action_info = []
+                                                            for action, stats in sorted_actions:
+                                                                count = stats['count']
+                                                                percentage = stats['percentage']
+                                                                avg_prob = stats['avg_probability']
+                                                                action_name = _get_action_name(action, game)
+                                                                action_info.append(f"{action_name}: {percentage:.1f}% (平均概率: {avg_prob:.3f})")
+                                                            print(f"      {' | '.join(action_info)}")
+                                                    
+                                                    # 检查是否应该开始过渡阶段
+                                                    win_rate = test_results.get('player0_win_rate', None)
+                                                    avg_return = test_results.get('player0_avg_return', None)
+                                                    
+                                                    # 转换为BB单位（如果需要）
+                                                    if avg_return is not None and bb is not None and bb > 0:
+                                                        avg_return_bb = avg_return / bb
+                                                    else:
+                                                        avg_return_bb = avg_return
+                                                    
+                                                    # 检查是否应该开始过渡阶段
+                                                    self.should_start_transition(iteration, advantage_losses, win_rate, avg_return_bb)
+                                    except ImportError:
+                                        pass  # training_evaluator 不可用
+                                    except Exception as e:
+                                        print(f" 评估失败: {e}")
+                                
+                                # 3. 保存checkpoint
                                 save_checkpoint(self, game, model_dir, save_prefix, iteration + 1)
                                 get_logger().info("  ✓ Checkpoint 已保存")
                             except Exception as e:
@@ -2813,8 +2779,8 @@ def main():
                         help="从指定目录恢复训练（例如 --resume models/deepcfr_parallel_6p）")
     parser.add_argument("--eval_with_games", action="store_true",
                         help="评估时运行测试对局")
-    parser.add_argument("--num_test_games", type=int, default=50,
-                        help="评估时的测试对局数量（默认: 50）")
+    parser.add_argument("--num_test_games", type=int, default=1000,
+                        help="评估时的测试对局数量（默认: 1000）")
     parser.add_argument("--blinds", type=str, default=None,
                         help="盲注配置，格式：'小盲 大盲' 或 '50 100 0 0 0 0'（多人场完整配置）。如果不指定，将根据玩家数量自动生成")
     parser.add_argument("--stack_size", type=int, default=None,

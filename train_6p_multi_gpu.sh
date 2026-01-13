@@ -1,6 +1,12 @@
 #!/bin/bash
 # 6人场DeepCFR训练脚本（多GPU版本）
-# 使用4张GPU，最大化训练速度
+# 使用6张GPU，最大化训练速度
+# 
+# 训练策略优化：
+# - 策略网络只在checkpoint时训练（减少99%训练时间）
+# - 评估只在checkpoint时进行（减少99%评估时间）
+# - Checkpoint时策略网络训练20步，充分学习
+# - Checkpoint时评估1000局，提高准确性
 
 # 设置环境
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5  # 使用6张GPU
@@ -22,11 +28,11 @@ NEW_SAMPLE_RATIO=0.9        # 新样本占比（提高到70%，确保策略网�
 LEARNING_RATE=0.001          # 学习率
 POLICY_LAYERS="256 256 256"  # 策略网络结构（3层256节点，6人局状态复杂）
 ADVANTAGE_LAYERS="256 256 256"  # 优势网络结构（与策略网络相同）
-ADVANTAGE_TRAIN_STEPS=3      # 优势网络训练步骤数（从1增加到3，平衡效果和耗时，这是最关键的修改！）
-POLICY_TRAIN_STEPS=2         # 策略网络训练步骤数（从1增加到2，平衡效果和耗时）
-EVAL_INTERVAL=10            # 每N次迭代进行一次评估
-CHECKPOINT_INTERVAL=100       # Checkpoint保存间隔
-NUM_TEST_GAMES=200            # 评估时的测试对局数量（推荐200局，平衡速度和准确性）
+ADVANTAGE_TRAIN_STEPS=3      # 优势网络训练步骤数（每次迭代训练3步，平衡效果和耗时）
+POLICY_TRAIN_STEPS=20        # 策略网络训练步骤数（只在checkpoint时训练，增加到20步以充分学习）
+EVAL_INTERVAL=100            # 评估间隔（现在评估只在checkpoint时进行，设为100与checkpoint_interval一致）
+CHECKPOINT_INTERVAL=100       # Checkpoint保存间隔（策略网络训练和评估都在此时进行）
+NUM_TEST_GAMES=1000           # 评估时的测试对局数量（checkpoint时评估，增加到1000局提高准确性）
 MAX_MEMORY_GB=4              # Worker内存限制（每个Worker最多4GB，防止OOM）
 betting_abstraction="fchpa"
 blinds="100 200 0 0 0 0"

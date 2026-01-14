@@ -59,7 +59,8 @@ def vectorized_preflop_strength(hole_cards_bits, num_suits=4, num_ranks=13):
     # 统计每个 rank 的牌数
     rank_counts = card_indices.sum(dim=2)  # [batch, 13]
     has_card = (rank_counts > 0).float()
-    card_count = has_card.sum(dim=1, keepdim=True)  # [batch, 1]
+    # 修复：统计牌的总数，而不是有牌的 rank 数量
+    card_count = hole_cards_bits.sum(dim=1, keepdim=True)  # [batch, 1]
     
     # 1. 对子检测
     is_pair = (rank_counts == 2).any(dim=1, keepdim=True).float()  # [batch, 1]
@@ -131,9 +132,12 @@ def vectorized_hand_strength(hole_cards_bits, board_cards_bits, num_suits=4, num
     # 检测牌型
     has_four = (rank_counts == 4).any(dim=1, keepdim=True).float()
     has_three = (rank_counts >= 3).any(dim=1, keepdim=True).float()
-    pair_count = (rank_counts >= 2).sum(dim=1, keepdim=True).float()
-    has_pair = (pair_count >= 1).float()
-    has_two_pair = (pair_count >= 2).float()
+    # 修复：区分纯对子和三条以上
+    trips_count = (rank_counts >= 3).sum(dim=1, keepdim=True).float()  # 三条数量
+    pair_only_count = (rank_counts == 2).sum(dim=1, keepdim=True).float()  # 纯对子数量（不含三条）
+    total_pair_count = (rank_counts >= 2).sum(dim=1, keepdim=True).float()  # 所有>=2的rank数量
+    has_pair = (total_pair_count >= 1).float()
+    has_two_pair = (total_pair_count >= 2).float()
     has_flush = (suit_counts >= 5).any(dim=1, keepdim=True).float()
     
     # 顺子检测（向量化：使用卷积核）
@@ -141,15 +145,14 @@ def vectorized_hand_strength(hole_cards_bits, board_cards_bits, num_suits=4, num
     # A 可以做低牌 A-2-3-4-5
     rank_with_low_ace = torch.cat([rank_present[:, 12:13], rank_present], dim=1)  # [batch, 14]
     # 使用滑动求和检测顺子（5个连续rank）
-    # 展开为 [batch, 1, 14] 以便使用 unfold
     rank_expanded = rank_with_low_ace.unsqueeze(1)  # [batch, 1, 14]
-    # 使用 unfold 创建滑动窗口
     windows = rank_expanded.unfold(2, 5, 1)  # [batch, 1, 10, 5]
     window_sums = windows.sum(dim=3).squeeze(1)  # [batch, 10]
     has_straight = (window_sums >= 5).any(dim=1, keepdim=True).float()
     
-    # 葫芦和同花顺
-    has_full_house = (has_three * has_two_pair).float()
+    # 修复葫芦检测：三条 + 另一个对子（或另一个三条）
+    # 葫芦 = (有三条) & (有纯对子 或 有两个三条)
+    has_full_house = (has_three * ((pair_only_count >= 1) | (trips_count >= 2)).float()).float()
     has_straight_flush = (has_flush * has_straight).float()
     
     # 计算强度（使用条件累加避免多次 where）

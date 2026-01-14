@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5  # 使用6张GPU
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate open_spiel
 
-# 训练参数配置
+# 训练参数配置（针对 256核CPU + 503GB内存 + 8×RTX4090 优化）
 NUM_PLAYERS=6
 NUM_WORKERS=20               # Worker数量（增加到20，提高队列使用率，避免主进程sleep）
 NUM_ITERATIONS=20000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
@@ -28,12 +28,12 @@ NEW_SAMPLE_RATIO=0.7        # 新样本占比（0.7=70%新样本+30%老样本，
 LEARNING_RATE=0.001          # 学习率
 POLICY_LAYERS="256 256 256"  # 策略网络结构（3层256节点，6人局状态复杂）
 ADVANTAGE_LAYERS="256 256 256"  # 优势网络结构（与策略网络相同）
-ADVANTAGE_TRAIN_STEPS=2      # 优势网络训练步骤数（每次迭代训练3步，平衡效果和耗时）
-POLICY_TRAIN_STEPS=3        # 策略网络训练步骤数（只在checkpoint时训练，增加到20步以充分学习）
-EVAL_INTERVAL=10            # 评估间隔（现在评估只在checkpoint时进行，设为100与checkpoint_interval一致）
-CHECKPOINT_INTERVAL=10       # Checkpoint保存间隔（策略网络训练和评估都在此时进行）
-NUM_TEST_GAMES=1000           # 评估时的测试对局数量（checkpoint时评估，增加到1000局提高准确性）
-MAX_MEMORY_GB=4              # Worker内存限制（每个Worker最多4GB，防止OOM）
+ADVANTAGE_TRAIN_STEPS=2      # 优势网络训练步骤数
+POLICY_TRAIN_STEPS=3        # 策略网络训练步骤数（只在checkpoint时训练）
+EVAL_INTERVAL=100            # 评估间隔
+CHECKPOINT_INTERVAL=100       # Checkpoint保存间隔
+NUM_TEST_GAMES=1000           # 评估时的测试对局数量
+MAX_MEMORY_GB=6              # Worker内存限制（每个Worker最多6GB，总计约480GB）
 betting_abstraction="fchpa"
 blinds="100 200 0 0 0 0"
 stack_size=50000

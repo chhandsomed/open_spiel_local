@@ -839,7 +839,7 @@ class ParallelDeepCFRSolver:
         }
         self._adaptive_max_collect = {
             'base': 50000,  # 基础值（从20000增加到50000，提高消费速度）
-            'min': 10000,   # 最小值（从5000增加到10000）
+            'min': 25000,   # 最小值（从10000提高到25000，避免max_collect过低导致样本收集变慢）
             'max': 200000,  # 最大值（从100000增加到200000，允许更快消费）
             'current': 50000,  # 当前值
         }
@@ -1348,22 +1348,22 @@ class ParallelDeepCFRSolver:
             new_max_collect = int(new_max_collect * growth_factor)
         
         # 3. 根据CPU使用率调整（限制指标，避免CPU过载）
-        # 注意：如果队列使用率很高（>90%），优先处理队列积压，即使CPU高也要增加消费速度
+        # 优化：当队列中有样本时（使用率>5%），优先消费队列，不因CPU高而减速
+        # 这避免了"CPU高→max_collect减半→消费变慢→队列空→忙等待→CPU仍高"的恶性循环
         if cpu_percent is not None:
-            if max_queue_usage > 0.90:
-                # 队列使用率 > 90%，优先处理队列积压，即使CPU高也要增加消费速度
-                # 但如果CPU非常高（>95%），适当限制，避免系统过载
-                if cpu_percent > 95:
-                    # CPU > 95%，稍微限制，但不要减少太多
-                    cpu_factor = max(0.8, 1.0 - (cpu_percent - 95) / 10.0)  # 最多减少到0.8倍
+            if max_queue_usage > 0.05:
+                # 队列中有样本（使用率>5%），优先消费，不减少max_collect
+                # 只有在CPU极高（>98%）时才适当限制
+                if cpu_percent > 98:
+                    cpu_factor = max(0.9, 1.0 - (cpu_percent - 98) / 20.0)  # 最多减少到0.9倍
                     new_max_collect = int(new_max_collect * cpu_factor)
-                # 否则，队列积压优先，不限制消费速度
-            elif cpu_percent > 90:
-                # 队列使用率不高，但CPU使用率 > 90%，减少消费速度，避免CPU过载
-                cpu_factor = max(0.5, 1.0 - (cpu_percent - 90) / 20.0)  # 最多减少到0.5倍
+                # 否则不限制，优先清空队列
+            elif cpu_percent > 95:
+                # 队列几乎空（<5%）且CPU极高，适当减少消费速度（避免忙等待）
+                cpu_factor = max(0.7, 1.0 - (cpu_percent - 95) / 15.0)  # 最多减少到0.7倍
                 new_max_collect = int(new_max_collect * cpu_factor)
-            elif cpu_percent < 50 and max_queue_usage > 0.50:
-                # CPU使用率 < 50% 且队列使用率 > 50%，可以适当增加消费速度
+            elif cpu_percent < 50 and max_queue_usage > 0.30:
+                # CPU使用率 < 50% 且队列使用率 > 30%，可以适当增加消费速度
                 cpu_factor = min(1.2, 1.0 + (50 - cpu_percent) / 100.0)  # 最多增加1.2倍
                 new_max_collect = int(new_max_collect * cpu_factor)
         

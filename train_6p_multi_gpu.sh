@@ -17,14 +17,14 @@ conda activate open_spiel
 
 # 训练参数配置（针对 256核CPU + 503GB内存 + 8×RTX4090 优化）
 NUM_PLAYERS=6
-NUM_WORKERS=20               # Worker数量（增加到20，提高队列使用率，避免主进程sleep）
+NUM_WORKERS=40               # Worker数量（充分利用256核CPU，80个Worker约用80核）
 NUM_ITERATIONS=20000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
-NUM_TRAVERSALS=4096          # 每次迭代遍历次数（适配batch_size=4096，增加样本产生速度，保证新样本充足）
-BATCH_SIZE=4096              # 训练批量大小（多GPU时4096利用率高，适配其他参数）
-MEMORY_CAPACITY=360000      # 优势网络经验回放缓冲区容量（每个玩家，适配batch_size=4096）
-STRATEGY_MEMORY_CAPACITY=720000  # 策略网络经验回放缓冲区容量（增加到72万，保证新样本有足够保存时间）
-QUEUE_MAXSIZE=80000         # 队列最大大小（配合20个Worker，提高缓冲能力）
-NEW_SAMPLE_RATIO=0.7        # 新样本占比（0.7=70%新样本+30%老样本，使用numpy向量化加速）
+NUM_TRAVERSALS=4096          # 每次迭代遍历次数（增加样本产生速度，配合更多Worker）
+BATCH_SIZE=4096              # 训练批量大小（增大批量，充分利用GPU显存）
+MEMORY_CAPACITY=500000      # 优势网络经验回放缓冲区容量（100万/玩家，内存充足）
+STRATEGY_MEMORY_CAPACITY=1000000  # 策略网络经验回放缓冲区容量（200万，内存充足）
+QUEUE_MAXSIZE=150000         # 队列最大大小（配合80个Worker，更大缓冲能力）
+NEW_SAMPLE_RATIO=0.7        # 新样本占比（0.7=70%新样本+30%老样本）
 LEARNING_RATE=0.001          # 学习率
 POLICY_LAYERS="256 256 256"  # 策略网络结构（3层256节点，6人局状态复杂）
 ADVANTAGE_LAYERS="256 256 256"  # 优势网络结构（与策略网络相同）

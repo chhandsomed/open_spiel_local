@@ -18,7 +18,7 @@ conda activate open_spiel
 # 训练参数配置（针对 256核CPU + 503GB内存 + 8×RTX4090 优化）
 NUM_PLAYERS=6
 NUM_WORKERS=40               # Worker数量（充分利用256核CPU，80个Worker约用80核）
-NUM_ITERATIONS=20000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
+NUM_ITERATIONS=200000        # 迭代次数（DeepCFR收敛较慢，需要较多迭代）
 NUM_TRAVERSALS=4096          # 每次迭代遍历次数（增加样本产生速度，配合更多Worker）
 BATCH_SIZE=4096              # 训练批量大小（增大批量，充分利用GPU显存）
 MEMORY_CAPACITY=500000      # 优势网络经验回放缓冲区容量（100万/玩家，内存充足）

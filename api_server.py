@@ -73,11 +73,10 @@ def convert_user_card_to_openspiel(card_input) -> int:
     - 字符串格式：如 "As", "Kh", "2d", "Tc", "Xh"（传统格式，兼容）
     - 大小王：JL(小王), JB(大王) - 不支持
     
-    OpenSpiel格式（suit * 13 + rank）：
-    - Diamonds(0-12): suit=0
-    - Spades(13-25): suit=1
-    - Hearts(26-38): suit=2
-    - Clubs(39-51): suit=3
+    OpenSpiel (Universal Poker / ACPC) 格式：
+    - card_id = rank * 4 + suit
+    - rank: 2..A -> 0..12
+    - suit: c d h s -> 0..3  （见 open_spiel/games/universal_poker/logic/card_set.cc: kSuitChars = "cdhs"）
     
     Args:
         card_input: 用户输入的牌面，可以是：
@@ -87,32 +86,27 @@ def convert_user_card_to_openspiel(card_input) -> int:
     Returns:
         OpenSpiel的card index (0-51)
     """
-    # 如果是整数，直接转换
+    # 如果是整数：按“用户输入编码”解析，再转换到 OpenSpiel 编码
     if isinstance(card_input, int):
         user_index = card_input
         
         if user_index < 0 or user_index > 51:
             raise ValueError(f"Invalid card index: {user_index}, must be 0-51")
         
-        # 用户输入的花色顺序：方块[0-12] -> 梅花[13-25] -> 红桃[26-38] -> 黑桃[39-51]
-        # OpenSpiel顺序：方块[0-12] -> 黑桃[13-25] -> 红桃[26-38] -> 梅花[39-51]
-        
-        if 0 <= user_index <= 12:
-            # 方块：不变
-            return user_index  # 0-12
-        elif 13 <= user_index <= 25:
-            # 用户：梅花[13-25] -> OpenSpiel：梅花[39-51]
-            rank = user_index - 13
-            return 39 + rank  # 39-51
-        elif 26 <= user_index <= 38:
-            # 红桃：不变
-            return user_index  # 26-38
-        elif 39 <= user_index <= 51:
-            # 用户：黑桃[39-51] -> OpenSpiel：黑桃[13-25]
-            rank = user_index - 39
-            return 13 + rank  # 13-25
-        else:
-            raise ValueError(f"Invalid card index: {user_index}")
+        # 用户编码假设（你项目 README/注释中约定）：
+        # - suit order: Diamonds[0-12] -> Clubs[13-25] -> Hearts[26-38] -> Spades[39-51]
+        # - within suit: rank 2..A -> 0..12
+        user_suit_block = user_index // 13  # 0..3
+        rank = user_index % 13              # 0..12
+
+        # 映射用户花色到 OpenSpiel suit_id（cdhs -> 0..3）
+        # user: 0=d,1=c,2=h,3=s
+        user_to_os_suit = {0: 1, 1: 0, 2: 2, 3: 3}
+        if user_suit_block not in user_to_os_suit:
+            raise ValueError(f"Invalid card suit block: {user_suit_block}")
+        suit = user_to_os_suit[user_suit_block]
+
+        return rank * 4 + suit
     
     # 如果是字符串，处理传统格式或大小王
     elif isinstance(card_input, str):
@@ -135,13 +129,11 @@ def convert_user_card_to_openspiel(card_input) -> int:
 
 
 def card_string_to_index(card_str: str) -> int:
-    """将传统牌面字符串转换为OpenSpiel的card index (0-51)
-    
-    OpenSpiel格式：suit * 13 + rank
-    - Diamonds(0-12): suit=0
-    - Spades(13-25): suit=1
-    - Hearts(26-38): suit=2
-    - Clubs(39-51): suit=3
+    """将传统牌面字符串转换为 OpenSpiel (Universal Poker) 的 card_id (0-51)
+
+    OpenSpiel (Universal Poker / ACPC) 格式：
+    - card_id = rank * 4 + suit
+    - suit order: c d h s -> 0..3
     
     Args:
         card_str: 牌面字符串，如 "As", "Kh", "2d", "Tc", "Xh"
@@ -170,21 +162,15 @@ def card_string_to_index(card_str: str) -> int:
     
     rank = rank_names[rank_char]
     
-    # 转换suit: OpenSpiel顺序 Diamonds(0-12), Spades(13-25), Hearts(26-38), Clubs(39-51)
-    suit_map = {
-        'd': 0,  # Diamonds
-        's': 1,  # Spades
-        'h': 2,  # Hearts
-        'c': 3   # Clubs
-    }
+    # suit: cdhs -> 0..3
+    suit_map = {'c': 0, 'd': 1, 'h': 2, 's': 3}
     
     if suit_char not in suit_map:
         raise ValueError(f"Invalid suit: {suit_char}")
     
     suit = suit_map[suit_char]
     
-    # OpenSpiel格式：suit * 13 + rank
-    return suit * 13 + rank
+    return rank * 4 + suit
 
 
 def card_index_to_string(card_idx: int) -> str:
@@ -196,13 +182,37 @@ def card_index_to_string(card_idx: int) -> str:
     Returns:
         牌面字符串，如 "As", "Kh"
     """
-    suit_names = ['s', 'h', 'd', 'c']
+    # OpenSpiel (Universal Poker) 格式：card_id = rank * 4 + suit, suit order = cdhs
+    suit_names = ['c', 'd', 'h', 's']
     rank_names = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
-    
-    suit = card_idx % 4
+
     rank = card_idx // 4
-    
+    suit = card_idx % 4
+
     return rank_names[rank] + suit_names[suit]
+
+
+def extract_engine_hole_and_board_card_ids(state: pyspiel.State, player_id: int):
+    """从 OpenSpiel 的 information_state_tensor 提取引擎实际“认定”的底牌/公共牌（card_id 列表）"""
+    info_state = state.information_state_tensor(player_id)
+    num_players = state.get_game().num_players()
+
+    hole_cards_start = num_players
+    hole_cards_end = hole_cards_start + 52
+    board_cards_start = hole_cards_end
+    board_cards_end = board_cards_start + 52
+
+    hole_bits = info_state[hole_cards_start:hole_cards_end]
+    board_bits = info_state[board_cards_start:board_cards_end]
+
+    hole_ids = [i for i, bit in enumerate(hole_bits) if bit > 0.5]
+    board_ids = [i for i, bit in enumerate(board_bits) if bit > 0.5]
+    return hole_ids, board_ids
+
+
+def format_card_ids(card_ids):
+    """将 card_id 列表转换为稳定可读的字符串列表（按 card_id 排序，cdhs 花色序）"""
+    return [card_index_to_string(c) for c in sorted(card_ids)]
 
 
 # ==========================================
@@ -276,16 +286,31 @@ def normalize_info_state_action_sizings(info_state, game, max_stack=None):
             max_stack = 2000  # 默认值
     
     # 归一化action_sizings部分
-    # 使用log归一化：log(1 + amount) / log(1 + max_stack)
+    # 修复：使用log归一化相对比例（处理all-in情况，使用动态max_ratio）
     # 与训练时保持一致（deep_cfr_simple_feature.py）
     if action_sizings_start < len(info_state_np):
         action_sizings_end = action_sizings_start + max_game_length
         if action_sizings_end <= len(info_state_np):
-            # 使用log归一化，避免小注值太小被其他特征稀释
-            log_max_stack = np.log1p(max_stack)
-            info_state_np[action_sizings_start:action_sizings_end] = np.log1p(
-                np.maximum(info_state_np[action_sizings_start:action_sizings_end], 0)
-            ) / log_max_stack
+            # 计算底池大小（使用总下注作为近似）
+            action_sizings = info_state_np[action_sizings_start:action_sizings_end]
+            total_bet = np.sum(action_sizings)
+            pot_size = max(total_bet, 1.0)  # 使用总下注作为底池的近似
+            
+            # 动态计算最大比例：max_ratio = max_stack / pot_size
+            # 最大all-in就是手里的筹码，所以max_ratio = max_stack / pot_size
+            max_ratio = max_stack / pot_size
+            # 限制max_ratio的范围，避免极端情况
+            max_ratio = np.clip(max_ratio, 1.0, 100.0)
+            
+            # 计算相对比例
+            bet_ratio = action_sizings / pot_size
+            
+            # 使用log归一化：log(1 + ratio) / log(1 + max_ratio)
+            log_max_ratio = np.log1p(max_ratio)
+            info_state_np[action_sizings_start:action_sizings_end] = np.log1p(bet_ratio) / log_max_ratio
+            info_state_np[action_sizings_start:action_sizings_end] = np.clip(
+                info_state_np[action_sizings_start:action_sizings_end], 0.0, 1.0
+            )
     
     return info_state_np
 
@@ -441,33 +466,10 @@ def build_state_from_cards(
         # 注意：不在发牌过程中验证，因为此时 to_struct() 可能返回中间状态
         # 验证将在所有chance节点处理完后进行
     
-    # 处理chance节点：发公共牌
-    # 根据当前轮次决定发多少张公共牌
+    # 公共牌延迟发牌：不要在这里随机把后续街发完。
+    # 正确行为：进入对应街的 chance 节点时，优先按 board_indices 发你指定的牌；
+    # 未指定的牌（比如你只给了3张flop，但没给turn/river）再随机补齐。
     board_card_idx = 0
-    while state.is_chance_node() and board_card_idx < len(board_indices):
-        legal_actions = state.legal_actions()
-        if not legal_actions:
-            break
-        
-        target_card = board_indices[board_card_idx]
-        
-        if target_card in legal_actions:
-            state.apply_action(target_card)
-            board_card_idx += 1
-        else:
-            # 如果指定的牌不在legal_actions中，随机选择
-            action = random.choice(legal_actions)
-            state.apply_action(action)
-            board_card_idx += 1
-    
-    # 如果还有chance节点（说明公共牌还没发完），随机发完
-    # 这通常发生在需要发Turn或River牌时
-    while state.is_chance_node():
-        legal_actions = state.legal_actions()
-        if not legal_actions:
-            break
-        action = random.choice(legal_actions)
-        state.apply_action(action)
     
     # 在所有chance节点处理完后，验证当前玩家的手牌
     # 使用 information_state_tensor 验证（更准确），忽略手牌顺序
@@ -480,10 +482,10 @@ def build_state_from_cards(
         hole_cards_indices = [i for i, bit in enumerate(hole_cards_bits) if bit > 0.5]
         
         # 转换为字符串格式
-        suits = ['d', 's', 'h', 'c']  # OpenSpiel顺序
+        suits = ['c', 'd', 'h', 's']  # OpenSpiel Universal Poker: cdhs
         ranks = ['2','3','4','5','6','7','8','9','T','J','Q','K','A']
-        actual_hand_set = set([ranks[c%13] + suits[c//13] for c in hole_cards_indices])
-        expected_hand_set = set([f"{ranks[c%13]}{suits[c//13]}" for c in current_player_hole_indices])
+        actual_hand_set = set([ranks[c//4] + suits[c%4] for c in hole_cards_indices])
+        expected_hand_set = set([ranks[c//4] + suits[c%4] for c in current_player_hole_indices])
         
         # 忽略顺序，只比较牌的集合
         if actual_hand_set != expected_hand_set:
@@ -502,15 +504,29 @@ def build_state_from_cards(
         if state.is_terminal():
             break
         
-        # 如果遇到chance节点，说明需要发公共牌（Turn或River）
-        # 这种情况不应该出现在action_history中，因为后端只传玩家动作
-        # 但为了健壮性，我们处理一下
+        # 如果遇到chance节点：说明需要发公共牌（flop/turn/river）
+        # 修复：优先按用户传入的 board_indices 发牌，避免被随机发牌覆盖导致日志/特征不一致。
         chance_actions_applied = 0
         while state.is_chance_node():
             legal_actions = state.legal_actions()
             if not legal_actions:
                 break
-            # 随机发牌（这些牌不影响当前玩家的信息状态）
+
+            if board_card_idx < len(board_indices):
+                target = board_indices[board_card_idx]
+                if target in legal_actions:
+                    state.apply_action(target)
+                    chance_actions_applied += 1
+                    board_card_idx += 1
+                    continue
+                else:
+                    # 指定牌不在 legal_actions：记录并回退到随机（防止卡死）
+                    print(
+                        f"⚠️ 警告: 指定公共牌{target}不在legal_actions中，将随机发牌。legal_actions size={len(legal_actions)}",
+                        flush=True
+                    )
+
+            # 未指定（或指定不可用）时随机发牌
             chance_action = random.choice(legal_actions)
             state.apply_action(chance_action)
             chance_actions_applied += 1
@@ -545,12 +561,17 @@ def build_state_from_cards(
         action_history_debug[-1]['current_player_after'] = state.current_player()
         action_history_debug[-1]['is_terminal'] = state.is_terminal()
     
-    # 如果还有chance节点（说明需要发Turn或River），随机发完
+    # 如果动作应用完毕仍在 chance 节点：继续发剩余公共牌
+    # 修复：同样优先按 board_indices 发；未指定的再随机。
     while state.is_chance_node():
         legal_actions = state.legal_actions()
         if not legal_actions:
             break
-        state.apply_action(random.choice(legal_actions))
+        if board_card_idx < len(board_indices) and board_indices[board_card_idx] in legal_actions:
+            state.apply_action(board_indices[board_card_idx])
+            board_card_idx += 1
+        else:
+            state.apply_action(random.choice(legal_actions))
     
     # 验证状态重建：检查信息状态中的动作序列
     if len(action_history) > 0:
@@ -925,9 +946,9 @@ def load_model(model_dir, device='cpu', num_players=None):
             print(f"  ✓ 自动检测到特征维度: {detected_feature_size}维 ({'老版本' if detected_feature_size == 7 else '新版本'})")
             manual_feature_size = detected_feature_size
         else:
-            # 如果无法检测，默认使用新版本（1维）
-            print(f"  ⚠️  无法自动检测特征维度，使用默认值: 1维（新版本）")
-            manual_feature_size = 23
+            # 如果无法检测，默认使用新版本（27维）
+            print(f"  ⚠️  无法自动检测特征维度，使用默认值: 27维（新版本）")
+            manual_feature_size = 27
         
         # 创建 solver（指定特征维度）
         solver = DeepCFRSimpleFeature(
@@ -1029,9 +1050,9 @@ def load_model(model_dir, device='cpu', num_players=None):
             print(f"  ✓ 自动检测到特征维度: {detected_feature_size}维")
             manual_feature_size = detected_feature_size
         else:
-            # 如果无法检测，默认使用23维（增强版本）
-            print(f"  ⚠️  无法自动检测特征维度，使用默认值: 23维")
-            manual_feature_size = 23
+            # 如果无法检测，默认使用27维（增强版本）
+            print(f"  ⚠️  无法自动检测特征维度，使用默认值: 27维")
+            manual_feature_size = 27
         
         # 从state_dict推断网络层大小
         # 查找所有mlp.model.*._weight键，提取隐藏层大小
@@ -1277,19 +1298,22 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             
             if action_sizings_start < len(info_state_raw):
                 original_sizings = info_state_raw[action_sizings_start:action_sizings_end].copy()
-                nonzero_original = [(i, float(s)) for i, s in enumerate(original_sizings) if abs(s) > 1e-6]
-                if nonzero_original:
-                    print(f"💰 归一化前action_sizings(非零): {nonzero_original[:10]}", flush=True)
-                    print(f"💰 max_stack用于归一化: {max_stack}", flush=True)
+                # 打印所有归一化前的sizing特征（不只是非零值）
+                print(f"\n💰 归一化前action_sizings (全部 {len(original_sizings)} 个):", flush=True)
+                for i, s in enumerate(original_sizings):
+                    if abs(s) > 1e-6:  # 只打印非零值
+                        print(f"   [{i}]: {float(s):.6f}", flush=True)
+                print(f"💰 max_stack用于归一化: {max_stack}", flush=True)
             
             info_state_raw = normalize_info_state_action_sizings(info_state_raw, state.get_game(), max_stack)
             
-            # 打印归一化后的值
+            # 打印归一化后的值（所有值）
             if action_sizings_start < len(info_state_raw):
                 normalized_sizings = info_state_raw[action_sizings_start:action_sizings_end]
-                nonzero_normalized = [(i, float(s)) for i, s in enumerate(normalized_sizings) if abs(s) > 1e-6]
-                if nonzero_normalized:
-                    print(f"💰 归一化后action_sizings(非零): {nonzero_normalized[:10]}", flush=True)
+                print(f"\n💰 归一化后action_sizings (全部 {len(normalized_sizings)} 个):", flush=True)
+                for i, s in enumerate(normalized_sizings):
+                    if abs(s) > 1e-6:  # 只打印非零值
+                        print(f"   [{i}]: {float(s):.6f}", flush=True)
             
             info_state = torch.FloatTensor(info_state_raw).unsqueeze(0).to(device)
             
@@ -1305,15 +1329,19 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             board_cards = [i for i, bit in enumerate(board_cards_bits) if bit > 0.5]
             
             def card_index_to_string(card_idx):
-                """将OpenSpiel的card index转换为字符串"""
-                suits = ['d', 's', 'h', 'c']  # OpenSpiel的顺序：Diamonds(0-12), Spades(13-25), Hearts(26-38), Clubs(39-51)
+                """将 OpenSpiel (Universal Poker) 的 card_id 转换为字符串（rank*4+suit, cdhs）"""
+                suits = ['c', 'd', 'h', 's']
                 ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
-                suit_idx = card_idx // 13
-                rank_idx = card_idx % 13
+                rank_idx = card_idx // 4
+                suit_idx = card_idx % 4
                 return ranks[rank_idx] + suits[suit_idx]
             
             hole_cards_str = [card_index_to_string(c) for c in hole_cards]
             board_cards_str = [card_index_to_string(c) for c in board_cards] if board_cards else []
+
+            # 额外调试：打印原始 card index，避免“字符串解码错位”导致误判
+            print(f"   [Debug] hole_cards index: {hole_cards}", flush=True)
+            print(f"   [Debug] board_cards index: {board_cards}", flush=True)
             
             # 验证位置和手牌一致性
             position_encoding = info_state_raw[:num_players]
@@ -1392,6 +1420,98 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             print(f"   原因: 位置编码映射会导致位置和手牌不一致，影响模型推理", flush=True)
             print(f"   位置编码表示'我是player'，不应该改变", flush=True)
             print(f"   手牌编码是相对于实际player的，不应该映射", flush=True)
+            
+                        # 🔍 特征传递验证：检查SimpleFeatureMLP是否正确提取特征
+            policy_net = model._policy_network
+            if isinstance(policy_net, nn.DataParallel):
+                policy_net = policy_net.module
+            
+            # 检查是否是SimpleFeatureMLP
+            is_simple_feature = hasattr(policy_net, 'extract_manual_features')
+            if is_simple_feature:
+                print(f"\n🔍 特征传递验证:", flush=True)
+                print(f"   模型类型: SimpleFeatureMLP", flush=True)
+                print(f"   原始输入维度: {info_state.shape[1]}", flush=True)
+                print(f"   期望原始输入维度: {policy_net.raw_input_size}", flush=True)
+                print(f"   手动特征维度: {policy_net.manual_feature_size}", flush=True)
+                
+                # 提取手动特征
+                with torch.no_grad():
+                    manual_features = policy_net.extract_manual_features(info_state)
+                    print(f"   提取的手动特征维度: {manual_features.shape}", flush=True)
+                    
+                    # 打印所有自定义特征
+                    print(f"\n📊 所有自定义特征 (共 {manual_features.shape[1]} 维):", flush=True)
+                    feature_names = []
+                    if manual_features.shape[1] == 27:
+                        # 27维特征结构（根据deep_cfr_simple_feature.py第691-769行）：
+                        # 1. 起手牌强度(1) + 2. 当前手牌强度(1) + 3. 是否中牌(1) +
+                        # 4. 成牌特征(8) + 5. 听牌特征(4) + 6. 公共牌特征(3) + 7. 游戏轮次(4) +
+                        # 8. 手牌强度变化(1) + 9. 下注统计特征(2) + 10. 是否有人加注/全押(2)
+                        feature_names = [
+                            "[0] 起手牌强度(加权1.5倍)", "[1] 当前手牌强度", "[2] 是否中牌",
+                            "[3] 成牌-一对", "[4] 成牌-两对", "[5] 成牌-三条", "[6] 成牌-顺子", 
+                            "[7] 成牌-同花", "[8] 成牌-葫芦", "[9] 成牌-四条", "[10] 成牌-同花顺",
+                            "[11] 听牌-同花听牌", "[12] 听牌-同花补牌数", "[13] 听牌-顺子听牌", "[14] 听牌-顺子补牌数",
+                            "[15] 公共牌-强度", "[16] 公共牌-是否同花面", "[17] 公共牌-是否顺子面",
+                            "[18] 游戏轮次-Preflop", "[19] 游戏轮次-Flop", "[20] 游戏轮次-Turn", "[21] 游戏轮次-River",
+                            "[22] 手牌强度变化", "[23] 下注统计-最大下注", "[24] 下注统计-总下注",
+                            "[25] 是否有人加注", "[26] 是否有人全押"
+                        ]
+                    elif manual_features.shape[1] == 28:
+                        # 兼容旧版本28维特征（向后兼容）
+                        feature_names = [
+                            "[0] 起手牌强度(加权1.5倍)", "[1] 当前手牌强度", "[2] 是否中牌",
+                            "[3] 成牌-一对", "[4] 成牌-两对", "[5] 成牌-三条", "[6] 成牌-顺子", 
+                            "[7] 成牌-同花", "[8] 成牌-葫芦", "[9] 成牌-四条", "[10] 成牌-同花顺",
+                            "[11] 听牌-同花听牌", "[12] 听牌-同花补牌数", "[13] 听牌-顺子听牌", "[14] 听牌-顺子补牌数", "[15] 听牌-补牌权益",
+                            "[16] 公共牌-强度", "[17] 公共牌-是否同花面", "[18] 公共牌-是否顺子面",
+                            "[19] 游戏轮次-Preflop", "[20] 游戏轮次-Flop", "[21] 游戏轮次-Turn", "[22] 游戏轮次-River",
+                            "[23] 手牌强度变化", "[24] 下注统计-最大下注", "[25] 下注统计-总下注",
+                            "[26] 是否有人加注", "[27] 是否有人全押"
+                        ]
+                    elif manual_features.shape[1] == 7:
+                        feature_names = [
+                            "起手牌强度", "当前手牌强度", "成牌特征", "位置特征", 
+                            "下注轮次特征", "底池赔率特征", "相对位置特征"
+                        ]
+                    elif manual_features.shape[1] == 1:
+                        feature_names = ["手牌强度"]
+                    else:
+                        feature_names = [f"特征{i}" for i in range(manual_features.shape[1])]
+                    
+                    for i in range(manual_features.shape[1]):
+                        feature_value = manual_features[0, i].item()
+                        if i < len(feature_names):
+                            feature_name = feature_names[i]
+                        else:
+                            feature_name = f"特征{i}"
+                        print(f"   {feature_name}: {feature_value:.6f}", flush=True)
+                    
+                    # 检查forward方法会如何处理输入
+                    expected_combined_size = policy_net.raw_input_size + policy_net.manual_feature_size
+                    print(f"   期望组合输入维度: {expected_combined_size}", flush=True)
+                    print(f"   实际输入维度: {info_state.shape[1]}", flush=True)
+                    
+                    if info_state.shape[1] == policy_net.raw_input_size:
+                        print(f"   ✅ 输入维度匹配，forward方法会自动提取特征", flush=True)
+                    elif info_state.shape[1] == expected_combined_size:
+                        print(f"   ⚠️ 输入已包含特征，forward方法将直接使用", flush=True)
+                    else:
+                        # 这里并不一定是“致命错误”：
+                        # SimpleFeatureMLP.forward 里有 Auto-adapt 逻辑，会尝试把不同 max_game_length 的输入裁剪/补零适配回训练维度。
+                        # 但这通常意味着你本次请求的 game 配置（尤其 stacks/blinds）与训练时不同，可能带来分布偏移。
+                        current_dim = int(info_state.shape[1])
+                        raw_dim = int(policy_net.raw_input_size)
+                        header_size = int(num_players + 52 + 52)
+                        msg = f"   ⚠️ 输入维度与训练不一致: current={current_dim}, expected_raw={raw_dim}（模型将尝试自动适配）"
+                        if (current_dim - header_size) % 3 == 0 and (raw_dim - header_size) % 3 == 0:
+                            L_new = (current_dim - header_size) // 3
+                            L_old = (raw_dim - header_size) // 3
+                            msg += f", 推测 max_game_length={L_new} -> {L_old}（game.max_game_length={state.get_game().max_game_length()}）"
+                        print(msg, flush=True)
+            else:
+                print(f"\n🔍 特征传递验证: 模型不是SimpleFeatureMLP，跳过特征检查", flush=True)
             
             with torch.no_grad():
                 logits = model._policy_network(info_state)
@@ -1504,12 +1624,36 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
             max_stack = 2000  # 默认值
     
     # 归一化action_sizings
+    # 打印归一化前的sizing特征
+    num_players = state.get_game().num_players()
+    max_game_length = state.get_game().max_game_length()
+    header_size = num_players + 52 + 52
+    action_seq_size = max_game_length * 2
+    action_sizings_start = header_size + action_seq_size
+    action_sizings_end = action_sizings_start + max_game_length
+    
+    if action_sizings_start < len(info_state_raw):
+        original_sizings = info_state_raw[action_sizings_start:action_sizings_end].copy()
+        # 打印所有归一化前的sizing特征（不只是非零值）
+        print(f"\n💰 归一化前action_sizings (全部 {len(original_sizings)} 个):", flush=True)
+        for i, s in enumerate(original_sizings):
+            if abs(s) > 1e-6:  # 只打印非零值
+                print(f"   [{i}]: {float(s):.6f}", flush=True)
+        print(f"💰 max_stack用于归一化: {max_stack}", flush=True)
+    
     info_state_raw = normalize_info_state_action_sizings(info_state_raw, state.get_game(), max_stack)
+    
+    # 打印归一化后的值（所有值）
+    if action_sizings_start < len(info_state_raw):
+        normalized_sizings = info_state_raw[action_sizings_start:action_sizings_end]
+        print(f"\n💰 归一化后action_sizings (全部 {len(normalized_sizings)} 个):", flush=True)
+        for i, s in enumerate(normalized_sizings):
+            if abs(s) > 1e-6:  # 只打印非零值
+                print(f"   [{i}]: {float(s):.6f}", flush=True)
     
     info_state = torch.FloatTensor(info_state_raw).unsqueeze(0).to(device)
     
     # 打印手牌和公共牌信息（用于调试）
-    num_players = state.get_game().num_players()
     hole_cards_start = num_players
     hole_cards_end = hole_cards_start + 52
     board_cards_start = hole_cards_end
@@ -1521,15 +1665,19 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
     board_cards = [i for i, bit in enumerate(board_cards_bits) if bit > 0.5]
     
     def card_index_to_string(card_idx):
-        """将OpenSpiel的card index转换为字符串"""
-        suits = ['d', 's', 'h', 'c']  # OpenSpiel的顺序：Diamonds(0-12), Spades(13-25), Hearts(26-38), Clubs(39-51)
+        """将 OpenSpiel (Universal Poker) 的 card_id 转换为字符串（rank*4+suit, cdhs）"""
+        suits = ['c', 'd', 'h', 's']
         ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
-        suit_idx = card_idx // 13
-        rank_idx = card_idx % 13
+        rank_idx = card_idx // 4
+        suit_idx = card_idx % 4
         return ranks[rank_idx] + suits[suit_idx]
     
     hole_cards_str = [card_index_to_string(c) for c in hole_cards]
     board_cards_str = [card_index_to_string(c) for c in board_cards] if board_cards else []
+    
+    # 额外调试：打印原始 card index，避免“字符串解码错位”导致误判
+    print(f"   [Debug] hole_cards index: {hole_cards}", flush=True)
+    print(f"   [Debug] board_cards index: {board_cards}", flush=True)
     
     # 验证位置和手牌一致性
     position_encoding = info_state_raw[:num_players]
@@ -1566,6 +1714,92 @@ def get_recommended_action(state, model, device='cpu', dealer_pos=None):
     print(f"   原因: 位置编码映射会导致位置和手牌不一致，影响模型推理", flush=True)
     print(f"   位置编码表示'我是player'，不应该改变", flush=True)
     print(f"   手牌编码是相对于实际player的，不应该映射", flush=True)
+    
+    # 检查是否是SimpleFeatureMLP（老模型可能也是SimpleFeatureMLP）
+    policy_net = actual_model
+    if isinstance(policy_net, nn.DataParallel):
+        policy_net = policy_net.module
+    
+    is_simple_feature = hasattr(policy_net, 'extract_manual_features')
+    if is_simple_feature:
+        print(f"\n🔍 标准Network模型，检测到SimpleFeatureMLP，提取自定义特征:", flush=True)
+        print(f"   模型类型: SimpleFeatureMLP", flush=True)
+        print(f"   原始输入维度: {info_state.shape[1]}", flush=True)
+        print(f"   期望原始输入维度: {policy_net.raw_input_size}", flush=True)
+        print(f"   手动特征维度: {policy_net.manual_feature_size}", flush=True)
+        
+        # 提取手动特征
+        with torch.no_grad():
+            manual_features = policy_net.extract_manual_features(info_state)
+            print(f"   提取的手动特征维度: {manual_features.shape}", flush=True)
+            
+            # 打印所有自定义特征
+            print(f"\n📊 所有自定义特征 (共 {manual_features.shape[1]} 维):", flush=True)
+            feature_names = []
+            if manual_features.shape[1] == 27:
+                # 27维特征结构（修复：移除补牌权益特征）
+                feature_names = [
+                    "[0] 起手牌强度(加权1.5倍)", "[1] 当前手牌强度", "[2] 是否中牌",
+                    "[3] 成牌-一对", "[4] 成牌-两对", "[5] 成牌-三条", "[6] 成牌-顺子", 
+                    "[7] 成牌-同花", "[8] 成牌-葫芦", "[9] 成牌-四条", "[10] 成牌-同花顺",
+                    "[11] 听牌-同花听牌", "[12] 听牌-同花补牌数", "[13] 听牌-顺子听牌", "[14] 听牌-顺子补牌数",
+                    "[15] 公共牌-强度", "[16] 公共牌-是否同花面", "[17] 公共牌-是否顺子面",
+                    "[18] 游戏轮次-Preflop", "[19] 游戏轮次-Flop", "[20] 游戏轮次-Turn", "[21] 游戏轮次-River",
+                    "[22] 手牌强度变化", "[23] 下注统计-最大下注", "[24] 下注统计-总下注",
+                    "[25] 是否有人加注", "[26] 是否有人全押"
+                ]
+            elif manual_features.shape[1] == 28:
+                # 兼容旧版本28维特征（向后兼容）
+                feature_names = [
+                    "[0] 起手牌强度(加权1.5倍)", "[1] 当前手牌强度", "[2] 是否中牌",
+                    "[3] 成牌-一对", "[4] 成牌-两对", "[5] 成牌-三条", "[6] 成牌-顺子", 
+                    "[7] 成牌-同花", "[8] 成牌-葫芦", "[9] 成牌-四条", "[10] 成牌-同花顺",
+                    "[11] 听牌-同花听牌", "[12] 听牌-同花补牌数", "[13] 听牌-顺子听牌", "[14] 听牌-顺子补牌数", "[15] 听牌-补牌权益",
+                    "[16] 公共牌-强度", "[17] 公共牌-是否同花面", "[18] 公共牌-是否顺子面",
+                    "[19] 游戏轮次-Preflop", "[20] 游戏轮次-Flop", "[21] 游戏轮次-Turn", "[22] 游戏轮次-River",
+                    "[23] 手牌强度变化", "[24] 下注统计-最大下注", "[25] 下注统计-总下注",
+                    "[26] 是否有人加注", "[27] 是否有人全押"
+                ]
+            elif manual_features.shape[1] == 7:
+                feature_names = [
+                    "起手牌强度", "当前手牌强度", "成牌特征", "位置特征", 
+                    "下注轮次特征", "底池赔率特征", "相对位置特征"
+                ]
+            elif manual_features.shape[1] == 1:
+                feature_names = ["手牌强度"]
+            else:
+                feature_names = [f"特征{i}" for i in range(manual_features.shape[1])]
+            
+            for i in range(manual_features.shape[1]):
+                feature_value = manual_features[0, i].item()
+                if i < len(feature_names):
+                    feature_name = feature_names[i]
+                else:
+                    feature_name = f"特征{i}"
+                print(f"   {feature_name}: {feature_value:.6f}", flush=True)
+            
+            # 检查forward方法会如何处理输入
+            expected_combined_size = policy_net.raw_input_size + policy_net.manual_feature_size
+            print(f"   期望组合输入维度: {expected_combined_size}", flush=True)
+            print(f"   实际输入维度: {info_state.shape[1]}", flush=True)
+            
+            if info_state.shape[1] == policy_net.raw_input_size:
+                print(f"   ✅ 输入维度匹配，forward方法会自动提取特征", flush=True)
+            elif info_state.shape[1] == expected_combined_size:
+                print(f"   ⚠️ 输入已包含特征，forward方法将直接使用", flush=True)
+            else:
+                # 同上：SimpleFeatureMLP.forward 里有 Auto-adapt，会裁剪/补零回 raw_input_size。
+                current_dim = int(info_state.shape[1])
+                raw_dim = int(policy_net.raw_input_size)
+                header_size = int(num_players + 52 + 52)
+                msg = f"   ⚠️ 输入维度与训练不一致: current={current_dim}, expected_raw={raw_dim}（模型将尝试自动适配）"
+                if (current_dim - header_size) % 3 == 0 and (raw_dim - header_size) % 3 == 0:
+                    L_new = (current_dim - header_size) // 3
+                    L_old = (raw_dim - header_size) // 3
+                    msg += f", 推测 max_game_length={L_new} -> {L_old}（game.max_game_length={state.get_game().max_game_length()}）"
+                print(msg, flush=True)
+    else:
+        print(f"\n🔍 标准Network模型，不是SimpleFeatureMLP，无自定义特征", flush=True)
     
     # 不再进行位置编码映射，直接使用原始信息状态
     # 处理 DataParallel（老模型可能也有）
@@ -1666,6 +1900,14 @@ def recommend_action():
     
     try:
         data = request.get_json()
+
+        # 调试：完整打印请求体（避免中文转义；便于定位“偶发维度变化”是否来自 stacks/blinds 等入参）
+        try:
+            print("📦 原始请求JSON:", flush=True)
+            print(json.dumps(data, ensure_ascii=False, sort_keys=True), flush=True)
+        except Exception:
+            # 打印失败不影响主流程
+            pass
         
         # 验证输入
         if 'player_id' not in data:
@@ -1705,8 +1947,14 @@ def recommend_action():
         stacks = data.get('stacks', None)
         seed = data.get('seed', None)
         
-        # 调试：打印接收到的action_history和action_sizings
-        print(f"📋 接收到的请求数据: player_id={player_id}, action_history={action_history}, action_sizings={action_sizings}", flush=True)
+        # 调试：打印接收到的关键字段（快速扫一眼）
+        print(
+            f"📋 接收到的请求数据: player_id={player_id}, dealer_pos={data.get('dealer_pos', None)}, "
+            f"hole_cards={hole_cards}, board_cards={board_cards}, "
+            f"action_history={action_history}, action_sizings={action_sizings}, "
+            f"blinds={blinds}, stacks={stacks}, seed={seed}",
+            flush=True
+        )
         
         # 验证action_sizings长度（如果提供）
         if action_sizings is not None and len(action_sizings) != len(action_history):
@@ -1737,7 +1985,60 @@ def recommend_action():
         dealer_pos = data.get('dealer_pos', None)  # 获取dealer_pos（用于位置编码映射）
         print(f"\n📥 API请求接收: player_id={player_id}, dealer_pos={dealer_pos}, blinds={blinds is not None}, stacks={stacks is not None}", flush=True)
         if blinds is not None and stacks is not None:
-            betting_abstraction = CONFIG.get('betting_abstraction', 'fchpa') if CONFIG else 'fchpa'
+            # 关键：必须使用“当前场次(num_players)对应模型”的配置来创建 game。
+            # 否则可能误用全局 CONFIG（例如另一场次/另一 bettingAbstraction），导致 game.max_game_length 变化，
+            # 进而 information_state_tensor 长度变化，触发“输入维度不匹配”。
+            cfg = CONFIGS.get(num_players, None) or CONFIG
+            betting_abstraction = cfg.get('betting_abstraction', 'fchpa') if cfg else 'fchpa'
+
+            # ==========================
+            # 🧯 应急方案：stack 尺度归一化到训练尺度
+            # ==========================
+            # 场景：大小盲与训练一致，但推理时 stack 深度变化会导致 game.max_game_length 变化，
+            # 进而 info_state 维度变化，触发模型 Auto-adapt（裁剪/补零），造成“下注/动作相关特征”失真。
+            #
+            # 做法：当 blinds 与训练一致且 stacks 与训练 stack_size 不一致时，
+            # 将 stacks（以及 action_sizings，如果提供）按同一比例缩放到训练 stack_size，再创建 game。
+            try:
+                train_stack_size = None
+                if cfg is not None:
+                    train_stack_size = cfg.get('stack_size', None)
+
+                # 解析训练 blinds（config 里一般是字符串 "100 200 0 0 0 0"）
+                train_blinds = None
+                if cfg is not None:
+                    bs = cfg.get('blinds', None)
+                    if isinstance(bs, str):
+                        train_blinds = [int(x) for x in bs.strip().split()]
+                    elif isinstance(bs, list):
+                        train_blinds = [int(x) for x in bs]
+
+                blinds_match_train = (train_blinds is None) or (list(map(int, blinds)) == train_blinds)
+
+                if blinds_match_train and train_stack_size is not None and stacks is not None:
+                    # 用最大非零 stack 作为尺度（常见是所有玩家相同）
+                    nonzero_stacks = [float(s) for s in stacks if float(s) > 0]
+                    if nonzero_stacks:
+                        req_stack_scale_base = max(nonzero_stacks)
+                        if req_stack_scale_base > 0 and float(train_stack_size) > 0:
+                            scale = float(train_stack_size) / float(req_stack_scale_base)
+                            # 只有当确实不一致时才缩放（避免无意义浮点误差）
+                            if abs(scale - 1.0) > 1e-9:
+                                orig_stacks = stacks
+                                stacks = [int(round(float(s) * scale)) if float(s) > 0 else int(s) for s in stacks]
+                                if action_sizings is not None:
+                                    action_sizings = [float(x) * scale for x in action_sizings]
+
+                                print(
+                                    f"🧯 [EmergencyStackNormalize] "
+                                    f"train_stack_size={train_stack_size} req_stack_base={req_stack_scale_base} "
+                                    f"scale={scale:.6f} stacks(orig)->scaled: {orig_stacks} -> {stacks}",
+                                    flush=True
+                                )
+            except Exception as _e:
+                # 应急归一化失败不影响主流程（但可能继续触发维度变化）
+                pass
+
             game = create_game_with_config(num_players, blinds, stacks, betting_abstraction, dealer_pos)
         else:
             # 使用全局游戏实例（从模型配置加载）
@@ -1748,6 +2049,17 @@ def recommend_action():
                     'error': 'Game not loaded and no blinds/stacks provided'
                 }), 500
             game = GAME
+
+        # 调试：打印本次 game 配置摘要（max_game_length 直接决定信息状态维度）
+        try:
+            print(
+                f"🎮 game摘要: num_players={game.num_players()} betting_abstraction="
+                f"{(CONFIGS.get(num_players, None) or CONFIG or {}).get('betting_abstraction', 'N/A')}, "
+                f"max_game_length={game.max_game_length()} game={str(game)[:200]}",
+                flush=True
+            )
+        except Exception:
+            pass
         
         # 验证手牌数量
         if len(hole_cards) != 2:
@@ -1767,6 +2079,51 @@ def recommend_action():
             action_sizings=action_sizings,  # 传递action_sizings用于验证
             seed=seed
         )
+
+        # 对照打印：API收到的牌 vs OpenSpiel引擎实际发到状态里的牌
+        # 说明：
+        # - 使用 information_state_tensor(player_id) 抽取引擎视角下该玩家的手牌 & 公共牌
+        # - 统一转成 OpenSpiel card_id 再比较，避免字符串花色顺序/大小写差异导致误判
+        try:
+            api_hole_ids = [convert_user_card_to_openspiel(c) for c in hole_cards]
+            api_board_ids = [convert_user_card_to_openspiel(c) for c in board_cards]
+            engine_hole_ids, engine_board_ids = extract_engine_hole_and_board_card_ids(state, player_id)
+
+            api_hole_set = set(api_hole_ids)
+            api_board_set = set(api_board_ids)
+            engine_hole_set = set(engine_hole_ids)
+            engine_board_set = set(engine_board_ids)
+
+            hole_match = (api_hole_set == engine_hole_set)
+            board_match = (api_board_set == engine_board_set)
+            board_subset = api_board_set.issubset(engine_board_set)
+
+            print(
+                f"🃏 [CardCheck] player={player_id} "
+                f"api_hole={hole_cards}({format_card_ids(api_hole_ids)}) "
+                f"api_board={board_cards}({format_card_ids(api_board_ids)}) | "
+                f"engine_hole={format_card_ids(engine_hole_ids)} "
+                f"engine_board={format_card_ids(engine_board_ids)} | "
+                f"hole_match={hole_match} board_match={board_match}",
+                flush=True
+            )
+
+            if (not hole_match) or (not board_subset) or (len(api_board_ids) != len(engine_board_ids)):
+                # 详细差异（只在不一致时打印）
+                hole_missing = format_card_ids(list(api_hole_set - engine_hole_set))
+                hole_extra = format_card_ids(list(engine_hole_set - api_hole_set))
+                board_missing = format_card_ids(list(api_board_set - engine_board_set))
+                board_extra = format_card_ids(list(engine_board_set - api_board_set))
+                print(
+                    f"⚠️ [CardCheckMismatch] player={player_id} "
+                    f"hole_missing={hole_missing} hole_extra={hole_extra} "
+                    f"board_missing={board_missing} board_extra={board_extra} "
+                    f"(api_board_len={len(api_board_ids)}, engine_board_len={len(engine_board_ids)})",
+                    flush=True
+                )
+        except Exception as _e:
+            # 对照打印失败不影响主流程
+            pass
         
         # 验证状态
         if state.is_terminal():

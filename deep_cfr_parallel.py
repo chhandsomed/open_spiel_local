@@ -181,7 +181,7 @@ class RandomReplacementBuffer:
         self._initialized = True
     
     def add(self, element):
-        """添加样本（Reservoir Sampling）"""
+        """添加样本（FIFO替换，确保新样本不会被随机替换掉）"""
         if self._capacity == 0:
             return
         
@@ -193,11 +193,9 @@ class RandomReplacementBuffer:
             idx = self._size
             self._size += 1
         else:
-            # Reservoir Sampling: 以 capacity/(add_calls+1) 的概率替换随机位置
-            idx = np.random.randint(0, self._add_calls + 1)
-            if idx >= self._capacity:
-                self._add_calls += 1
-                return  # 不替换
+            # FIFO替换：循环替换，确保新样本不会被随机替换掉
+            # 这样可以保持样本的时效性，新样本不会被过早替换
+            idx = self._add_calls % self._capacity
         
         # 写入数据（NumPy 数组操作，无 GIL）
         self._info_states[idx] = element.info_state
@@ -223,6 +221,9 @@ class RandomReplacementBuffer:
     def sample(self, num_samples, current_iteration=None, new_sample_ratio=0.5):
         """采样（返回 NumPy 数组，而不是 Python 对象列表）
         
+        修改：直接随机采样，不再按比例分层采样
+        这样可以避免新样本占比不足的问题，让所有样本都有平等的采样机会
+        
         返回:
             dict: {
                 'info_states': [batch, info_state_size],
@@ -237,11 +238,8 @@ class RandomReplacementBuffer:
         
         actual_num_samples = min(num_samples, self._size)
         
-        # 分层采样
-        if current_iteration is not None:
-            return self._stratified_sample_numpy(actual_num_samples, current_iteration, new_sample_ratio)
-        else:
-            return self._random_sample_numpy(actual_num_samples)
+        # 直接随机采样，不再按比例分层采样
+        return self._random_sample_numpy(actual_num_samples, current_iteration)
     
     def _empty_result(self):
         """返回空结果"""
@@ -260,10 +258,20 @@ class RandomReplacementBuffer:
                 'new_sample_count': 0
             }
     
-    def _random_sample_numpy(self, num_samples):
-        """随机采样（纯 NumPy，无 GIL）"""
+    def _random_sample_numpy(self, num_samples, current_iteration=None):
+        """随机采样（纯 NumPy，无 GIL）
+        
+        修改：统计新样本数量，用于日志输出
+        """
         indices = np.random.choice(self._size, num_samples, replace=False)
-        return self._gather_by_indices(indices, new_sample_count=0)
+        
+        # 统计新样本数量（用于日志输出）
+        new_sample_count = 0
+        if current_iteration is not None:
+            sampled_iterations = self._iterations[indices]
+            new_sample_count = np.sum(sampled_iterations == current_iteration)
+        
+        return self._gather_by_indices(indices, new_sample_count=new_sample_count)
     
     def _stratified_sample_numpy(self, num_samples, current_iteration, new_sample_ratio):
         """分层采样（纯 NumPy 向量化，无 GIL）"""
@@ -1013,7 +1021,7 @@ class ParallelDeepCFRSolver:
         
         # 验证策略网络输入维度
         actual_input_size = policy_net.mlp.model[0]._weight.shape[1]
-        expected_input_size = self._embedding_size + 23  # 23维手动特征（增强版本）
+        expected_input_size = self._embedding_size + 27  # 23维手动特征（增强版本）
         assert actual_input_size == expected_input_size, \
             f"策略网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
         
@@ -1052,7 +1060,7 @@ class ParallelDeepCFRSolver:
             
             # 验证优势网络输入维度
             actual_input_size = net.mlp.model[0]._weight.shape[1]
-            expected_input_size = self._embedding_size + 23  # 23维手动特征（增强版本）
+            expected_input_size = self._embedding_size + 27  # 23维手动特征（增强版本）
             assert actual_input_size == expected_input_size, \
                 f"玩家 {player} 优势网络输入维度错误: 期望 {expected_input_size}，实际 {actual_input_size}"
             
@@ -2330,9 +2338,17 @@ class ParallelDeepCFRSolver:
                         elif speedup_efficiency < 70:
                             get_logger().warning(f"    ⚠️ 加速比效率较低 ({speedup_efficiency:.1f}%)，可能并行训练未完全生效")
                 
-                # 策略网络训练：只在checkpoint时训练（优化：减少训练时间）
-                # 策略网络训练已移到checkpoint部分，这里不再训练
-                strategy_train_time = 0.0
+                # 策略网络训练：每次迭代都训练，确保与优势网络同步更新
+                # 修改：从只在checkpoint时训练改为每次迭代都训练
+                # 这样可以确保策略网络和优势网络同步更新，避免策略样本不一致的问题
+                strategy_train_start = time.time()
+                policy_loss = self._learn_strategy_network(current_iteration=self._iteration_counter.value)
+                strategy_train_time = time.time() - strategy_train_start
+                if policy_loss is not None:
+                    # 保存策略损失（用于checkpoint时显示）
+                    if not hasattr(self, '_last_policy_loss'):
+                        self._last_policy_loss = []
+                    self._last_policy_loss.append(policy_loss)
                 
                 # 同步网络参数到 Worker（始终同步，移除两阶段机制）
                 # 修改：像单进程训练一样，始终使用训练后的网络，避免两阶段问题
@@ -2401,22 +2417,27 @@ class ParallelDeepCFRSolver:
                         if model_dir and save_prefix and game:
                             get_logger().info(f"\n  💾 保存 checkpoint (迭代 {iteration + 1})...")
                             try:
-                                # 1. 训练策略网络
-                                get_logger().info("    正在训练策略网络 (用于 Checkpoint)...")
+                                # 1. 训练策略网络（checkpoint时额外训练一次，确保策略网络充分学习）
+                                get_logger().info("    正在训练策略网络 (用于 Checkpoint，额外训练)...")
                                 # 注意：样本的iteration字段记录的是创建时的iteration_counter.value
                                 # Worker进程读取iteration_counter.value，样本记录的iteration = iteration_counter.value
                                 # 训练时，应该使用self._iteration_counter.value来匹配样本的iteration字段
                                 # 使用self._iteration_counter.value而不是iteration+1，确保与样本的iteration字段匹配
-                                policy_loss = self._learn_strategy_network(current_iteration=self._iteration_counter.value)
-                                if policy_loss is not None:
-                                    # 保存策略损失
-                                    policy_losses.append(policy_loss)
-                                    # 打印归一化的损失值（MSE）
-                                    current_iter = iteration + 1
-                                    mse = policy_loss / current_iter if current_iter > 0 else policy_loss
-                                    get_logger().info(f"    完成 (MSE: {mse:.6f}, 原始: {policy_loss:.2f})")
+                                # 使用最后一次迭代的策略损失（如果存在），否则重新训练
+                                if hasattr(self, '_last_policy_loss') and self._last_policy_loss:
+                                    policy_loss = self._last_policy_loss[-1]
+                                    get_logger().info(f"    使用最后一次迭代的策略损失: MSE={policy_loss/self._iteration_counter.value:.6f} (原始: {policy_loss:.2f})")
                                 else:
-                                    get_logger().info("    完成 (无足够样本训练)")
+                                    policy_loss = self._learn_strategy_network(current_iteration=self._iteration_counter.value)
+                                    if policy_loss is not None:
+                                        # 保存策略损失
+                                        policy_losses.append(policy_loss)
+                                        # 打印归一化的损失值（MSE）
+                                        current_iter = iteration + 1
+                                        mse = policy_loss / current_iter if current_iter > 0 else policy_loss
+                                        get_logger().info(f"    完成 (MSE: {mse:.6f}, 原始: {policy_loss:.2f})")
+                                    else:
+                                        get_logger().info("    完成 (无足够样本训练)")
                                 
                                 # 2. 运行评估（checkpoint时评估）
                                 print()

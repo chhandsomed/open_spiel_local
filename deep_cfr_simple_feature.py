@@ -33,15 +33,46 @@ from open_spiel.python.pytorch import deep_cfr
 from deep_cfr_with_feature_transform import (
     calculate_hand_strength_features,
     calculate_preflop_hand_strength,
-    card_index_to_rank_suit
+    card_index_to_rank_suit,
+    PREFLOP_HAND_STRENGTH_TABLE
 )
 
 
 # ========== 向量化特征计算函数（高性能版本） ==========
 # 优化：使用 PyTorch 批量操作代替 Python 循环，提速 100x+
 
+# 将强度表转换为 PyTorch tensor 以便向量化查表
+# 创建一个 [13, 13] 的查找表，索引为 (rank1, rank2)，其中 rank1 >= rank2
+_preflop_strength_table_tensor = None
+
+def _init_preflop_strength_table(device='cpu', num_ranks=13):
+    """初始化起手牌强度查找表（向量化版本）
+    
+    将字典表转换为 [13, 13] 的 tensor，索引为 (rank1, rank2)
+    """
+    global _preflop_strength_table_tensor
+    if _preflop_strength_table_tensor is not None:
+        return _preflop_strength_table_tensor.to(device)
+    
+    # 创建查找表，初始化为 0.5（默认值）
+    table = torch.full((num_ranks, num_ranks), 0.5, dtype=torch.float32)
+    
+    # 填充表中的值（只填充 rank1 >= rank2 的部分）
+    for (rank1, rank2), strength in PREFLOP_HAND_STRENGTH_TABLE.items():
+        table[rank1, rank2] = strength
+        # 对称填充（虽然不会用到，但保持一致性）
+        if rank1 != rank2:
+            table[rank2, rank1] = strength
+    
+    _preflop_strength_table_tensor = table
+    return table.to(device)
+
+
 def vectorized_preflop_strength(hole_cards_bits, num_suits=4, num_ranks=13):
-    """向量化计算起手牌强度（完全向量化，无Python循环）
+    """向量化计算起手牌强度（使用标准强度表，完全向量化，无Python循环）
+    
+    修复：使用标准起手牌强度表（PREFLOP_HAND_STRENGTH_TABLE）而不是公式计算
+    这样可以确保 A2s=0.73 等标准值正确
     
     Args:
         hole_cards_bits: [batch_size, 52] 手牌的one-hot编码
@@ -52,58 +83,56 @@ def vectorized_preflop_strength(hole_cards_bits, num_suits=4, num_ranks=13):
     batch_size = hole_cards_bits.shape[0]
     device = hole_cards_bits.device
     
+    # 初始化查找表
+    strength_table = _init_preflop_strength_table(device, num_ranks)
+    
     # 将 52 张牌的 one-hot 转换为 rank 和 suit 表示
-    # 牌索引布局: rank * num_suits + suit，即 0-3 对应 rank=0(2)，4-7 对应 rank=1(3)，...
     card_indices = hole_cards_bits.view(batch_size, num_ranks, num_suits)  # [batch, 13, 4]
     
     # 统计每个 rank 的牌数
     rank_counts = card_indices.sum(dim=2)  # [batch, 13]
     has_card = (rank_counts > 0).float()
-    # 修复：统计牌的总数，而不是有牌的 rank 数量
     card_count = hole_cards_bits.sum(dim=1, keepdim=True)  # [batch, 1]
     
     # 1. 对子检测
     is_pair = (rank_counts == 2).any(dim=1, keepdim=True).float()  # [batch, 1]
     
-    # 2. 对子 rank（向量化）：使用加权索引找最大对子 rank
-    pair_mask = (rank_counts == 2).float()  # [batch, 13]
+    # 2. 获取两张牌的 rank（向量化）
     rank_indices = torch.arange(num_ranks, device=device).float().unsqueeze(0)  # [1, 13]
-    # 对子 rank = 有对子的最大 rank 索引
-    pair_rank = (pair_mask * rank_indices).max(dim=1, keepdim=True)[0]  # [batch, 1]
-    pair_strength = pair_rank / 12.0
-    
-    # 3. 高牌 rank（向量化）
     weighted_ranks = has_card * rank_indices
     max_rank = weighted_ranks.max(dim=1, keepdim=True)[0]  # [batch, 1]
     
     # 第二高牌（向量化）：将最高牌位置清零后再取最大
     max_rank_idx = max_rank.long()  # [batch, 1]
-    # 创建 one-hot 掩码移除最高牌
     one_hot_max = torch.zeros(batch_size, num_ranks, device=device)
     one_hot_max.scatter_(1, max_rank_idx, 1.0)
     second_rank_mask = has_card * (1 - one_hot_max)
     second_rank = (second_rank_mask * rank_indices).max(dim=1, keepdim=True)[0]  # [batch, 1]
     
-    # 4. 是否同花
+    # 确保 rank1 >= rank2（用于查表）
+    rank1 = torch.max(max_rank, second_rank).long()  # [batch, 1]
+    rank2 = torch.min(max_rank, second_rank).long()  # [batch, 1]
+    
+    # 3. 是否同花
     suit_counts = card_indices.sum(dim=1)  # [batch, 4]
-    is_suited = (suit_counts == 2).any(dim=1, keepdim=True).float()
+    is_suited = (suit_counts == 2).any(dim=1, keepdim=True).float()  # [batch, 1]
     
-    # 5. 连张检测
-    rank_diff = torch.abs(max_rank - second_rank)
-    is_connected = (rank_diff <= 1).float()
-    is_gapper = ((rank_diff == 2) | (rank_diff == 3)).float()
+    # 4. 查表获取强度
+    # 使用 gather 进行批量查表
+    rank1_flat = rank1.squeeze(1)  # [batch]
+    rank2_flat = rank2.squeeze(1)  # [batch]
+    table_strength = strength_table[rank1_flat, rank2_flat].unsqueeze(1)  # [batch, 1]
     
-    # 综合计算强度
-    pair_base = 0.5 + pair_strength * 0.5  # 对子：0.5-1.0
-    high_card_value = (max_rank / 12.0) * 0.4 + (second_rank / 12.0) * 0.2
-    suited_bonus = is_suited * 0.1
-    connected_bonus = is_connected * 0.05 + is_gapper * 0.02
-    non_pair_strength = high_card_value + suited_bonus + connected_bonus
+    # 5. 根据是否同花和对子调整强度
+    # 对子：直接使用查表值（不区分花色）
+    # 非对子：根据是否同花选择不同的强度
+    #   同花：直接使用查表值（表中存储的是同花强度）
+    #   不同花：同花强度减去 0.18（与 calculate_preflop_hand_strength 保持一致）
+    offsuit_strength = torch.clamp(table_strength - 0.18, min=0.0)
+    # 对子直接使用查表值，非对子根据是否同花调整
+    strength = is_pair * table_strength + (1 - is_pair) * (is_suited * table_strength + (1 - is_suited) * offsuit_strength)
     
-    # 最终强度
-    strength = is_pair * pair_base + (1 - is_pair) * non_pair_strength
-    
-    # 处理无效输入
+    # 6. 处理无效输入（手牌不足2张）
     invalid_mask = (card_count < 2)
     strength = torch.where(invalid_mask, torch.tensor(0.5, device=device), strength)
     

@@ -674,7 +674,7 @@ curl -X POST http://localhost:8826/api/v1/reload_model \
 curl -X POST http://localhost:8826/api/v1/reload_model \
   -H "Content-Type: application/json" \
   -d '{
-    "model_dir": "models/deepcfr_6p_multi_20260116_171819/checkpoints/iter_17300",
+    "model_dir": "models/deepcfr_6p_multi_20260116_171819/checkpoints/iter_114200",
     "num_players": 6
   }'
 ```

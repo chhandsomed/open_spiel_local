@@ -5,14 +5,14 @@
 信息状态(raw_input_size维) + 手动特征(27维) = (raw_input_size+27)维 -> MLP
 
 手动特征组成（27维，修复：移除补牌权益特征，从28维变为27维）：
-1. 起手牌强度 (1维，加权1.5倍以提高重要性，范围0-1.5，修复：从2.0降低避免特征值过大)
-2. 当前手牌强度（考虑公共牌）(1维，范围0-1)
+1. 起手牌强度 (1维，加权1.5倍以提高重要性，范围0-1.5，修复：恢复加权以提高preflop阶段重要性)
+2. 当前手牌强度（考虑公共牌）(1维，范围0-1，不加权以保持语义清晰)
 3. 是否中牌 (1维，0/1布尔值，修复：Preflop阶段=0)
 4. 成牌特征：对子、两对、三条、顺子、同花、葫芦、四条、同花顺 (8维，0/1布尔值，修复：扩展为所有牌型)
 5. 听牌特征：同花听牌、同花补牌数、顺子听牌、顺子补牌数 (4维，范围0-1，修复：移除补牌权益，River阶段=0)
 6. 公共牌特征：强度、是否同花面、是否顺子面 (3维，范围0-1)
 7. 游戏轮次：Preflop/Flop/Turn/River (4维 one-hot，0/1布尔值)
-8. 手牌强度变化 (1维，使用tanh归一化到[0,1]，修复：Preflop阶段=0)
+8. 手牌强度变化 (1维，使用tanh归一化到[-1,1]，修复：使用原始值计算，Preflop阶段=0)
 9. 下注统计：最大下注、总下注 (2维，使用动态max_ratio归一化到0-1)
 10. 动作特征：是否有人加注、是否有人全押 (2维，0/1布尔值)
 
@@ -115,10 +115,10 @@ def vectorized_hand_strength(hole_cards_bits, board_cards_bits, num_suits=4, num
     
     分阶段计算：
     - Preflop（没有公共牌）：使用底牌强度
-    - Postflop（有公共牌）：使用成牌强度（允许超过1.0）
+    - Postflop（有公共牌）：使用成牌强度（统一到[0,1]有界刻度，便于训练与解释）
     
     Returns:
-        strength: [batch_size, 1] 手牌强度值 (Preflop: 0-1, Postflop: 0-1.2)
+        strength: [batch_size, 1] 手牌强度值 (Preflop: 0-1, Postflop: 0-1)
     """
     batch_size = hole_cards_bits.shape[0]
     device = hole_cards_bits.device
@@ -189,12 +189,12 @@ def vectorized_hand_strength(hole_cards_bits, board_cards_bits, num_suits=4, num
     max_trips_rank = trips_ranks.max(dim=1, keepdim=True)[0]  # [batch, 1]
     max_four_rank = four_ranks.max(dim=1, keepdim=True)[0]  # [batch, 1]
     
-    # rank加成（归一化到[0, 1]，然后乘以0.2）
+    # rank加成（统一尺度：加成幅度要小，且不应把任意牌型推到 > 1.0）
     max_rank_value = (num_ranks - 1)  # 12 (A)
     
-    pair_rank_bonus = (max_pair_rank / max_rank_value) * 0.2  # [batch, 1], 0-0.2
-    trips_rank_bonus = (max_trips_rank / max_rank_value) * 0.2  # [batch, 1], 0-0.2
-    four_rank_bonus = (max_four_rank / max_rank_value) * 0.2  # [batch, 1], 0-0.2
+    pair_rank_bonus = (max_pair_rank / max_rank_value) * 0.15   # [batch, 1], 0-0.15
+    trips_rank_bonus = (max_trips_rank / max_rank_value) * 0.10  # [batch, 1], 0-0.10
+    four_rank_bonus = (max_four_rank / max_rank_value) * 0.03    # [batch, 1], 0-0.03
     
     # 高牌的rank（修复：应该基于手牌的最高两张牌，而不是所有牌的最高两张牌）
     # 对于高牌，如果手牌没有中牌，强度应该基于手牌的最高两张牌
@@ -221,41 +221,37 @@ def vectorized_hand_strength(hole_cards_bits, board_cards_bits, num_suits=4, num
     # 高牌（需要考虑rank）
     strength = torch.where(strength == 0, high_card_strength, strength)
     
-    # 一对（需要考虑rank）
-    pair_strength = torch.tensor(0.6, device=device) + pair_rank_bonus  # 基础0.6 + rank加成
+    # 一对（考虑rank）
+    pair_strength = torch.tensor(0.35, device=device) + pair_rank_bonus  # 0.35-0.50
     strength = torch.where(has_pair > 0, pair_strength, strength)
     
-    # 两对（需要考虑rank，使用较高的对子rank）
-    # 修复：提高两对的基础强度，确保能够超过强起手牌（如99=0.79）
-    # 两对的基础强度应该 > 中等起手牌强度
-    two_pair_strength = torch.tensor(0.7, device=device) + pair_rank_bonus * 0.8  # 基础0.7 + rank加成（提高基础值）
+    # 两对（考虑rank，轻微加成）
+    two_pair_strength = torch.tensor(0.55, device=device) + pair_rank_bonus * 0.20  # ~0.55-0.58
     strength = torch.where(has_two_pair > 0, two_pair_strength, strength)
     
-    # 三条（需要考虑rank）
-    # 修复：提高三条的基础强度，确保三条A > AA的底牌强度(1.0)
-    # 基础0.85 + rank加成(0.2) = 1.05，可以超过1.0
-    trips_strength = torch.tensor(0.85, device=device) + trips_rank_bonus  # 基础0.85 + rank加成
+    # 三条（考虑rank）
+    trips_strength = torch.tensor(0.70, device=device) + trips_rank_bonus  # 0.70-0.80
     strength = torch.where(has_three > 0, trips_strength, strength)
     
-    # 顺子（不考虑rank，因为顺子本身已经很强）
-    strength = torch.where(has_straight > 0, torch.tensor(0.75, device=device), strength)
+    # 顺子
+    strength = torch.where(has_straight > 0, torch.tensor(0.80, device=device), strength)
     
-    # 同花（不考虑rank，因为同花本身已经很强）
-    strength = torch.where(has_flush > 0, torch.tensor(0.8, device=device), strength)
+    # 同花
+    strength = torch.where(has_flush > 0, torch.tensor(0.85, device=device), strength)
     
-    # 葫芦（需要考虑rank，使用三条的rank）
-    full_house_strength = torch.tensor(0.9, device=device) + trips_rank_bonus * 0.5  # 基础0.9 + rank加成
+    # 葫芦（轻微考虑三条rank）
+    full_house_strength = torch.tensor(0.92, device=device) + trips_rank_bonus * 0.20  # ~0.92-0.94
     strength = torch.where(has_full_house > 0, full_house_strength, strength)
     
-    # 四条（需要考虑rank）
-    four_strength = torch.tensor(0.95, device=device) + four_rank_bonus  # 基础0.95 + rank加成
+    # 四条（轻微考虑rank）
+    four_strength = torch.tensor(0.97, device=device) + four_rank_bonus  # 0.97-1.00
     strength = torch.where(has_four > 0, four_strength, strength)
     
-    # 同花顺（最强，允许超过1.0）
-    strength = torch.where(has_straight_flush > 0, torch.tensor(1.1, device=device), strength)
+    # 同花顺（最强）
+    strength = torch.where(has_straight_flush > 0, torch.tensor(1.0, device=device), strength)
     
-    # 确保强度 >= 0（但不限制上限，允许超过1.0）
-    strength = torch.clamp(strength, 0.0, float('inf'))
+    # 统一到[0,1]有界刻度
+    strength = torch.clamp(strength, 0.0, 1.0)
     
     # 分阶段合并：Preflop使用底牌强度，Postflop使用成牌强度
     # preflop_strength已在函数开头计算
@@ -666,27 +662,39 @@ class SimpleFeatureMLP(nn.Module):
         
         if self.manual_feature_size == 27:
             # 增强版本：27维特征（使用向量化计算，高性能，修复：移除补牌权益特征）
-            # 1. 起手牌强度（1维）- 加权1.5倍以提高重要性（修复：从2.0降低到1.5，避免特征值过大导致模型过度保守）
-            preflop_strength = vectorized_preflop_strength(hole_cards)
-            preflop_strength_weighted = preflop_strength * 1.5  # 加权1.5倍（修复：降低加权倍数，避免特征值过大）
-            # 确保加权后仍在合理范围内（0-1.5，与其他特征0-1更接近）
+            # 1. 起手牌强度（1维）- 恢复加权1.5倍以提高preflop阶段重要性
+            # 计算原始起手牌强度（用于strength_change计算）
+            preflop_strength_original = vectorized_preflop_strength(hole_cards)
+            preflop_strength_original = torch.clamp(preflop_strength_original, 0.0, 1.0)
+            
+            # 加权起手牌强度（用于特征输入，提高preflop阶段重要性）
+            preflop_strength_weighted = preflop_strength_original * 1.5
+            preflop_strength_weighted = torch.clamp(preflop_strength_weighted, 0.0, 1.5)
             features.append(preflop_strength_weighted)
             
-            # 2. 当前手牌强度（考虑公共牌）（1维）
+            # 2. 当前手牌强度（考虑公共牌）（1维，统一到[0,1]，不加权）
+            # preflop时：current_hand_strength = preflop_strength_original
+            # postflop时：current_hand_strength = 实际手牌强度
             current_hand_strength = vectorized_hand_strength(hole_cards, board_cards)
+            current_hand_strength = torch.clamp(current_hand_strength, 0.0, 1.0)
             features.append(current_hand_strength)
             
-            # 3. 是否中牌（1维）- 修复：Preflop阶段不应该有"中牌"概念
+            # 3. 是否中牌（1维）- 修复：改为检查是否有成牌，而不是基于手牌强度阈值
             board_count = board_cards.sum(dim=1, keepdim=True)  # [batch, 1]
             is_preflop = (board_count == 0).float()  # [batch, 1]
             is_postflop = (board_count > 0).float()  # [batch, 1]
-            # Preflop阶段：是否中牌 = 0（没有公共牌，无法中牌）
-            # Postflop阶段：是否中牌 = (current_hand_strength > 0.2)
-            hit_hand = is_postflop * (current_hand_strength > 0.2).float()
-            features.append(hit_hand)
             
             # 4. 成牌特征（8维）- 修复：扩展为所有牌型，避免遗漏顺子、同花、葫芦、四条、同花顺
             hit_pair, hit_two_pair, hit_trips, hit_straight, hit_flush, hit_full_house, hit_four, hit_straight_flush = check_made_hands(hole_cards, board_cards)
+            
+            # Preflop阶段：是否中牌 = 0（没有公共牌，无法中牌）
+            # Postflop阶段：是否中牌 = 检查是否有任何成牌（对子、两对、三条、顺子、同花、葫芦、四条、同花顺）
+            has_made_hand = (hit_pair + hit_two_pair + hit_trips + hit_straight + 
+                           hit_flush + hit_full_house + hit_four + hit_straight_flush)
+            has_made_hand = (has_made_hand > 0.5).float()  # 确保是0或1
+            hit_hand = is_postflop * has_made_hand
+            features.append(hit_hand)
+            
             features.extend([hit_pair, hit_two_pair, hit_trips, hit_straight, hit_flush, hit_full_house, hit_four, hit_straight_flush])
             
             # 5. 听牌特征（4维）- 移除补牌权益特征
@@ -698,30 +706,32 @@ class SimpleFeatureMLP(nn.Module):
             features.extend([board_strength, is_flush_board, is_straight_board])
             features.append(game_round)  # 4维 one-hot
             
-            # 7. 手牌强度变化（1维）- 分阶段计算
-            # Preflop: 强度变化 = 0（没有变化）
-            # Postflop: 强度变化 = 成牌强度 - 底牌强度（允许超过1.0）
-            board_count = board_cards.sum(dim=1, keepdim=True)  # [batch, 1]
-            is_preflop = (board_count == 0).float()  # [batch, 1]
-            is_postflop = (board_count > 0).float()  # [batch, 1]
-            
-            # Preflop: 强度变化 = 0
-            strength_change_preflop = torch.zeros_like(preflop_strength)
-            
-            # Postflop: 强度变化 = 成牌强度 - 底牌强度（允许超过1.0）
-            strength_change_postflop = current_hand_strength - preflop_strength
-            
-            # 归一化：Preflop时保持0，Postflop时归一化
-            # 修复：Preflop时不应该归一化，应该保持0
-            strength_change_normalized = is_preflop * torch.zeros_like(strength_change_preflop) + \
-                                         is_postflop * (torch.tanh(strength_change_postflop * 3.0) + 1.0) / 2.0
-            features.append(strength_change_normalized)
+            # 7. 手牌强度变化（1维）
+            # 语义：postflop时的"相对变化" = current_strength - preflop_strength_original（可为负）
+            # 归一化：tanh(k * delta_raw) -> [-1, 1]
+            # 注意：使用原始值计算，确保语义正确（preflop时delta_raw=0，postflop时反映真实变化）
+            # 使用原始值计算delta，确保语义正确
+            delta_raw = current_hand_strength - preflop_strength_original
+            k_delta = 3.0
+            strength_change = is_preflop * torch.zeros_like(delta_raw) + is_postflop * torch.tanh(delta_raw * k_delta)
+            features.append(strength_change)
             
             # 8. 下注统计特征（2维）- 如果board_cards有值，说明已经进入下注阶段
-            action_seq_start = self.num_players + 104
-            action_seq_end = action_seq_start + self.max_game_length * 2
+            # 修复：根据实际输入维度计算索引，而不是使用self.max_game_length
+            # 因为输入可能已经适配过维度（Auto-adapt），或者维度不匹配
+            header_size = self.num_players + 104
+            current_dim = x.shape[1]
+            # 计算实际的max_game_length（从输入维度推断）
+            if (current_dim - header_size) % 3 == 0:
+                actual_max_game_length = (current_dim - header_size) // 3
+            else:
+                # 如果无法推断，使用训练时的max_game_length（向后兼容）
+                actual_max_game_length = self.max_game_length
+            
+            action_seq_start = header_size
+            action_seq_end = action_seq_start + actual_max_game_length * 2
             action_sizings_start = action_seq_end
-            action_sizings = x[:, action_sizings_start:action_sizings_start+self.max_game_length]
+            action_sizings = x[:, action_sizings_start:action_sizings_start+actual_max_game_length]
             
             total_bet = torch.sum(action_sizings, dim=1, keepdim=True)
             max_bet = torch.max(action_sizings, dim=1, keepdim=True)[0]
@@ -750,6 +760,7 @@ class SimpleFeatureMLP(nn.Module):
             features.extend([max_bet_norm, total_bet_norm])
             
             # 9. 是否有人加注/全押（2维）
+            # 使用上面计算的action_seq_start和action_seq_end
             action_seq = x[:, action_seq_start:action_seq_end]
             # 检查是否有raise (01) 或 all-in (11)
             has_raise = torch.any(

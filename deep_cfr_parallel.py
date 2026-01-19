@@ -29,6 +29,7 @@ import torch.multiprocessing as mp
 from multiprocessing import Process, Queue, Event, Value, Manager
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 import queue
 import resource
 
@@ -218,11 +219,13 @@ class RandomReplacementBuffer:
         
         self._add_calls += 1
     
-    def sample(self, num_samples, current_iteration=None, new_sample_ratio=0.5):
+    def sample(self, num_samples, current_iteration=None, new_sample_ratio=0.5, new_sample_window=0):
         """采样（返回 NumPy 数组，而不是 Python 对象列表）
         
-        修改：直接随机采样，不再按比例分层采样
-        这样可以避免新样本占比不足的问题，让所有样本都有平等的采样机会
+        修改：支持按比例分层采样（新样本/老样本），用于提升“新样本占比”，降低分布漂移带来的训练抖动。
+        - 新样本：iteration ∈ [current_iteration - new_sample_window, current_iteration]
+          - new_sample_window=0 时退化为 iteration == current_iteration（旧行为）
+        - 老样本：其他 iteration
         
         返回:
             dict: {
@@ -238,8 +241,22 @@ class RandomReplacementBuffer:
         
         actual_num_samples = min(num_samples, self._size)
         
-        # 直接随机采样，不再按比例分层采样
-        return self._random_sample_numpy(actual_num_samples, current_iteration)
+        # 如果提供 current_iteration，则优先分层采样，确保新样本占比
+        if current_iteration is not None and new_sample_ratio is not None:
+            try:
+                ratio = float(new_sample_ratio)
+            except Exception:
+                ratio = 0.5
+            ratio = max(0.0, min(1.0, ratio))
+            try:
+                window = int(new_sample_window) if new_sample_window is not None else 0
+            except Exception:
+                window = 0
+            window = max(0, window)
+            return self._stratified_sample_numpy(actual_num_samples, int(current_iteration), ratio, window)
+        
+        # 否则随机采样
+        return self._random_sample_numpy(actual_num_samples, current_iteration, new_sample_window=new_sample_window)
     
     def _empty_result(self):
         """返回空结果"""
@@ -258,7 +275,7 @@ class RandomReplacementBuffer:
                 'new_sample_count': 0
             }
     
-    def _random_sample_numpy(self, num_samples, current_iteration=None):
+    def _random_sample_numpy(self, num_samples, current_iteration=None, new_sample_window=0):
         """随机采样（纯 NumPy，无 GIL）
         
         修改：统计新样本数量，用于日志输出
@@ -268,50 +285,84 @@ class RandomReplacementBuffer:
         # 统计新样本数量（用于日志输出）
         new_sample_count = 0
         if current_iteration is not None:
+            try:
+                window = int(new_sample_window) if new_sample_window is not None else 0
+            except Exception:
+                window = 0
+            window = max(0, window)
             sampled_iterations = self._iterations[indices]
-            new_sample_count = np.sum(sampled_iterations == current_iteration)
+            if window <= 0:
+                new_sample_count = np.sum(sampled_iterations == current_iteration)
+            else:
+                low = current_iteration - window
+                new_sample_count = np.sum((sampled_iterations >= low) & (sampled_iterations <= current_iteration))
         
         return self._gather_by_indices(indices, new_sample_count=new_sample_count)
     
-    def _stratified_sample_numpy(self, num_samples, current_iteration, new_sample_ratio):
+    def _stratified_sample_numpy(self, num_samples, current_iteration, new_sample_ratio, new_sample_window=0):
         """分层采样（纯 NumPy 向量化，无 GIL）"""
         # 向量化分离新旧样本（纯 NumPy，释放 GIL）
         valid_iterations = self._iterations[:self._size]
-        new_mask = valid_iterations == current_iteration
+        if new_sample_window is None:
+            new_sample_window = 0
+        try:
+            window = int(new_sample_window)
+        except Exception:
+            window = 0
+        window = max(0, window)
+        if window <= 0:
+            new_mask = valid_iterations == current_iteration
+        else:
+            low = current_iteration - window
+            new_mask = (valid_iterations >= low) & (valid_iterations <= current_iteration)
         new_indices = np.where(new_mask)[0]
         old_indices = np.where(~new_mask)[0]
         
         num_new_available = len(new_indices)
         num_old_available = len(old_indices)
         
-        # 计算采样数量
-        num_new = min(num_new_available, int(num_samples * new_sample_ratio))
-        num_old = num_samples - num_new
+        # 计算目标采样数量：优先满足 new_sample_ratio，但保证尽可能凑满 num_samples
+        desired_new = int(num_samples * new_sample_ratio)
+        desired_new = max(0, min(desired_new, num_new_available))
+        desired_old = num_samples - desired_new
+        desired_old = max(0, min(desired_old, num_old_available))
         
-        # 如果新样本不足，用老样本补充
-        if num_new < int(num_samples * new_sample_ratio) and num_old_available > 0:
-            num_old = min(num_old_available, num_samples - num_new)
+        # 如果老样本不足，用剩余的新样本补齐（允许超过 new_sample_ratio）
+        remaining = num_samples - (desired_new + desired_old)
+        if remaining > 0 and num_new_available > desired_new:
+            extra_new = min(remaining, num_new_available - desired_new)
+            desired_new += extra_new
+            remaining -= extra_new
+        
+        # 如果新样本不足，再用剩余的老样本补齐
+        if remaining > 0 and num_old_available > desired_old:
+            extra_old = min(remaining, num_old_available - desired_old)
+            desired_old += extra_old
+            remaining -= extra_old
         
         # NumPy 随机采样（释放 GIL）
         sampled_indices = []
         
-        if num_new > 0 and num_new_available > 0:
-            if num_new >= num_new_available:
+        if desired_new > 0 and num_new_available > 0:
+            if desired_new >= num_new_available:
                 sampled_indices.append(new_indices)
             else:
-                sampled_indices.append(np.random.choice(new_indices, num_new, replace=False))
+                sampled_indices.append(np.random.choice(new_indices, desired_new, replace=False))
         
-        if num_old > 0 and num_old_available > 0:
-            if num_old >= num_old_available:
+        if desired_old > 0 and num_old_available > 0:
+            if desired_old >= num_old_available:
                 sampled_indices.append(old_indices)
             else:
-                sampled_indices.append(np.random.choice(old_indices, num_old, replace=False))
+                sampled_indices.append(np.random.choice(old_indices, desired_old, replace=False))
         
         if len(sampled_indices) == 0:
             return self._empty_result()
         
         all_indices = np.concatenate(sampled_indices)
-        return self._gather_by_indices(all_indices, new_sample_count=num_new)
+        # 打散索引，避免“新样本/老样本分块”带来的潜在序列偏差
+        if all_indices.shape[0] > 1:
+            np.random.shuffle(all_indices)
+        return self._gather_by_indices(all_indices, new_sample_count=desired_new)
     
     def _gather_by_indices(self, indices, new_sample_count=0):
         """根据索引收集数据（纯 NumPy 切片，无 GIL）"""
@@ -328,9 +379,9 @@ class RandomReplacementBuffer:
         
         return result
     
-    def sample_legacy(self, num_samples, current_iteration=None, new_sample_ratio=0.5):
+    def sample_legacy(self, num_samples, current_iteration=None, new_sample_ratio=0.5, new_sample_window=0):
         """兼容旧接口：返回 namedtuple 列表（慢，仅用于兼容）"""
-        result = self.sample(num_samples, current_iteration, new_sample_ratio)
+        result = self.sample(num_samples, current_iteration, new_sample_ratio, new_sample_window)
         
         if len(result['info_states']) == 0:
             return []
@@ -417,7 +468,10 @@ def worker_process(
     num_traversals_per_batch,
     device='cpu',
     max_memory_gb=None,  # Worker 内存限制
-    parent_pid=None  # 主进程PID，用于检查主进程是否存活
+    parent_pid=None,  # 主进程PID，用于检查主进程是否存活
+    # 🧯 advantage/regret 目标稳健化参数（主进程传入）
+    advantage_target_scale: float = 1.0,           # 归一化尺度（通常=max_stack）
+    advantage_target_clip: Optional[float] = 5.0   # 归一化后裁剪阈值（None表示不裁剪）
 ):
     """Worker 进程：并行遍历游戏树
     
@@ -584,6 +638,23 @@ def worker_process(
                     # 理由：优势网络需要学习完整的遗憾值，采样时再截断为0（Regret Matching标准做法）
                     # 如果只学习正遗憾值，Fold等动作的负遗憾值会被忽略，导致无法学习到真实价值
                     sampled_regret_arr[action] = sampled_regret[action]
+
+                # ==========================
+                # 🧯 Advantage/Regret 目标稳健化
+                # ==========================
+                # regret/advantage 以筹码单位计通常重尾且量级大，直接用 MSE 会导致 loss 极大且训练震荡/平台。
+                # 推荐：按 max_stack 归一化到 O(1) 的尺度，并对归一化后的目标做裁剪。
+                try:
+                    if advantage_target_scale and float(advantage_target_scale) > 0:
+                        inv_scale = 1.0 / float(advantage_target_scale)
+                        sampled_regret_arr = [float(x) * inv_scale for x in sampled_regret_arr]
+                        if advantage_target_clip is not None:
+                            c = float(advantage_target_clip)
+                            if c > 0:
+                                sampled_regret_arr = [max(-c, min(c, float(x))) for x in sampled_regret_arr]
+                except Exception:
+                    # 归一化失败不影响主流程（但会回退为原始尺度）
+                    pass
                 
                 # 调试输出：收集样本数据（只收集前20个样本）
                 if hasattr(traverse_game_tree, '_debug_count'):
@@ -852,6 +923,7 @@ class ParallelDeepCFRSolver:
         max_memory_gb=None,  # 最大内存限制（GB），None 表示不限制
         queue_maxsize=50000,  # 队列最大大小（降低以减少内存占用）
         new_sample_ratio=0.5,  # 新样本占比（分层加权采样，默认0.5即50%）
+        new_sample_window=0,   # 新样本窗口（最近W轮算“新”）；0表示仅当前轮
         # 切换条件参数
         switch_threshold_win_rate_strict=0.25,  # 严格胜率阈值（25%）
         switch_threshold_win_rate_relaxed=0.20,  # 宽松胜率阈值（20%）
@@ -864,6 +936,11 @@ class ParallelDeepCFRSolver:
         reinitialize_advantage_networks=False,  # 是否重新初始化优势网络（默认关闭，避免每次迭代重置导致学习不稳定）
         advantage_network_train_steps=1,  # 优势网络训练步数（每次迭代）
         policy_network_train_steps=1,  # 策略网络训练步数（每次迭代）
+        # 🧯 advantage/regret 训练稳健化（建议开启）
+        advantage_target_scale: Optional[float] = None,   # None: 自动取 game.stack 的最大值
+        advantage_target_clip: Optional[float] = None,    # 归一化后裁剪阈值（None不裁剪，默认不裁剪）
+        advantage_loss: str = "mse",                    # "huber" 或 "mse"
+        huber_delta: float = 1.0                          # Huber delta（归一化后单位）
     ):
         self.game = game
         self.num_workers = num_workers
@@ -880,6 +957,7 @@ class ParallelDeepCFRSolver:
         self.max_memory_gb = max_memory_gb
         self.queue_maxsize = queue_maxsize
         self.new_sample_ratio = new_sample_ratio  # 新样本占比（分层加权采样）
+        self.new_sample_window = new_sample_window  # 新样本窗口（最近W轮）
         
         # 内存监控
         self._last_memory_check = 0
@@ -923,6 +1001,16 @@ class ParallelDeepCFRSolver:
         
         # 从游戏配置中解析max_stack（用于归一化下注统计特征）
         self._max_stack = self._parse_max_stack_from_game_string(self._game_string)
+
+        # 🧯 advantage/regret 目标稳健化配置
+        self._advantage_target_scale = float(advantage_target_scale) if advantage_target_scale is not None else float(self._max_stack)
+        if self._advantage_target_scale <= 0:
+            self._advantage_target_scale = 1.0
+        self._advantage_target_clip = advantage_target_clip
+        self._advantage_loss_type = str(advantage_loss).lower()
+        self._huber_delta = float(huber_delta) if huber_delta is not None else 1.0
+        if self._huber_delta <= 0:
+            self._huber_delta = 1.0
         
         # 网络层配置
         self._policy_network_layers = policy_network_layers
@@ -996,11 +1084,11 @@ class ParallelDeepCFRSolver:
         match = re.search(r'stack=([\d\s]+)', game_string)
         if match:
             stack_str = match.group(1).strip()
-            # 解析第一个玩家的筹码量（所有玩家应该相同）
             stack_values = stack_str.split()
             if stack_values:
                 try:
-                    max_stack = int(stack_values[0])
+                    # 取最大值，兼容不等深度的配置
+                    max_stack = max(int(x) for x in stack_values)
                     return max_stack
                 except ValueError:
                     pass
@@ -1088,7 +1176,8 @@ class ParallelDeepCFRSolver:
                 torch.optim.Adam(net.parameters(), lr=self.learning_rate)
             )
         
-        self._loss_advantages = nn.MSELoss(reduction="mean")
+        # 优势网络损失：默认用 Huber（对重尾目标更稳），可选 MSE
+        self._loss_advantages = self._build_advantage_loss()
     
     def _start_workers(self):
         """启动 Worker 进程"""
@@ -1133,6 +1222,8 @@ class ParallelDeepCFRSolver:
                     'cpu',  # Worker 在 CPU 上运行
                     self.max_memory_gb,  # Worker 内存限制
                     main_process_pid,  # 主进程PID，用于检查主进程是否存活
+                    self._advantage_target_scale,
+                    self._advantage_target_clip,
                 ),
                 daemon=True  # 设置为守护进程，主进程退出时自动杀死
             )
@@ -1185,8 +1276,8 @@ class ParallelDeepCFRSolver:
                     available_mem = psutil.virtual_memory().available / 1024 / 1024 / 1024
                     print(f"  系统内存: {total_mem:.1f}GB 总计, {available_mem:.1f}GB 可用")
                     
-                    if estimated_memory_mb / 1024 > available_mem * 0.8:
-                        print(f"  ⚠️ 警告: 估算内存需求 ({estimated_memory_mb/1024:.1f}GB) 接近可用内存 ({available_mem:.1f}GB)")
+                    if estimated_memory_gb > available_mem * 0.8:
+                        print(f"  ⚠️ 警告: 估算内存需求 ({estimated_memory_gb:.1f}GB) 接近可用内存 ({available_mem:.1f}GB)")
                         print(f"  建议: 减少 --memory_capacity 或 --num_workers")
                 except:
                     pass
@@ -1639,7 +1730,8 @@ class ParallelDeepCFRSolver:
         sample_result = self._advantage_memories[player].sample(
             actual_batch_size, 
             current_iteration=current_iteration,
-            new_sample_ratio=self.new_sample_ratio
+            new_sample_ratio=self.new_sample_ratio,
+            new_sample_window=self.new_sample_window
         )
         sample_time = time.time() - sample_start
         
@@ -1674,8 +1766,18 @@ class ParallelDeepCFRSolver:
                         advantages[i, :len(adv)] = adv
                         advantages[i, len(adv):] = 0
                     iterations_arr[i, 0] = s.iteration
-                    if current_iteration is not None and hasattr(s, 'iteration') and s.iteration == current_iteration:
-                        new_sample_count += 1
+                if current_iteration is not None and hasattr(s, 'iteration'):
+                    try:
+                        w = int(self.new_sample_window) if self.new_sample_window is not None else 0
+                    except Exception:
+                        w = 0
+                    w = max(0, w)
+                    if w <= 0:
+                        if s.iteration == current_iteration:
+                            new_sample_count += 1
+                    else:
+                        if (s.iteration >= (current_iteration - w)) and (s.iteration <= current_iteration):
+                            new_sample_count += 1
             else:
                 info_states = np.array([], dtype=np.float32)
                 advantages = np.array([], dtype=np.float32)
@@ -1724,6 +1826,21 @@ class ParallelDeepCFRSolver:
         # 创建其他 tensor
         advantages_tensor = torch.from_numpy(advantages).to(device)
         iters = torch.from_numpy(iterations).to(device)
+
+        # 训练期可观测性：打印 advantage label 分布（确认归一化/裁剪是否生效）
+        if current_iteration is not None and current_iteration % 1000 == 0 and player == 0:
+            try:
+                flat = np.asarray(advantages, dtype=np.float32).reshape(-1)
+                abs_flat = np.abs(flat)
+                p50, p90, p99 = np.quantile(abs_flat, [0.5, 0.9, 0.99]).tolist()
+                mx = float(abs_flat.max()) if abs_flat.size else 0.0
+                get_logger().info(
+                    f"  🧯 advantage targets stats(abs) @iter={current_iteration}: "
+                    f"p50={p50:.4f}, p90={p90:.4f}, p99={p99:.4f}, max={mx:.4f} | "
+                    f"scale={self._advantage_target_scale:.1f}, clip={self._advantage_target_clip}, loss={self._advantage_loss_type}"
+                )
+            except Exception:
+                pass
         
         # 修复：DataParallel在多线程环境下可能死锁，需要设置环境变量
         import os
@@ -1770,6 +1887,23 @@ class ParallelDeepCFRSolver:
             loss_value = final_loss.detach().cpu().numpy()
             return float(loss_value) if np.isscalar(loss_value) else float(loss_value.item())
         return None
+
+    def _build_advantage_loss(self):
+        """构建优势网络损失函数（默认 Huber）"""
+        if self._advantage_loss_type == "mse":
+            return nn.MSELoss(reduction="mean")
+
+        delta = float(self._huber_delta)
+
+        def huber(pred, target):
+            diff = pred - target
+            abs_diff = torch.abs(diff)
+            quad = torch.clamp(abs_diff, max=delta)
+            lin = abs_diff - quad
+            loss = 0.5 * (quad ** 2) / delta + lin
+            return loss.mean()
+
+        return huber
     
     def _learn_strategy_network(self, current_iteration=None):
         """训练策略网络（NumPy 优化版）
@@ -1791,7 +1925,8 @@ class ParallelDeepCFRSolver:
         sample_result = self._strategy_memories.sample(
             actual_batch_size,
             current_iteration=current_iteration,
-            new_sample_ratio=self.new_sample_ratio
+            new_sample_ratio=self.new_sample_ratio,
+            new_sample_window=self.new_sample_window
         )
         sample_time = time.time() - sample_start
         
@@ -1820,7 +1955,16 @@ class ParallelDeepCFRSolver:
             
             # 统计新样本和老样本比例
             if current_iteration is not None and len(samples) > 0:
-                new_samples = sum(1 for s in samples if hasattr(s, 'iteration') and s.iteration == current_iteration)
+                try:
+                    w = int(self.new_sample_window) if self.new_sample_window is not None else 0
+                except Exception:
+                    w = 0
+                w = max(0, w)
+                if w <= 0:
+                    new_samples = sum(1 for s in samples if hasattr(s, 'iteration') and s.iteration == current_iteration)
+                else:
+                    low = current_iteration - w
+                    new_samples = sum(1 for s in samples if hasattr(s, 'iteration') and (s.iteration >= low) and (s.iteration <= current_iteration))
                 old_samples = len(samples) - new_samples
                 new_ratio = new_samples / len(samples) * 100 if len(samples) > 0 else 0
                 get_logger().info(f"    策略网络训练样本: 新样本 {new_samples}/{len(samples)} ({new_ratio:.1f}%), 老样本 {old_samples}/{len(samples)} ({100-new_ratio:.1f}%)")
@@ -2441,15 +2585,19 @@ class ParallelDeepCFRSolver:
                                 
                                 # 2. 运行评估（checkpoint时评估）
                                 print()
-                                # 打印归一化的优势网络损失（除以iteration得到MSE）
+                                # 打印优势网络损失
                                 current_iter = iteration + 1
                                 for player, losses in advantage_losses.items():
-                                    if losses:
-                                        raw_loss = losses[-1]
+                                    if not losses:
+                                        continue
+                                    raw_loss = losses[-1]
+                                    if self._advantage_loss_type == "mse":
                                         # 归一化：除以iteration（因为损失值 = iteration * MSE）
-                                        # 归一化后的值就是MSE本身
                                         mse = raw_loss / current_iter if current_iter > 0 else raw_loss
                                         print(f"    玩家 {player} 优势网络损失: MSE={mse:.2f} (原始: {raw_loss:.2f})")
+                                    else:
+                                        # Huber 等稳健损失不再做“除以iteration”的归一化展示
+                                        print(f"    玩家 {player} 优势网络损失: Loss({self._advantage_loss_type})={raw_loss:.6f}")
                                 
                                 # 打印归一化的策略网络损失（除以iteration得到MSE）
                                 if policy_losses:
@@ -2462,7 +2610,7 @@ class ParallelDeepCFRSolver:
                                 # 运行评估
                                 if game is not None:
                                     try:
-                                        from training_evaluator import quick_evaluate
+                                        from training_evaluator import quick_evaluate, evaluate_with_test_games, _get_action_name
                                         print(f"  评估训练效果...", end="", flush=True)
                                         eval_result = quick_evaluate(
                                             game,
@@ -2512,7 +2660,6 @@ class ParallelDeepCFRSolver:
                                                     
                                                     # 打印测试对局中的动作平均占比（自对弈模式）
                                                     if test_results.get('action_statistics'):
-                                                        from training_evaluator import _get_action_name
                                                         action_stats = test_results['action_statistics']
                                                         total_count = sum(s['count'] for s in action_stats.values())
                                                         if total_count > 0:
@@ -2559,7 +2706,6 @@ class ParallelDeepCFRSolver:
                                                     
                                                     # 打印测试对局中的动作平均占比
                                                     if test_results.get('action_statistics'):
-                                                        from training_evaluator import _get_action_name
                                                         action_stats = test_results['action_statistics']
                                                         total_count = sum(s['count'] for s in action_stats.values())
                                                         if total_count > 0:
@@ -2576,6 +2722,122 @@ class ParallelDeepCFRSolver:
                                                                 action_name = _get_action_name(action, game)
                                                                 action_info.append(f"{action_name}: {percentage:.1f}% (平均概率: {avg_prob:.3f})")
                                                             print(f"      {' | '.join(action_info)}")
+
+                                                    # ===== 额外评估：不止 vs Random（只用于诊断，不回灌训练）=====
+                                                    try:
+                                                        extra_opponents = getattr(self, "_eval_extra_opponents", "snapshot") or ""
+                                                        extra_opponents = [s.strip().lower() for s in str(extra_opponents).split(",") if s.strip()]
+                                                    except Exception:
+                                                        extra_opponents = ["snapshot"]
+
+                                                    try:
+                                                        extra_games = int(getattr(self, "_eval_extra_games", 200))
+                                                    except Exception:
+                                                        extra_games = 200
+                                                    extra_games = max(10, extra_games)
+
+                                                    def _print_overall_line(label, tr):
+                                                        ng = tr.get('games_played', 0)
+                                                        if ng <= 0:
+                                                            print(f"    {label}: 无有效对局")
+                                                            return
+                                                        overall_avg_return = tr.get('player0_avg_return', 0)
+                                                        overall_win_rate = tr.get('player0_win_rate', 0) * 100
+                                                        if bb is not None and bb > 0:
+                                                            bb_value2 = overall_avg_return / bb
+                                                            print(f"    {label}: {ng}局 | 总体: 平均回报 {overall_avg_return:.2f} ({bb_value2:+.2f} BB), 胜率 {overall_win_rate:.1f}%")
+                                                        else:
+                                                            print(f"    {label}: {ng}局 | 总体: 平均回报 {overall_avg_return:.2f}, 胜率 {overall_win_rate:.1f}%")
+                                                        if tr.get('action_statistics'):
+                                                            action_stats2 = tr['action_statistics']
+                                                            sorted_actions2 = sorted(action_stats2.items(),
+                                                                                    key=lambda x: x[1]['percentage'],
+                                                                                    reverse=True)
+                                                            parts = []
+                                                            for action, st in sorted_actions2[:8]:
+                                                                parts.append(f"{_get_action_name(action, game)}: {st['percentage']:.1f}% (p={st['avg_probability']:.3f})")
+                                                            print(f"      动作: {' | '.join(parts)}")
+
+                                                    if extra_opponents:
+                                                        # 1) vs Snapshot：用旧checkpoint策略当对手
+                                                        if "snapshot" in extra_opponents and model_dir and save_prefix:
+                                                            try:
+                                                                gap = int(getattr(self, "_eval_snapshot_gap", 1000))
+                                                            except Exception:
+                                                                gap = 1000
+                                                            gap = max(1, gap)
+                                                            snap_iter = max(1, (iteration + 1) - gap)
+                                                            snap_path = os.path.join(
+                                                                model_dir, "checkpoints", f"iter_{snap_iter}",
+                                                                f"{save_prefix}_policy_network_iter{snap_iter}.pt"
+                                                            )
+                                                            if os.path.exists(snap_path):
+                                                                try:
+                                                                    import torch
+                                                                    snap_solver = ParallelDeepCFRSolver(
+                                                                        game,
+                                                                        num_workers=0,  # 仅用于出动作，不启动worker
+                                                                        policy_network_layers=tuple(self._policy_network_layers),
+                                                                        advantage_network_layers=tuple(self._advantage_network_layers),
+                                                                        num_iterations=1,
+                                                                        num_traversals=1,
+                                                                        learning_rate=self.learning_rate,
+                                                                        batch_size_advantage=32,
+                                                                        batch_size_strategy=32,
+                                                                        memory_capacity=1,
+                                                                        strategy_memory_capacity=1,
+                                                                        device="cpu",
+                                                                        gpu_ids=None,
+                                                                        new_sample_ratio=self.new_sample_ratio,
+                                                                        new_sample_window=self.new_sample_window,
+                                                                        advantage_target_scale=self._advantage_target_scale,
+                                                                        advantage_target_clip=self._advantage_target_clip,
+                                                                        advantage_loss=self._advantage_loss_type,
+                                                                        huber_delta=self._huber_delta
+                                                                    )
+                                                                    sd = torch.load(snap_path, map_location="cpu")
+                                                                    snap_solver._policy_network.load_state_dict(sd)
+                                                                    snap_solver._policy_network.eval()
+                                                                    tr_snap = evaluate_with_test_games(
+                                                                        game,
+                                                                        self,
+                                                                        num_games=extra_games,
+                                                                        verbose=False,
+                                                                        mode="vs_random",
+                                                                        opponent_solver=snap_solver,
+                                                                        opponent_strategy="solver"
+                                                                    )
+                                                                    _print_overall_line(f"测试对局: {extra_games} 局 (vs Snapshot@{snap_iter})", tr_snap)
+                                                                except Exception as e:
+                                                                    print(f"    测试对局: vs Snapshot 失败: {e}")
+                                                            else:
+                                                                print(f"    测试对局: snapshot 不存在（期望 {snap_path}）")
+
+                                                        # 2) vs Tight：能fold就fold，否则call/check
+                                                        if "tight" in extra_opponents:
+                                                            tr_tight = evaluate_with_test_games(
+                                                                game,
+                                                                self,
+                                                                num_games=extra_games,
+                                                                verbose=False,
+                                                                mode="vs_random",
+                                                                opponent_solver=None,
+                                                                opponent_strategy="tight"
+                                                            )
+                                                            _print_overall_line(f"测试对局: {extra_games} 局 (vs Tight)", tr_tight)
+
+                                                        # 3) vs Call：优先call/check
+                                                        if "call" in extra_opponents:
+                                                            tr_call = evaluate_with_test_games(
+                                                                game,
+                                                                self,
+                                                                num_games=extra_games,
+                                                                verbose=False,
+                                                                mode="vs_random",
+                                                                opponent_solver=None,
+                                                                opponent_strategy="call"
+                                                            )
+                                                            _print_overall_line(f"测试对局: {extra_games} 局 (vs Call)", tr_call)
                                                     
                                                     # 检查是否应该开始过渡阶段
                                                     win_rate = test_results.get('player0_win_rate', None)
@@ -2881,6 +3143,8 @@ def main():
                         help="队列最大大小，降低可减少内存占用（默认: 50000）")
     parser.add_argument("--new_sample_ratio", type=float, default=0.5,
                         help="新样本占比（分层加权采样，默认0.5即50%）")
+    parser.add_argument("--new_sample_window", type=int, default=0,
+                        help="新样本窗口（最近W轮算“新”）；0表示仅当前轮。建议 10~50")
     parser.add_argument("--betting_abstraction", type=str, default="fcpa")
     parser.add_argument("--save_prefix", type=str, default="deepcfr_parallel")
     parser.add_argument("--save_dir", type=str, default="models")
@@ -2899,6 +3163,12 @@ def main():
                         help="评估时运行测试对局")
     parser.add_argument("--num_test_games", type=int, default=1000,
                         help="评估时的测试对局数量（默认: 1000）")
+    parser.add_argument("--eval_extra_opponents", type=str, default="snapshot",
+                        help="额外评估对手（逗号分隔）：snapshot,tight,call。例如 'snapshot,tight'。空字符串表示不额外评估")
+    parser.add_argument("--eval_extra_games", type=int, default=200,
+                        help="额外评估每种对手的对局数量（默认: 200，避免评估过慢）")
+    parser.add_argument("--eval_snapshot_gap", type=int, default=1000,
+                        help="snapshot评估使用的旧checkpoint间隔（默认: 1000，例如用 iter-(gap) 作为对手）")
     parser.add_argument("--blinds", type=str, default=None,
                         help="盲注配置，格式：'小盲 大盲' 或 '50 100 0 0 0 0'（多人场完整配置）。如果不指定，将根据玩家数量自动生成")
     parser.add_argument("--stack_size", type=int, default=None,
@@ -3059,9 +3329,15 @@ def main():
         max_memory_gb=args.max_memory_gb,
         queue_maxsize=args.queue_maxsize,
         new_sample_ratio=args.new_sample_ratio,
+        new_sample_window=args.new_sample_window,
         advantage_network_train_steps=args.advantage_train_steps,
         policy_network_train_steps=args.policy_train_steps,
     )
+
+    # 评估扩展参数（仅用于 checkpoint 评估打印，不影响训练样本）
+    solver._eval_extra_opponents = args.eval_extra_opponents
+    solver._eval_extra_games = args.eval_extra_games
+    solver._eval_snapshot_gap = args.eval_snapshot_gap
     
     # 显示内存配置
     if args.max_memory_gb:
@@ -3086,8 +3362,12 @@ def main():
             'max_memory_gb': args.max_memory_gb,
             'queue_maxsize': args.queue_maxsize,
             'new_sample_ratio': args.new_sample_ratio,
+            'new_sample_window': args.new_sample_window,
             'advantage_train_steps': args.advantage_train_steps,
             'policy_train_steps': args.policy_train_steps,
+            'eval_extra_opponents': args.eval_extra_opponents,
+            'eval_extra_games': args.eval_extra_games,
+            'eval_snapshot_gap': args.eval_snapshot_gap,
             'betting_abstraction': args.betting_abstraction,
             'blinds': blinds_str,
             'stack_size': stack_size,

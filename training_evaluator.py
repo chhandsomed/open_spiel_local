@@ -96,8 +96,10 @@ def evaluate_policy_quality(
     states_sampled = 0
     
     # 动作统计
-    action_counts = defaultdict(int)  # {action: count}
-    action_total_prob = defaultdict(float)  # {action: total_probability}
+    # 统计“实际采样到的动作”分布（而不是“合法动作集合”分布）
+    # count: 被选中的次数；avg_probability: 被选中时该动作的概率（置信度）
+    action_counts = defaultdict(int)  # {action: chosen_count}
+    action_total_prob = defaultdict(float)  # {action: sum(prob_when_chosen)}
     
     try:
         # 采样一些状态，计算策略熵
@@ -150,17 +152,14 @@ def evaluate_policy_quality(
                             if entropy > 0:  # 只记录有效的熵值
                                 entropies.append(entropy)
                                 states_sampled += 1
-                            
-                            # 统计动作占比
-                            for action, prob in action_probs.items():
-                                action_counts[action] += 1
-                                action_total_prob[action] += prob
-                            
-                            # 根据策略采样动作继续
+
+                            # 根据策略采样动作继续，并统计“实际选择的动作”
                             actions = list(action_probs.keys())
                             probabilities = list(action_probs.values())
-                            action = np.random.choice(actions, p=probabilities)
-                            state = state.child(action)
+                            chosen_action = np.random.choice(actions, p=probabilities)
+                            action_counts[chosen_action] += 1
+                            action_total_prob[chosen_action] += float(action_probs.get(chosen_action, 0.0))
+                            state = state.child(chosen_action)
                         except Exception as e:
                             # 如果获取策略失败，跳过这个状态
                             if verbose:
@@ -246,6 +245,7 @@ def play_test_game(
     game,
     deep_cfr_solver,
     opponent_strategy="random",
+    opponent_solver=None,
     verbose=False,
     use_trained_for_all=True,
     trained_player=None
@@ -268,9 +268,9 @@ def play_test_game(
     num_players = game.num_players()
     max_steps = 1000  # 防止无限循环
     
-    # 动作统计（本局对局中的动作）
-    game_action_counts = defaultdict(int)  # {action: count}
-    game_action_total_prob = defaultdict(float)  # {action: total_probability}
+    # 动作统计（本局对局中的动作，按“实际选择的动作”统计）
+    game_action_counts = defaultdict(int)  # {action: chosen_count}
+    game_action_total_prob = defaultdict(float)  # {action: sum(prob_when_chosen)}
     
     # 如果未指定trained_player且不是自对弈模式，随机选择一个玩家使用训练策略
     if not use_trained_for_all and trained_player is None:
@@ -324,22 +324,54 @@ def play_test_game(
                         else:
                             # 如果所有概率为0，使用均匀分布
                             action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
-                        # 统计动作占比
-                        for act, prob in action_probs.items():
-                            game_action_counts[act] += 1
-                            game_action_total_prob[act] += prob
-                        
+
                         # 使用确定性策略：选择概率最高的动作（如果相同则选择第一个）
-                        best_action = max(legal_actions, key=lambda a: action_probs.get(a, 0.0))
-                        action = best_action
+                        action = max(legal_actions, key=lambda a: action_probs.get(a, 0.0))
+
+                        # 统计“实际选择的动作”
+                        game_action_counts[action] += 1
+                        game_action_total_prob[action] += float(action_probs.get(action, 0.0))
                     except Exception as e:
                         if verbose:
                             print(f"  ⚠️ 获取动作概率失败: {e}")
                         # 使用固定策略：选择第一个合法动作
                         action = legal_actions[0]
-                else:  # 对手使用随机策略
-                    # 随机选择合法动作
-                    action = np.random.choice(legal_actions)
+                else:  # 对手策略
+                    # 1) vs snapshot/solver：用对手的 policy 出招（确定性 argmax）
+                    if opponent_solver is not None:
+                        try:
+                            opp_probs = opponent_solver.action_probabilities(state, player)
+                            opp_action_probs = {a: opp_probs.get(a, 0.0) for a in legal_actions}
+                            total = sum(opp_action_probs.values())
+                            if total > 0:
+                                opp_action_probs = {a: p/total for a, p in opp_action_probs.items()}
+                            else:
+                                opp_action_probs = {a: 1.0/len(legal_actions) for a in legal_actions}
+                            action = max(legal_actions, key=lambda a: opp_action_probs.get(a, 0.0))
+                        except Exception as e:
+                            if verbose:
+                                print(f"  ⚠️ 对手solver获取动作概率失败: {e}")
+                            action = np.random.choice(legal_actions)
+                    else:
+                        # 2) 规则/随机对手
+                        strat = (opponent_strategy or "random").lower()
+                        if strat == "tight":
+                            # 能fold就fold，否则优先call/check
+                            if 0 in legal_actions:
+                                action = 0
+                            elif 1 in legal_actions:
+                                action = 1
+                            else:
+                                action = np.random.choice(legal_actions)
+                        elif strat == "call":
+                            # 能call/check就call/check，否则随机
+                            if 1 in legal_actions:
+                                action = 1
+                            else:
+                                action = np.random.choice(legal_actions)
+                        else:
+                            # random/uniform：均匀随机
+                            action = np.random.choice(legal_actions)
                 
                 state = state.child(action)
             
@@ -372,7 +404,9 @@ def evaluate_with_test_games(
     deep_cfr_solver,
     num_games=100,
     verbose=True,
-    mode="self_play"  # "self_play" or "vs_random"
+    mode="self_play",  # "self_play" or "vs_random" or "vs_snapshot"/"vs_tight"/"vs_call"
+    opponent_solver=None,
+    opponent_strategy="random",
 ):
     """通过测试对局评估策略
     
@@ -413,6 +447,8 @@ def evaluate_with_test_games(
         game_result = play_test_game(
             game, 
             deep_cfr_solver, 
+            opponent_strategy=opponent_strategy,
+            opponent_solver=opponent_solver,
             verbose=verbose and failed_games < 3, 
             use_trained_for_all=use_trained_for_all
         )
@@ -717,7 +753,9 @@ def quick_evaluate(
             deep_cfr_solver, 
             num_games=num_test_games, 
             verbose=verbose,
-            mode="vs_random"  # 改为 vs Random
+            mode="vs_random",  # 改为 vs Random
+            opponent_solver=None,
+            opponent_strategy="random",
         )
         if verbose:
             if test_results and test_results.get('games_played', 0) < num_test_games:

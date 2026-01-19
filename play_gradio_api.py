@@ -11,12 +11,24 @@ import glob
 import math
 import requests
 from collections import Counter
+import argparse
+
 
 # 添加当前目录到 path 以导入本地模块
 sys.path.append(os.getcwd())
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='启动打牌助理')
+    parser.add_argument('--url', type=str, default='http://localhost:8826/api/v1',
+                      help='服务器主机地址')
+    args = parser.parse_args()
+    return args
+
+args = parse_args()
+
+API_BASE_URL = args.url
 # API服务器配置
-API_BASE_URL = "http://localhost:8826/api/v1"
+# API_BASE_URL = "http://localhost:8826/api/v1"
 
 # ==========================================
 # 0. 牌型评估工具 (简化版)
@@ -2375,6 +2387,7 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
     )
 
     # submit_btn.click (removed)
+
 
 
 if __name__ == "__main__":

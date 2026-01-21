@@ -544,6 +544,47 @@ def check_draws(hole_cards_bits, board_cards_bits, num_suits=4, num_ranks=13):
     return vectorized_draws(hole_cards_bits, board_cards_bits, num_suits, num_ranks)
 
 
+def calculate_draw_potential(flush_draw, flush_outs, straight_draw, straight_outs, 
+                             is_flop, is_turn, num_remaining_cards_flop=9, num_remaining_cards_turn=8):
+    """计算听牌潜力（使用二四法则和所罗门法则）
+    
+    Args:
+        flush_draw: [batch_size, 1] 是否同花听牌
+        flush_outs: [batch_size, 1] 同花outs（归一化到[0,1]）
+        straight_draw: [batch_size, 1] 是否顺子听牌
+        straight_outs: [batch_size, 1] 顺子outs（归一化到[0,1]）
+        is_flop: [batch_size, 1] 是否Flop阶段
+        is_turn: [batch_size, 1] 是否Turn阶段
+        num_remaining_cards_flop: Flop阶段剩余牌数（默认9张）
+        num_remaining_cards_turn: Turn阶段剩余牌数（默认8张）
+    
+    Returns:
+        draw_potential: [batch_size, 1] 听牌潜力 [0, 1]
+    """
+    # 将归一化的outs转换回实际outs数量
+    flush_actual_outs = flush_outs * 9.0  # 最大9张
+    straight_actual_outs = straight_outs * 8.0  # 最大8张
+    
+    # 计算总outs（取最大值，因为可能同时有同花和顺子听牌）
+    total_outs = torch.max(flush_actual_outs, straight_actual_outs)
+    
+    # 二四法则/所罗门法则：成牌概率 = outs × 倍数 / 100
+    # Flop阶段：倍数 = 4（2张牌未发）
+    # Turn阶段：倍数 = 2（1张牌未发）
+    multiplier = is_flop * 4.0 + is_turn * 2.0
+    draw_probability = (total_outs * multiplier / 100.0).clamp(0.0, 1.0)
+    
+    # 归一化到[0, 1]作为潜力值
+    # 最大潜力：Flop阶段9张outs = 36%，Turn阶段8张outs = 16%
+    # 归一化：Flop最大0.36 -> 1.0，Turn最大0.16 -> 1.0
+    max_potential_flop = 9.0 * 4.0 / 100.0  # 0.36
+    max_potential_turn = 8.0 * 2.0 / 100.0  # 0.16
+    max_potential = is_flop * max_potential_flop + is_turn * max_potential_turn
+    draw_potential = draw_probability / (max_potential + 1e-8)
+    
+    return draw_potential.clamp(0.0, 1.0)
+
+
 def calculate_board_features(board_cards_bits, num_suits=4, num_ranks=13):
     """计算公共牌特征（使用向量化版本）"""
     return vectorized_board_features(board_cards_bits, num_suits, num_ranks)
@@ -702,19 +743,55 @@ class SimpleFeatureMLP(nn.Module):
             features.append(preflop_strength_weighted)
             
             # 2. 当前手牌强度（考虑公共牌）（1维，统一到[0,1]，不加权）
-            # preflop时：current_hand_strength = preflop_strength_original
-            # postflop时：current_hand_strength = 实际手牌强度
-            current_hand_strength = vectorized_hand_strength(hole_cards, board_cards)
+            # 方案B：当前手牌强度 = 起手牌强度 × 权重 + 成牌强度 × 权重
+            board_count = board_cards.sum(dim=1, keepdim=True)  # [batch, 1]
+            is_preflop = (board_count == 0).float()  # [batch, 1]
+            is_flop = (board_count == 3).float()  # [batch, 1]
+            is_turn = (board_count == 4).float()  # [batch, 1]
+            is_river = (board_count == 5).float()  # [batch, 1]
+            
+            # 预先计算成牌和听牌特征（避免重复计算）
+            made_hand_strength = vectorized_hand_strength(hole_cards, board_cards)
+            flush_draw, flush_outs, straight_draw, straight_outs = check_draws(hole_cards, board_cards)
+            hit_pair, hit_two_pair, hit_trips, hit_straight, hit_flush, hit_full_house, hit_four, hit_straight_flush = check_made_hands(hole_cards, board_cards)
+            
+            # 计算听牌潜力（所有阶段都需要，但Preflop阶段会设为0）
+            draw_potential = calculate_draw_potential(flush_draw, flush_outs, 
+                                                     straight_draw, straight_outs,
+                                                     is_flop, is_turn)
+            
+            # 综合成牌强度（成牌强度 + 听牌潜力）
+            total_made_strength = made_hand_strength + draw_potential
+            
+            # 阶段权重调整
+            # 起手牌权重：Flop=0.4, Turn=0.35, River=0.3
+            # 成牌权重：Flop=0.6, Turn=0.65, River=0.7
+            preflop_weight = (
+                is_flop * 0.4 +
+                is_turn * 0.35 +
+                is_river * 0.3
+            )
+            made_hand_weight = 1.0 - preflop_weight  # 0.6-0.7
+            
+            # Preflop阶段：只使用起手牌强度
+            # Postflop阶段：起手牌强度 + 成牌强度（含听牌潜力）加权
+            current_hand_strength = (
+                is_preflop * preflop_strength_original +
+                (1 - is_preflop) * (
+                    preflop_strength_original * preflop_weight +
+                    total_made_strength * made_hand_weight
+                )
+            )
             current_hand_strength = torch.clamp(current_hand_strength, 0.0, 1.0)
+            
             features.append(current_hand_strength)
             
             # 3. 是否中牌（1维）- 修复：改为检查是否有成牌，而不是基于手牌强度阈值
-            board_count = board_cards.sum(dim=1, keepdim=True)  # [batch, 1]
-            is_preflop = (board_count == 0).float()  # [batch, 1]
+            # 注意：board_count和is_preflop已经在上面计算过了
             is_postflop = (board_count > 0).float()  # [batch, 1]
             
             # 4. 成牌特征（8维）- 修复：扩展为所有牌型，避免遗漏顺子、同花、葫芦、四条、同花顺
-            hit_pair, hit_two_pair, hit_trips, hit_straight, hit_flush, hit_full_house, hit_four, hit_straight_flush = check_made_hands(hole_cards, board_cards)
+            # 注意：hit_pair等已经在上面计算过了
             
             # Preflop阶段：是否中牌 = 0（没有公共牌，无法中牌）
             # Postflop阶段：是否中牌 = 检查是否有任何成牌（对子、两对、三条、顺子、同花、葫芦、四条、同花顺）
@@ -727,7 +804,7 @@ class SimpleFeatureMLP(nn.Module):
             features.extend([hit_pair, hit_two_pair, hit_trips, hit_straight, hit_flush, hit_full_house, hit_four, hit_straight_flush])
             
             # 5. 听牌特征（4维）- 移除补牌权益特征
-            flush_draw, flush_outs, straight_draw, straight_outs = check_draws(hole_cards, board_cards)
+            # 注意：flush_draw等已经在上面计算过了
             features.extend([flush_draw, flush_outs, straight_draw, straight_outs])
             
             # 6. 公共牌特征（7维）
@@ -735,14 +812,49 @@ class SimpleFeatureMLP(nn.Module):
             features.extend([board_strength, is_flush_board, is_straight_board])
             features.append(game_round)  # 4维 one-hot
             
-            # 7. 手牌强度变化（1维）
-            # 语义：postflop时的"相对变化" = current_strength - preflop_strength_original（可为负）
-            # 归一化：tanh(k * delta_raw) -> [-1, 1]
-            # 注意：使用原始值计算，确保语义正确（preflop时delta_raw=0，postflop时反映真实变化）
-            # 使用原始值计算delta，确保语义正确
-            delta_raw = current_hand_strength - preflop_strength_original
-            k_delta = 3.0
-            strength_change = is_preflop * torch.zeros_like(delta_raw) + is_postflop * torch.tanh(delta_raw * k_delta)
+            # 7. 手牌强度变化（1维）- 方案B：成牌贡献 - 起手牌贡献（衰减后）
+            # 强度变化 = (成牌强度 × 成牌权重) - (起手牌强度 × 起手牌权重 × 衰减系数)
+            # Preflop阶段：强度变化 = 0
+            # Postflop阶段：计算成牌贡献和起手牌贡献（衰减后）
+            
+            # 7.1 阶段权重（与上面保持一致）
+            preflop_weight = (
+                is_flop * 0.4 +
+                is_turn * 0.35 +
+                is_river * 0.3
+            )
+            made_hand_weight = 1.0 - preflop_weight
+            
+            # 7.2 成牌贡献 = 综合成牌强度 × 成牌权重（Postflop阶段）
+            made_contribution = total_made_strength * made_hand_weight
+            
+            # 7.3 起手牌贡献（衰减后）= 起手牌强度 × 起手牌权重 × 衰减系数（Postflop阶段）
+            # 衰减系数：Flop=0.8, Turn=0.6, River=0.4
+            decay_factor = (
+                is_flop * 0.8 +
+                is_turn * 0.6 +
+                is_river * 0.4
+            )
+            preflop_contribution = preflop_strength_original * preflop_weight * decay_factor
+            
+            # 7.4 强度变化 = 成牌贡献 - 起手牌贡献（衰减后）
+            delta_base = made_contribution - preflop_contribution
+            
+            # 7.5 中牌后确保最小提升（Postflop阶段）
+            min_boost = torch.tensor(0.05, device=delta_base.device)
+            delta_adjusted = torch.where(
+                (has_made_hand > 0.5) & (is_preflop < 0.5),  # 中牌且Postflop
+                torch.maximum(delta_base, min_boost),
+                delta_base
+            )
+            
+            # 7.6 归一化（Postflop阶段）
+            k_delta = 1.5
+            strength_change_postflop = torch.tanh(delta_adjusted * k_delta)
+            
+            # 7.7 Preflop阶段强度变化为0
+            strength_change = is_preflop * torch.zeros_like(delta_base) + (1 - is_preflop) * strength_change_postflop
+            
             features.append(strength_change)
             
             # 8. 下注统计特征（2维）- 如果board_cards有值，说明已经进入下注阶段

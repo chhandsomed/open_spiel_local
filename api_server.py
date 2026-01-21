@@ -215,6 +215,39 @@ def format_card_ids(card_ids):
     return [card_index_to_string(c) for c in sorted(card_ids)]
 
 
+def extract_board_cards_order_from_history(state: pyspiel.State, game: pyspiel.Game):
+    """
+    从 state.history() 中提取公共牌的发牌顺序
+    
+    Args:
+        state: OpenSpiel游戏状态
+        game: OpenSpiel游戏实例
+    
+    Returns:
+        list: 公共牌的 card_id 列表（按发牌顺序）
+    """
+    board_card_ids = []
+    temp_state = game.new_initial_state()
+    num_players = game.num_players()
+    num_hole_cards = 2
+    hole_cards_dealt = 0
+    
+    for action in state.history():
+        if temp_state.is_chance_node():
+            # 判断是发手牌还是发公共牌
+            # 前 num_players * num_hole_cards 个chance动作是发手牌
+            if hole_cards_dealt < num_players * num_hole_cards:
+                hole_cards_dealt += 1
+            else:
+                # 这是发公共牌的动作
+                board_card_ids.append(action)
+            temp_state.apply_action(action)
+        else:
+            temp_state.apply_action(action)
+    
+    return board_card_ids
+
+
 # ==========================================
 # 2. 状态构建函数
 # ==========================================
@@ -747,6 +780,39 @@ def build_state_from_cards(
             import traceback
             traceback.print_exc()
     
+    # 验证公共牌顺序
+    if board_cards:
+        try:
+            expected_board_ids = board_indices
+            actual_board_ids = extract_board_cards_order_from_history(state, game)
+            
+            if len(expected_board_ids) == len(actual_board_ids):
+                if expected_board_ids != actual_board_ids:
+                    expected_str = [card_index_to_string(c) for c in expected_board_ids]
+                    actual_str = [card_index_to_string(c) for c in actual_board_ids]
+                    print(
+                        f"⚠️ [BoardOrderMismatch] 公共牌顺序不一致！\n"
+                        f"  传入顺序: {expected_str} (IDs: {expected_board_ids})\n"
+                        f"  实际顺序: {actual_str} (IDs: {actual_board_ids})",
+                        flush=True
+                    )
+                else:
+                    expected_str = [card_index_to_string(c) for c in expected_board_ids]
+                    print(
+                        f"✅ [BoardOrderCheck] 公共牌顺序一致: {expected_str}",
+                        flush=True
+                    )
+            else:
+                print(
+                    f"⚠️ [BoardOrderMismatch] 公共牌数量不一致: "
+                    f"传入={len(expected_board_ids)}, 实际={len(actual_board_ids)}",
+                    flush=True
+                )
+        except Exception as e:
+            print(f"⚠️ [BoardOrderCheck] 验证公共牌顺序时出错: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+
     return state
 
 
@@ -2121,6 +2187,36 @@ def recommend_action():
                     f"(api_board_len={len(api_board_ids)}, engine_board_len={len(engine_board_ids)})",
                     flush=True
                 )
+            # 验证公共牌顺序
+            if board_cards:
+                try:
+                    engine_board_ids_ordered = extract_board_cards_order_from_history(state, game)
+                    if len(api_board_ids) == len(engine_board_ids_ordered):
+                        order_match = (api_board_ids == engine_board_ids_ordered)
+                        if not order_match:
+                            api_order_str = [card_index_to_string(c) for c in api_board_ids]
+                            engine_order_str = [card_index_to_string(c) for c in engine_board_ids_ordered]
+                            print(
+                                f"⚠️ [CardOrderMismatch] player={player_id} "
+                                f"api_order={api_order_str} (IDs: {api_board_ids}) | "
+                                f"engine_order={engine_order_str} (IDs: {engine_board_ids_ordered})",
+                                flush=True
+                            )
+                        else:
+                            api_order_str = [card_index_to_string(c) for c in api_board_ids]
+                            print(
+                                f"✅ [CardOrderCheck] player={player_id} 公共牌顺序一致: {api_order_str}",
+                                flush=True
+                            )
+                    else:
+                        print(
+                            f"⚠️ [CardOrderMismatch] player={player_id} 公共牌数量不一致: "
+                            f"api={len(api_board_ids)}, engine={len(engine_board_ids_ordered)}",
+                            flush=True
+                        )
+                except Exception as order_e:
+                    print(f"⚠️ [CardOrderCheck] 验证公共牌顺序时出错: {order_e}", flush=True)
+
         except Exception as _e:
             # 对照打印失败不影响主流程
             pass

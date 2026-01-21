@@ -21,12 +21,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description='启动打牌助理')
     parser.add_argument('--url', type=str, default='http://localhost:8826/api/v1',
                       help='服务器主机地址')
+    parser.add_argument('--port', type=int, default=8823,
+                      help='ui端口号')
     args = parser.parse_args()
     return args
 
 args = parse_args()
 
 API_BASE_URL = args.url
+UI_PORT = args.port
+
 # API服务器配置
 # API_BASE_URL = "http://localhost:8826/api/v1"
 
@@ -579,23 +583,28 @@ def extract_state_info_for_api(state, player_id):
         # 将字符串格式转换为用户格式的数字
         hole_cards = [card_string_to_user_index(c) for c in hole_cards_str]
     
-    # 提取公共牌
+    # 提取公共牌（按发牌顺序）
     board_cards = []
     try:
-        state_struct = state.to_struct()
-        board_cards_str = getattr(state_struct, 'board_cards', '')
-        if board_cards_str:
-            # board_cards是字符串格式，如 "2d3c4h"，需要转换为用户格式
-            for i in range(0, len(board_cards_str), 2):
-                card_str = board_cards_str[i:i+2]
-                # 转换为用户格式的数字
-                user_idx = card_string_to_user_index(card_str)
-                board_cards.append(user_idx)
+        # 优先使用 get_ordered_board_cards 获取按发牌顺序排列的公共牌
+        board_cards_str_list = get_ordered_board_cards(state)
+        if board_cards_str_list:
+            # 将字符串格式转换为用户格式的数字
+            board_cards = [card_string_to_user_index(c) for c in board_cards_str_list]
+        else:
+            # Fallback: 从 state_struct 获取（注意：这个已经是排序的，不推荐）
+            state_struct = state.to_struct()
+            board_cards_str = getattr(state_struct, 'board_cards', '')
+            if board_cards_str:
+                print(f"⚠️ Warning: Using sorted board_cards from state_struct (not in deal order)", flush=True)
+                for i in range(0, len(board_cards_str), 2):
+                    card_str = board_cards_str[i:i+2]
+                    user_idx = card_string_to_user_index(card_str)
+                    board_cards.append(user_idx)
     except Exception as e:
-        print(f"Warning: Failed to extract board cards from state_struct: {e}")
-        # Fallback: 从state_str解析
+        print(f"Warning: Failed to extract board cards: {e}", flush=True)
+        # Fallback: 从state_str解析（也可能不是发牌顺序）
         board_cards_str, _ = get_cards_from_state(state_str)
-        # 将字符串格式转换为用户格式的数字
         board_cards = [card_string_to_user_index(c) for c in board_cards_str]
     
     # 提取历史动作和下注金额（只包含玩家动作，不包含发牌动作）
@@ -1265,7 +1274,9 @@ def get_ordered_board_cards(state):
     known_cards = set()
     
     try:
-        temp_state = GAME.new_initial_state()
+        # 使用 state 的 game 实例，而不是全局 GAME，更可靠
+        game = state.get_game()
+        temp_state = game.new_initial_state()
         history = state.history()
         
         for action in history:
@@ -2393,5 +2404,5 @@ with gr.Blocks(title="Texas Hold'em vs AI") as demo:
 if __name__ == "__main__":
     print(f"Starting Gradio...")
     demo.queue(max_size=32)
-    demo.launch(server_name="0.0.0.0", server_port=8823)
+    demo.launch(server_name="0.0.0.0", server_port=UI_PORT)
 

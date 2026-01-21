@@ -37,13 +37,14 @@ NUM_TEST_GAMES=1000           # 评估时的测试对局数量
 EVAL_EXTRA_OPPONENTS="snapshot,tight,call"  # 额外评估对手：旧checkpoint/紧手/只跟注（仅用于诊断，不回灌训练）
 EVAL_EXTRA_GAMES=200          # 每种额外评估对手的对局数（避免评估过慢）
 EVAL_SNAPSHOT_GAP=100        # snapshot对手使用 iter-(gap) 的旧checkpoint
+EVAL_CHECKPOINT_PATH="models/deepcfr_6p_multi_20260116_171819/checkpoints/iter_114200"  # 指定checkpoint作为评测对手（v5.2版本，v5.3将对战v5.2）
 MAX_MEMORY_GB=6              # Worker内存限制（每个Worker最多6GB，总计约480GB）
 betting_abstraction="fchpa"
 blinds="100 200 0 0 0 0"
 stack_size=50000
 
-# 保存前缀
-SAVE_PREFIX="deepcfr_6p_multi_$(date +%Y%m%d_%H%M%S)"
+# 保存前缀（v5.3版本）
+SAVE_PREFIX="deepcfr_6p_multi_v5.3_$(date +%Y%m%d_%H%M%S)"
 
 # 运行训练（后台运行，输出到日志文件）
 nohup python deep_cfr_parallel.py \
@@ -74,6 +75,7 @@ nohup python deep_cfr_parallel.py \
     --eval_extra_opponents $EVAL_EXTRA_OPPONENTS \
     --eval_extra_games $EVAL_EXTRA_GAMES \
     --eval_snapshot_gap $EVAL_SNAPSHOT_GAP \
+    --eval_checkpoint_path $EVAL_CHECKPOINT_PATH \
     --betting_abstraction $betting_abstraction \
     --save_prefix $SAVE_PREFIX \
     > train_6p_${SAVE_PREFIX}.log 2>&1 &

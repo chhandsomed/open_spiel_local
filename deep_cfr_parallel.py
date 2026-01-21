@@ -2838,6 +2838,85 @@ class ParallelDeepCFRSolver:
                                                                 opponent_strategy="call"
                                                             )
                                                             _print_overall_line(f"测试对局: {extra_games} 局 (vs Call)", tr_call)
+                                                        
+                                                        # 4) vs 指定Checkpoint：使用指定的checkpoint作为对手
+                                                        eval_checkpoint_path = getattr(self, "_eval_checkpoint_path", None)
+                                                        if eval_checkpoint_path and os.path.exists(eval_checkpoint_path):
+                                                            try:
+                                                                import torch
+                                                                import json
+                                                                import glob
+                                                                import re
+                                                                
+                                                                # 查找策略网络文件
+                                                                policy_files = glob.glob(os.path.join(eval_checkpoint_path, "*_policy_network*.pt"))
+                                                                if not policy_files:
+                                                                    # 尝试从父目录查找
+                                                                    parent_dir = os.path.dirname(eval_checkpoint_path)
+                                                                    policy_files = glob.glob(os.path.join(parent_dir, "*_policy_network*.pt"))
+                                                                
+                                                                if policy_files:
+                                                                    # 选择最新的checkpoint文件
+                                                                    latest_file = None
+                                                                    max_iter = 0
+                                                                    for f in policy_files:
+                                                                        match = re.search(r'_iter(\d+)\.pt$', f)
+                                                                        if match:
+                                                                            iter_num = int(match.group(1))
+                                                                            if iter_num > max_iter:
+                                                                                max_iter = iter_num
+                                                                                latest_file = f
+                                                                    if not latest_file:
+                                                                        latest_file = policy_files[0]
+                                                                    
+                                                                    # 加载配置
+                                                                    config_path = os.path.join(eval_checkpoint_path, "config.json")
+                                                                    if not os.path.exists(config_path):
+                                                                        parent_dir = os.path.dirname(eval_checkpoint_path)
+                                                                        config_path = os.path.join(parent_dir, "config.json")
+                                                                    
+                                                                    checkpoint_solver = ParallelDeepCFRSolver(
+                                                                        game,
+                                                                        num_workers=0,
+                                                                        policy_network_layers=tuple(self._policy_network_layers),
+                                                                        advantage_network_layers=tuple(self._advantage_network_layers),
+                                                                        num_iterations=1,
+                                                                        num_traversals=1,
+                                                                        learning_rate=self.learning_rate,
+                                                                        batch_size_advantage=32,
+                                                                        batch_size_strategy=32,
+                                                                        memory_capacity=1,
+                                                                        strategy_memory_capacity=1,
+                                                                        device="cpu",
+                                                                        gpu_ids=None,
+                                                                        new_sample_ratio=self.new_sample_ratio,
+                                                                        new_sample_window=self.new_sample_window,
+                                                                        advantage_target_scale=self._advantage_target_scale,
+                                                                        advantage_target_clip=self._advantage_target_clip,
+                                                                        advantage_loss=self._advantage_loss_type,
+                                                                        huber_delta=self._huber_delta
+                                                                    )
+                                                                    sd = torch.load(latest_file, map_location="cpu")
+                                                                    checkpoint_solver._policy_network.load_state_dict(sd)
+                                                                    checkpoint_solver._policy_network.eval()
+                                                                    
+                                                                    checkpoint_name = os.path.basename(eval_checkpoint_path)
+                                                                    tr_checkpoint = evaluate_with_test_games(
+                                                                        game,
+                                                                        self,
+                                                                        num_games=extra_games,
+                                                                        verbose=False,
+                                                                        mode="vs_random",
+                                                                        opponent_solver=checkpoint_solver,
+                                                                        opponent_strategy="solver"
+                                                                    )
+                                                                    _print_overall_line(f"测试对局: {extra_games} 局 (vs Checkpoint: {checkpoint_name})", tr_checkpoint)
+                                                                else:
+                                                                    print(f"    测试对局: 找不到checkpoint文件 ({eval_checkpoint_path})")
+                                                            except Exception as e:
+                                                                print(f"    测试对局: vs Checkpoint 失败: {e}")
+                                                                import traceback
+                                                                traceback.print_exc()
                                                     
                                                     # 检查是否应该开始过渡阶段
                                                     win_rate = test_results.get('player0_win_rate', None)
@@ -3169,6 +3248,8 @@ def main():
                         help="额外评估每种对手的对局数量（默认: 200，避免评估过慢）")
     parser.add_argument("--eval_snapshot_gap", type=int, default=1000,
                         help="snapshot评估使用的旧checkpoint间隔（默认: 1000，例如用 iter-(gap) 作为对手）")
+    parser.add_argument("--eval_checkpoint_path", type=str, default=None,
+                        help="指定checkpoint路径作为评测对手（例如：models/deepcfr_6p_multi_20260116_171819/checkpoints/iter_114200）")
     parser.add_argument("--blinds", type=str, default=None,
                         help="盲注配置，格式：'小盲 大盲' 或 '50 100 0 0 0 0'（多人场完整配置）。如果不指定，将根据玩家数量自动生成")
     parser.add_argument("--stack_size", type=int, default=None,
@@ -3338,6 +3419,7 @@ def main():
     solver._eval_extra_opponents = args.eval_extra_opponents
     solver._eval_extra_games = args.eval_extra_games
     solver._eval_snapshot_gap = args.eval_snapshot_gap
+    solver._eval_checkpoint_path = args.eval_checkpoint_path
     
     # 显示内存配置
     if args.max_memory_gb:
@@ -3368,6 +3450,7 @@ def main():
             'eval_extra_opponents': args.eval_extra_opponents,
             'eval_extra_games': args.eval_extra_games,
             'eval_snapshot_gap': args.eval_snapshot_gap,
+            'eval_checkpoint_path': args.eval_checkpoint_path,
             'betting_abstraction': args.betting_abstraction,
             'blinds': blinds_str,
             'stack_size': stack_size,

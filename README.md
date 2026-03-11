@@ -677,6 +677,16 @@ curl -X POST http://localhost:8826/api/v1/reload_model \
     "model_dir": "models/deepcfr_6p_multi_20260116_171819/checkpoints/iter_114200",
     "num_players": 6
   }'
+
+
+
+  # 替换6人场模型（明确指定num_players=6）
+curl -X POST http://localhost:8828/api/v1/reload_model \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model_dir": "models/deepcfr_6p_multi_v5.3_20260119_183722/checkpoints/iter_317600",
+    "num_players": 6
+  }'
 ```
 
 **自动检测场次（从config.json读取）**：
